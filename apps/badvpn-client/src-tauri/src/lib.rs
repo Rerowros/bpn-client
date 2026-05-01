@@ -42,7 +42,8 @@ pub fn run() {
             commands::close_all_connections,
             commands::clear_closed_connections,
             commands::proxy_catalog,
-            commands::select_proxy
+            commands::select_proxy,
+            commands::policy_summary
         ])
         .run(tauri::generate_context!())
         .expect("failed to run BadVpn Tauri application");

@@ -512,3 +512,67 @@ export function getProxyCatalog(): Promise<ProxyCatalog> {
 export function selectProxy(group: string, proxy: string): Promise<ProxyCatalog> {
   return invoke<ProxyCatalog>("select_proxy", { group, proxy });
 }
+
+export interface PolicyRuleView {
+  target_kind: string;
+  target_value: string;
+  path: string;
+  path_group: string | null;
+  source: string;
+  priority: number;
+  original_rule: string | null;
+  tags: string[];
+  mihomo_rule: string;
+  zapret_effect: string;
+  dns_effect: string;
+}
+
+export interface SuppressedRuleView {
+  original_rule: string;
+  chosen_rule: string;
+  reason: string;
+}
+
+export interface RouteExpectationView {
+  target: string;
+  expected_path: string;
+  expected_mihomo_action: string;
+  expected_zapret: boolean;
+  source: string;
+}
+
+export interface PolicyDnsRuleView {
+  pattern: string;
+  nameservers: string[];
+}
+
+export interface ManagedGroupView {
+  name: string;
+  proxies: string[];
+}
+
+export interface PolicySummaryResponse {
+  available: boolean;
+  mode: string;
+  main_proxy_group: string;
+  final_rule: string;
+  mihomo_rules: string[];
+  zapret_hostlist: string[];
+  zapret_hostlist_exclude: string[];
+  zapret_ipset: string[];
+  zapret_ipset_exclude: string[];
+  dns_nameserver_policy: PolicyDnsRuleView[];
+  policy_rules: PolicyRuleView[];
+  suppressed_rules: SuppressedRuleView[];
+  diagnostics_expectations: RouteExpectationView[];
+  diagnostics_messages: string[];
+  managed_proxy_groups: ManagedGroupView[];
+  rule_count: number;
+  suppressed_count: number;
+  warnings_count: number;
+  zapret_domain_count: number;
+}
+
+export function getPolicySummary(): Promise<PolicySummaryResponse> {
+  return invoke<PolicySummaryResponse>("policy_summary");
+}

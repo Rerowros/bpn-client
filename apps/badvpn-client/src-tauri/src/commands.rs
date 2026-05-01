@@ -8,8 +8,8 @@ use badvpn_common::{
     generate_mihomo_config_from_subscription_with_options, overlay_mihomo_config_yaml,
     parse_subscription_userinfo, summarize_subscription_body, zapret_default_hostlist,
     zapret_default_ipset, zapret_user_placeholder_hostlist, AgentCommand, AgentState, AppPhase,
-    ConnectRequest, ConnectionStatus, DiagnosticSummary, MihomoConfigOptions, RouteMode,
-    RuntimeDiagnosticsSettings, RuntimeGameProfile, RuntimeMode, RuntimeSettings,
+    CompiledPolicy, ConnectRequest, ConnectionStatus, DiagnosticSummary, MihomoConfigOptions,
+    RouteMode, RuntimeDiagnosticsSettings, RuntimeGameProfile, RuntimeMode, RuntimeSettings,
     RuntimeZapretSettings, SubscriptionFormat, SubscriptionState, AGENT_LOCAL_ADDR,
     AGENT_PIPE_NAME,
 };
@@ -81,6 +81,7 @@ static LAST_ACTIVE_CONNECTIONS: OnceLock<Mutex<Vec<TrackedConnection>>> = OnceLo
 static CLOSED_CONNECTIONS: OnceLock<Mutex<Vec<TrackedConnection>>> = OnceLock::new();
 static LAST_LIST_REFRESH_ATTEMPT: OnceLock<Mutex<u64>> = OnceLock::new();
 static LAST_MIHOMO_HEALTHY_AT: OnceLock<Mutex<u64>> = OnceLock::new();
+static LAST_COMPILED_POLICY: OnceLock<Mutex<Option<CompiledPolicy>>> = OnceLock::new();
 
 fn state() -> &'static Mutex<AgentState> {
     STATE.get_or_init(|| Mutex::new(AgentState::default()))
@@ -116,6 +117,16 @@ fn last_list_refresh_attempt() -> &'static Mutex<u64> {
 
 fn last_mihomo_healthy_at() -> &'static Mutex<u64> {
     LAST_MIHOMO_HEALTHY_AT.get_or_init(|| Mutex::new(0))
+}
+
+fn last_compiled_policy() -> &'static Mutex<Option<CompiledPolicy>> {
+    LAST_COMPILED_POLICY.get_or_init(|| Mutex::new(None))
+}
+
+fn store_compiled_policy(policy: &CompiledPolicy) {
+    if let Ok(mut guard) = last_compiled_policy().lock() {
+        *guard = Some(policy.clone());
+    }
 }
 
 fn log_event(scope: &str, message: impl AsRef<str>) {
@@ -2166,6 +2177,228 @@ pub async fn select_proxy(group: String, proxy: String) -> Result<ProxyCatalog, 
         .map_err(|error| format!("Mihomo rejected proxy selection: {error}"))?;
     persist_proxy_selection(group.trim(), proxy.trim())?;
     proxy_catalog().await
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicySummaryResponse {
+    pub available: bool,
+    pub mode: String,
+    pub main_proxy_group: String,
+    pub final_rule: String,
+    pub mihomo_rules: Vec<String>,
+    pub zapret_hostlist: Vec<String>,
+    pub zapret_hostlist_exclude: Vec<String>,
+    pub zapret_ipset: Vec<String>,
+    pub zapret_ipset_exclude: Vec<String>,
+    pub dns_nameserver_policy: Vec<PolicyDnsRuleView>,
+    pub policy_rules: Vec<PolicyRuleView>,
+    pub suppressed_rules: Vec<SuppressedRuleView>,
+    pub diagnostics_expectations: Vec<RouteExpectationView>,
+    pub diagnostics_messages: Vec<String>,
+    pub managed_proxy_groups: Vec<ManagedGroupView>,
+    pub rule_count: usize,
+    pub suppressed_count: usize,
+    pub warnings_count: usize,
+    pub zapret_domain_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyRuleView {
+    pub target_kind: String,
+    pub target_value: String,
+    pub path: String,
+    pub path_group: Option<String>,
+    pub source: String,
+    pub priority: u16,
+    pub original_rule: Option<String>,
+    pub tags: Vec<String>,
+    pub mihomo_rule: String,
+    pub zapret_effect: String,
+    pub dns_effect: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuppressedRuleView {
+    pub original_rule: String,
+    pub chosen_rule: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteExpectationView {
+    pub target: String,
+    pub expected_path: String,
+    pub expected_mihomo_action: String,
+    pub expected_zapret: bool,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyDnsRuleView {
+    pub pattern: String,
+    pub nameservers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedGroupView {
+    pub name: String,
+    pub proxies: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn policy_summary() -> Result<PolicySummaryResponse, String> {
+    let policy = last_compiled_policy()
+        .lock()
+        .map_err(|_| "policy lock is poisoned".to_string())?
+        .clone();
+
+    let Some(policy) = policy else {
+        return Ok(PolicySummaryResponse {
+            available: false,
+            mode: String::new(),
+            main_proxy_group: String::new(),
+            final_rule: String::new(),
+            mihomo_rules: Vec::new(),
+            zapret_hostlist: Vec::new(),
+            zapret_hostlist_exclude: Vec::new(),
+            zapret_ipset: Vec::new(),
+            zapret_ipset_exclude: Vec::new(),
+            dns_nameserver_policy: Vec::new(),
+            policy_rules: Vec::new(),
+            suppressed_rules: Vec::new(),
+            diagnostics_expectations: Vec::new(),
+            diagnostics_messages: Vec::new(),
+            managed_proxy_groups: Vec::new(),
+            rule_count: 0,
+            suppressed_count: 0,
+            warnings_count: 0,
+            zapret_domain_count: 0,
+        });
+    };
+
+    let mode = format!("{:?}", policy.mode);
+    let final_rule = policy.mihomo_rules.last().cloned().unwrap_or_default();
+
+    let policy_rules = policy
+        .policy_rules
+        .iter()
+        .map(|rule| {
+            let path_str = match &rule.path {
+                badvpn_common::PolicyPath::DirectSafe => "DirectSafe".to_string(),
+                badvpn_common::PolicyPath::ZapretDirect => "ZapretDirect".to_string(),
+                badvpn_common::PolicyPath::VpnProxy { group } => format!("VpnProxy({})", group),
+                badvpn_common::PolicyPath::Reject => "Reject".to_string(),
+            };
+            let path_group = match &rule.path {
+                badvpn_common::PolicyPath::VpnProxy { group } => Some(group.clone()),
+                _ => None,
+            };
+            let mihomo_action = match &rule.path {
+                badvpn_common::PolicyPath::DirectSafe => "DIRECT",
+                badvpn_common::PolicyPath::ZapretDirect => "DIRECT",
+                badvpn_common::PolicyPath::VpnProxy { .. } => "proxy group",
+                badvpn_common::PolicyPath::Reject => "REJECT",
+            };
+            let target_kind_str = format!("{:?}", rule.target.kind);
+            let mihomo_rule = rule.original_rule.clone().unwrap_or_else(|| {
+                format!(
+                    "{},{},{}",
+                    target_kind_str, rule.target.value, mihomo_action
+                )
+            });
+            let zapret_effect = match &rule.path {
+                badvpn_common::PolicyPath::ZapretDirect => "hostlist/ipset".to_string(),
+                badvpn_common::PolicyPath::VpnProxy { .. } => "exclude".to_string(),
+                _ => "none".to_string(),
+            };
+            let dns_effect = if matches!(rule.path, badvpn_common::PolicyPath::VpnProxy { .. }) {
+                "trusted DoH".to_string()
+            } else {
+                "default".to_string()
+            };
+
+            PolicyRuleView {
+                target_kind: target_kind_str,
+                target_value: rule.target.value.clone(),
+                path: path_str,
+                path_group,
+                source: format!("{:?}", rule.source),
+                priority: rule.priority,
+                original_rule: rule.original_rule.clone(),
+                tags: rule.tags.clone(),
+                mihomo_rule,
+                zapret_effect,
+                dns_effect,
+            }
+        })
+        .collect();
+
+    let suppressed_rules = policy
+        .suppressed_rules
+        .iter()
+        .map(|rule| SuppressedRuleView {
+            original_rule: rule.original_rule.clone(),
+            chosen_rule: rule.chosen_rule.clone(),
+            reason: rule.reason.clone(),
+        })
+        .collect();
+
+    let diagnostics_expectations = policy
+        .diagnostics_expectations
+        .iter()
+        .map(|exp| RouteExpectationView {
+            target: exp.target.clone(),
+            expected_path: format!("{:?}", exp.expected_path),
+            expected_mihomo_action: exp.expected_mihomo_action.clone(),
+            expected_zapret: exp.expected_zapret,
+            source: format!("{:?}", exp.source),
+        })
+        .collect();
+
+    let dns_nameserver_policy = policy
+        .dns_nameserver_policy
+        .iter()
+        .map(|rule| PolicyDnsRuleView {
+            pattern: rule.pattern.clone(),
+            nameservers: rule.nameservers.clone(),
+        })
+        .collect();
+
+    let managed_proxy_groups = policy
+        .managed_proxy_groups
+        .iter()
+        .map(|group| ManagedGroupView {
+            name: group.name.clone(),
+            proxies: group.proxies.clone(),
+        })
+        .collect();
+
+    let rule_count = policy.mihomo_rules.len();
+    let suppressed_count = policy.suppressed_rules.len();
+    let warnings_count = policy.diagnostics_messages.len();
+    let zapret_domain_count = policy.zapret_hostlist.len();
+
+    Ok(PolicySummaryResponse {
+        available: true,
+        mode,
+        main_proxy_group: policy.main_proxy_group,
+        final_rule,
+        mihomo_rules: policy.mihomo_rules,
+        zapret_hostlist: policy.zapret_hostlist,
+        zapret_hostlist_exclude: policy.zapret_hostlist_exclude,
+        zapret_ipset: policy.zapret_ipset,
+        zapret_ipset_exclude: policy.zapret_ipset_exclude,
+        dns_nameserver_policy,
+        policy_rules,
+        suppressed_rules,
+        diagnostics_expectations,
+        diagnostics_messages: policy.diagnostics_messages,
+        managed_proxy_groups,
+        rule_count,
+        suppressed_count,
+        warnings_count,
+        zapret_domain_count,
+    })
 }
 
 async fn refresh_runtime_state(run_network_tests: bool) -> Result<AgentState, String> {
@@ -4331,6 +4564,7 @@ fn write_mihomo_config(subscription_body: &str) -> Result<(), String> {
         &secret,
         &options,
     )?;
+    store_compiled_policy(&generated.policy);
     let config_path = mihomo_config_path()?;
     let parent = config_path
         .parent()
