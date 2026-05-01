@@ -883,11 +883,7 @@ fn resolve_agent_bin() -> Result<PathBuf, String> {
     if let Ok(current_exe) = std::env::current_exe() {
         if let Some(dir) = current_exe.parent() {
             candidates.extend(exe_names.iter().map(|name| dir.join(name)));
-            candidates.extend(
-                exe_names
-                    .iter()
-                    .map(|name| dir.join("resources").join("agent").join(name)),
-            );
+            candidates.extend(agent_resource_bin_candidates(dir, &exe_names));
         }
     }
     if let Ok(current_dir) = std::env::current_dir() {
@@ -941,6 +937,48 @@ fn resolve_agent_bin() -> Result<PathBuf, String> {
                 "BadVpn agent binary was not found. Build it with `cargo build -p badvpn-agent`, stage `badvpn-agent-staged.exe`, or set BADVPN_AGENT_BIN."
             )
         })
+}
+
+fn agent_resource_bin_candidates(resource_parent: &Path, exe_names: &[&str]) -> Vec<PathBuf> {
+    exe_names
+        .iter()
+        .flat_map(|exe_name| {
+            [
+                resource_parent
+                    .join("resources")
+                    .join("agent")
+                    .join(exe_name),
+                resource_parent
+                    .join("resources")
+                    .join("resources")
+                    .join("agent")
+                    .join(exe_name),
+            ]
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod agent_resource_tests {
+    use super::*;
+
+    #[test]
+    fn agent_resource_candidates_include_tauri_preserved_directory_layout() {
+        let candidates = agent_resource_bin_candidates(
+            Path::new("C:/Program Files/BadVpn"),
+            &["badvpn-agent-staged.exe"],
+        );
+
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("C:/Program Files/BadVpn/resources/agent/badvpn-agent-staged.exe"),
+                PathBuf::from(
+                    "C:/Program Files/BadVpn/resources/resources/agent/badvpn-agent-staged.exe"
+                ),
+            ]
+        );
+    }
 }
 
 #[tauri::command]
