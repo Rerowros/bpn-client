@@ -471,6 +471,7 @@ pub async fn restart() -> Result<AgentState, String> {
 
 async fn start_via_agent(settings: &AppSettings) -> Result<AgentState, String> {
     let request = build_agent_connect_request(settings).await?;
+    ensure_agent_runtime_components(settings).await?;
     let agent_state = send_agent_command(
         AgentCommand::Connect {
             request: Box::new(request),
@@ -882,12 +883,22 @@ fn resolve_agent_bin() -> Result<PathBuf, String> {
     if let Ok(current_exe) = std::env::current_exe() {
         if let Some(dir) = current_exe.parent() {
             candidates.extend(exe_names.iter().map(|name| dir.join(name)));
+            candidates.extend(agent_resource_bin_candidates(dir, &exe_names));
         }
     }
     if let Ok(current_dir) = std::env::current_dir() {
         for exe_name in &exe_names {
             candidates.push(current_dir.join("target").join("debug").join(exe_name));
             candidates.push(current_dir.join("target").join("release").join(exe_name));
+            candidates.push(
+                current_dir
+                    .join("apps")
+                    .join("badvpn-client")
+                    .join("src-tauri")
+                    .join("resources")
+                    .join("agent")
+                    .join(exe_name),
+            );
             candidates.push(
                 current_dir
                     .join("apps")
@@ -926,6 +937,48 @@ fn resolve_agent_bin() -> Result<PathBuf, String> {
                 "BadVpn agent binary was not found. Build it with `cargo build -p badvpn-agent`, stage `badvpn-agent-staged.exe`, or set BADVPN_AGENT_BIN."
             )
         })
+}
+
+fn agent_resource_bin_candidates(resource_parent: &Path, exe_names: &[&str]) -> Vec<PathBuf> {
+    exe_names
+        .iter()
+        .flat_map(|exe_name| {
+            [
+                resource_parent
+                    .join("resources")
+                    .join("agent")
+                    .join(exe_name),
+                resource_parent
+                    .join("resources")
+                    .join("resources")
+                    .join("agent")
+                    .join(exe_name),
+            ]
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod agent_resource_tests {
+    use super::*;
+
+    #[test]
+    fn agent_resource_candidates_include_tauri_preserved_directory_layout() {
+        let candidates = agent_resource_bin_candidates(
+            Path::new("C:/Program Files/BadVpn"),
+            &["badvpn-agent-staged.exe"],
+        );
+
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("C:/Program Files/BadVpn/resources/agent/badvpn-agent-staged.exe"),
+                PathBuf::from(
+                    "C:/Program Files/BadVpn/resources/resources/agent/badvpn-agent-staged.exe"
+                ),
+            ]
+        );
+    }
 }
 
 #[tauri::command]
@@ -3892,6 +3945,45 @@ fn uppercase_or_unknown(value: &str) -> String {
     }
 }
 
+async fn ensure_agent_runtime_components(settings: &AppSettings) -> Result<(), String> {
+    let needs_zapret =
+        settings.effective_route_mode() == RouteMode::Smart && settings.zapret.enabled;
+    if agent_runtime_components_ready(needs_zapret) {
+        return Ok(());
+    }
+
+    log_event(
+        "components",
+        "first-run runtime component preparation requested for badvpn-agent",
+    );
+    install_components(false).await?;
+
+    if read_badvpn_agent_service_status().installed {
+        stage_runtime_assets_to_programdata()?;
+        log_event(
+            "components",
+            "first-run runtime components staged to ProgramData for badvpn-agent",
+        );
+    }
+
+    if agent_runtime_components_ready(needs_zapret) {
+        Ok(())
+    } else {
+        Err("Runtime components are still missing after first-run preparation.".to_string())
+    }
+}
+
+fn agent_runtime_components_ready(needs_zapret: bool) -> bool {
+    let mihomo_ready = resolve_mihomo_bin().is_ok()
+        || programdata_mihomo_bin()
+            .map(|path| path.exists())
+            .unwrap_or(false);
+    let zapret_ready = !needs_zapret
+        || zapret_runtime_assets_ready().is_ok()
+        || programdata_zapret_runtime_assets_ready().is_ok();
+    mihomo_ready && zapret_ready
+}
+
 async fn install_components(force: bool) -> Result<(), String> {
     fs::create_dir_all(data_dir()?.join("downloads"))
         .map_err(|error| format!("Failed to create downloads directory: {error}"))?;
@@ -5659,6 +5751,38 @@ fn component_dir(component: &str) -> Result<PathBuf, String> {
     Ok(data_dir()?.join("components").join(component))
 }
 
+fn programdata_component_dir(component: &str) -> Result<PathBuf, String> {
+    Ok(programdata_dir()?.join("components").join(component))
+}
+
+fn programdata_mihomo_bin() -> Result<PathBuf, String> {
+    Ok(programdata_component_dir("mihomo")?.join("mihomo.exe"))
+}
+
+fn programdata_flowseal_zapret_assets() -> Result<FlowsealZapretAssets, String> {
+    let root_dir = programdata_component_dir("zapret")?;
+    let bin_dir = root_dir.join("bin");
+    let profiles_dir = root_dir.join("profiles");
+    let lists_dir = root_dir.join("lists");
+    Ok(FlowsealZapretAssets {
+        root_dir,
+        bin_dir: bin_dir.clone(),
+        profiles_dir,
+        list_general: lists_dir.join("list-general.txt"),
+        list_general_user: lists_dir.join("list-general-user.txt"),
+        list_google: lists_dir.join("list-google.txt"),
+        list_exclude: lists_dir.join("list-exclude.txt"),
+        list_exclude_user: lists_dir.join("list-exclude-user.txt"),
+        ipset_all: lists_dir.join("ipset-all.txt"),
+        ipset_effective: lists_dir.join("ipset-all.effective.txt"),
+        ipset_exclude: lists_dir.join("ipset-exclude.txt"),
+        ipset_exclude_user: lists_dir.join("ipset-exclude-user.txt"),
+        fake_quic: bin_dir.join("quic_initial_www_google_com.bin"),
+        fake_tls_google: bin_dir.join("tls_clienthello_www_google_com.bin"),
+        fake_tls_4pda: bin_dir.join("tls_clienthello_4pda_to.bin"),
+    })
+}
+
 fn extract_mihomo_zip(bytes: &[u8]) -> Result<(), String> {
     let mut archive = ZipArchive::new(Cursor::new(bytes))
         .map_err(|error| format!("Failed to open Mihomo zip: {error}"))?;
@@ -6042,6 +6166,15 @@ async fn ensure_zapret_runtime_lists_force() -> Result<(), String> {
 
 fn zapret_runtime_assets_ready() -> Result<(), String> {
     let assets = flowseal_zapret_assets()?;
+    zapret_runtime_assets_ready_for_assets(&assets)
+}
+
+fn programdata_zapret_runtime_assets_ready() -> Result<(), String> {
+    let assets = programdata_flowseal_zapret_assets()?;
+    zapret_runtime_assets_ready_for_assets(&assets)
+}
+
+fn zapret_runtime_assets_ready_for_assets(assets: &FlowsealZapretAssets) -> Result<(), String> {
     let required = [
         assets.bin_dir.join("winws.exe"),
         assets.bin_dir.join("WinDivert.dll"),
