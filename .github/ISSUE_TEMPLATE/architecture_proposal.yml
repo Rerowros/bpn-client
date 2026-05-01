@@ -1,0 +1,59 @@
+name: Architecture proposal
+description: Propose a significant architecture, runtime, security, or workflow change.
+title: "[architecture] "
+labels: ["needs:triage", "needs:decision", "proposal:architecture"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for large architecture, runtime, security, or workflow changes before implementation.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What current design choice is limiting, unsafe, or hard to maintain?
+    validations:
+      required: true
+  - type: textarea
+    id: current
+    attributes:
+      label: Current architecture
+      description: Describe the current behavior or ownership boundary.
+    validations:
+      required: true
+  - type: textarea
+    id: proposed
+    attributes:
+      label: Proposed architecture
+      description: What should replace it?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: textarea
+    id: impact
+    attributes:
+      label: Security, runtime, and Windows impact
+      description: Mention privilege boundaries, IPC, routing, DNS, firewall, update, rollback, installer, or service impact.
+    validations:
+      required: true
+  - type: textarea
+    id: migration
+    attributes:
+      label: Migration and rollback plan
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation plan
+      description: Tests, checks, and manual Windows QA needed.
+    validations:
+      required: true
+  - type: textarea
+    id: files
+    attributes:
+      label: Files and docs likely affected
+      render: text

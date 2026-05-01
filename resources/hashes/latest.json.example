@@ -1,0 +1,11 @@
+{
+  "version": "0.1.1",
+  "notes": "BadVpn update notes",
+  "pub_date": "2026-04-28T00:00:00Z",
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "SIGNATURE_FROM_TAURI_BUILD",
+      "url": "https://github.com/Rerowros/bpn-client/releases/download/v0.1.1/BadVpn_0.1.1_x64-setup.nsis.zip"
+    }
+  }
+}

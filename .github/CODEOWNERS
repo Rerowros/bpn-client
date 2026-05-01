@@ -1,0 +1,19 @@
+# CODEOWNERS controls automatic review requests on GitHub.
+# Listed owners must have write access to the repository.
+
+* @Rerowros
+
+# Security-sensitive runtime and privileged code.
+/crates/badvpn-agent/ @Rerowros
+/crates/badvpn-common/src/ipc.rs @Rerowros
+/crates/badvpn-common/src/mihomo_config.rs @Rerowros
+/crates/badvpn-common/src/policy.rs @Rerowros
+/apps/badvpn-client/src-tauri/ @Rerowros
+
+# Release, update, CI, and project governance.
+/.github/ @Rerowros
+/resources/hashes/ @Rerowros
+/scripts/ @Rerowros
+/docs/update-release.md @Rerowros
+/docs/qa-win-mvp.md @Rerowros
+/SECURITY.md @Rerowros

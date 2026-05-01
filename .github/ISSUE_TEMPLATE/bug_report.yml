@@ -1,0 +1,78 @@
+name: Bug report
+description: Report broken current behavior in BadVpn.
+title: "[bug] "
+labels: ["type:bug", "needs:triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include subscription URLs, tokens, controller secrets, raw credentials, or unsanitized logs. Security vulnerabilities must follow SECURITY.md instead of public issues.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What is broken?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: List the smallest steps that reproduce the issue.
+      placeholder: |
+        1. Open BadVpn
+        2. Select Smart
+        3. Click Connect
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: dropdown
+    id: route_mode
+    attributes:
+      label: Route mode
+      options:
+        - Smart
+        - VPN Only
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: Windows 11 23H2
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: BadVpn version or commit
+      placeholder: v0.1.0 or commit SHA
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Paste only sanitized logs or diagnostics. Remove secrets and subscription URLs first.
+      render: text
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I removed subscription URLs, tokens, controller secrets, and raw credentials.
+          required: true
+        - label: This is not a private security vulnerability report.
+          required: true

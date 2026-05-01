@@ -1,0 +1,14 @@
+# BadVpn Smart Hybrid overlay.
+# Discord and game-bypass targets must resolve to DIRECT so they do not use VPN servers.
+# zapret/winws handles DPI bypass on the direct path.
+
+rules:
+  - DOMAIN-SUFFIX,discord.com,DIRECT
+  - DOMAIN-SUFFIX,discord.gg,DIRECT
+  - DOMAIN-SUFFIX,discordapp.com,DIRECT
+  - DOMAIN-SUFFIX,discordapp.net,DIRECT
+  - DOMAIN-SUFFIX,discordcdn.com,DIRECT
+  - DOMAIN-SUFFIX,discord.media,DIRECT
+  - DOMAIN-SUFFIX,discord-activities.com,DIRECT
+  - DOMAIN-SUFFIX,discordactivities.com,DIRECT
+  - MATCH,PROXY
