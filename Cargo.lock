@@ -97,7 +97,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "badvpn-common",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
