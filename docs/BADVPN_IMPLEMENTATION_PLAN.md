@@ -1,12 +1,12 @@
-# BadVpn Implementation Plan
+# BPN Client Implementation Plan
 
-BadVpn is a Windows-first desktop VPN client for our VPN service. The first release must provide a simple, reliable desktop flow around a Clash/Mihomo subscription, Mihomo TUN routing, and local zapret/winws bypass for Discord, YouTube/Googlevideo, and configured games that should not go through VPN servers.
+BPN Client is a Windows-first desktop VPN client for the BPN VPN service. The first release must provide a simple, reliable desktop flow around a Clash/Mihomo subscription, Mihomo TUN routing, and local zapret/winws bypass for Discord, YouTube/Googlevideo, and configured games that should not go through VPN servers.
 
 For agent-driven development, this file is the product and architecture contract. Keep task status in `docs/PLAN.MD`, runtime mechanics in `docs/runtime-mihomo-zapret.md`, update rules in `docs/update-release.md`, and manual QA in `docs/qa-win-mvp.md`.
 
 ## Product Goal
 
-BadVpn should let a user install the app, add a Clash/Mihomo subscription URL, press connect, and get a working desktop connection without manually editing configs, running batch files, or choosing technical routing options.
+BPN Client should let a user install the app, add a Clash/Mihomo subscription URL, press connect, and get a working desktop connection without manually editing configs, running batch files, or choosing technical routing options.
 
 The first public routing model has two modes. **Smart** is the default:
 
@@ -18,7 +18,7 @@ The first public routing model has two modes. **Smart** is the default:
 
 ## Implementation Defaults
 
-- Product name: `BadVpn`
+- Product name: `BPN Client`
 - First platform: Windows 10/11
 - Later platform targets: macOS and Linux after the Windows service/routing model is stable
 - UI stack: Tauri v2 + React + TypeScript
@@ -73,7 +73,7 @@ The service integration starts with Clash/Mihomo subscription compatibility.
 
 - Add, edit, remove, and refresh subscription URLs.
 - Validate fetched profiles before applying them.
-- Normalize provider configs into BadVpn-managed Mihomo config overlays.
+- Normalize provider configs into BPN Client-managed Mihomo config overlays.
 - Preserve provider proxy groups while adding app routing, DNS, controller, and TUN settings.
 - Detect duplicate subscriptions and failed refreshes.
 - Keep refresh history and rollback to the previous valid profile.
@@ -146,10 +146,10 @@ Additional runtime hardening:
 
 ### FG6. Updates and Component Integrity
 
-BadVpn must keep Mihomo and bypass assets current without blindly trusting remote release pages.
+BPN Client must keep Mihomo and bypass assets current without blindly trusting remote release pages.
 
 - Use signed app updates for the Tauri client.
-- Use a BadVpn component manifest for Mihomo, winws, WinDivert, lists, and config templates.
+- Use a BPN Client component manifest for Mihomo, winws, WinDivert, lists, and config templates.
 - Verify each component by hash and, where possible, signature.
 - Download into staging, verify, stop affected processes, atomically swap, test, then commit.
 - Keep previous component versions for rollback.
@@ -242,7 +242,7 @@ Exit criteria:
 
 - App survives reboot and reports the correct intended state.
 - Failed component update rolls back.
-- Uninstall removes only BadVpn-owned services, rules, files, and scheduled tasks.
+- Uninstall removes only BPN Client-owned services, rules, files, and scheduled tasks.
 
 ### M4. Release Hardening
 
@@ -265,7 +265,7 @@ Exit criteria:
 
 ## Global Acceptance Criteria
 
-- BadVpn installs and runs on a clean Windows 10/11 machine.
+- BPN Client installs and runs on a clean Windows 10/11 machine.
 - UI runs without administrator privileges after setup.
 - User can add a Clash/Mihomo subscription and connect.
 - Mihomo lifecycle is stable across connect, disconnect, reconnect, app restart, and system reboot.
@@ -273,7 +273,7 @@ Exit criteria:
 - zapret/winws failure does not block VPN startup.
 - Updates are verified and rollback-capable.
 - No secrets appear in plaintext logs or diagnostic bundles.
-- Uninstall cleans BadVpn-owned services, route/firewall changes, managed assets, and scheduled tasks without touching unrelated VPN/DPI tools.
+- Uninstall cleans BPN Client-owned services, route/firewall changes, managed assets, and scheduled tasks without touching unrelated VPN/DPI tools.
 - Diagnostics can attest the installed `badvpn-agent.exe` path/version/hash and warn when the installed service binary differs from the staged build.
 
 ## Current Open Questions

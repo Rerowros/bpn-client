@@ -1,6 +1,6 @@
-# BadVpn Docs Index for Agents
+# BPN Client Docs Index
 
-This folder is the working context for BadVpn agent-driven development. Keep each decision in one canonical document, then link to it instead of copying the same checklist into every plan.
+This folder is the working context for BPN Client development. Keep each decision in one canonical document, then link to it instead of copying the same checklist into every plan.
 
 ## Read Order
 

@@ -1,4 +1,4 @@
-# BadVpn Runtime Contract
+# BPN Client Runtime Contract
 
 This document owns runtime behavior: `badvpn-agent`, IPC, Mihomo/winws lifecycle, generated configs, logs, preflight, and fallback. Product scope lives in `docs/BADVPN_IMPLEMENTATION_PLAN.md`; update/signing rules live in `docs/update-release.md`; manual scenarios live in `docs/qa-win-mvp.md`.
 
@@ -21,7 +21,7 @@ This document owns runtime behavior: `badvpn-agent`, IPC, Mihomo/winws lifecycle
 
 1. UI loads the active subscription profile, fetches the raw Clash/Mihomo body, and sends the body to the agent. The subscription URL itself is not sent.
 2. The agent runs preflight before mutating runtime state.
-3. The agent compiles one `CompiledPolicy` from subscription YAML, BadVpn presets, user overrides, game profiles, runtime facts, and selected proxy groups.
+3. The agent compiles one `CompiledPolicy` from subscription YAML, BPN Client presets, user overrides, game profiles, runtime facts, and selected proxy groups.
 4. The same compiled policy renders:
    - Mihomo rules and overlay settings;
    - zapret hostlist, hostlist-exclude, ipset, and ipset-exclude;
@@ -48,7 +48,9 @@ Preflight should cover mixed/controller ports, DNS port `1053` TCP/UDP, managed 
 
 - User downloads and subscription state: `%APPDATA%\BadVpn`.
 - Service runtime assets/configs/logs: `%PROGRAMDATA%\BadVpn`.
-- Agent service install/repair stages the current BadVpn runtime assets into ProgramData.
+- The Tauri installer bundles the current `badvpn-agent.exe` under application resources so Install / Repair can stage it into `%PROGRAMDATA%\BadVpn\agent`.
+- Agent service install/repair stages the current BPN Client runtime assets into ProgramData.
+- Mihomo and zapret/winws are not bundled into the installer. On first connect or explicit runtime update, the GUI downloads them into user-scoped components, then stages verified assets into ProgramData for `badvpn-agent`.
 - Runtime update/repair should eventually download, verify, stage, swap, smoke-check, and rollback entirely inside `badvpn-agent`.
 
 ## Logs And Secrets
@@ -60,7 +62,7 @@ Preflight should cover mixed/controller ports, DNS port `1053` TCP/UDP, managed 
 
 ## Runtime Checks
 
-BadVpn performs lightweight status checks in the background and full diagnostics on demand.
+BPN Client performs lightweight status checks in the background and full diagnostics on demand.
 
 Checks include:
 

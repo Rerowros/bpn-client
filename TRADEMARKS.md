@@ -26,7 +26,7 @@ Forks must not imply official endorsement, ownership, or compatibility with the 
 
 The source code license does not grant permission to misuse:
 
-- the `BPN Client` or `BadVpn` project name;
+- the `BPN Client` project name;
 - project logos or icons;
 - official screenshots and marketing materials;
 - official domains and VPN service links;

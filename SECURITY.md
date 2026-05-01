@@ -1,10 +1,10 @@
 # Security Policy
 
-BadVpn is security-sensitive because it manages VPN routing, privileged Windows service operations, runtime binaries, local IPC, update flows, and user subscription data.
+BPN Client is security-sensitive because it manages VPN routing, privileged Windows service operations, runtime binaries, local IPC, update flows, and user subscription data.
 
 ## Supported Versions
 
-BadVpn is currently pre-release. Security fixes are applied to the active development branch unless a release branch is explicitly announced.
+BPN Client is currently pre-release. Security fixes are applied to the active development branch unless a release branch is explicitly announced.
 
 ## Reporting a Vulnerability
 

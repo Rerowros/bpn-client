@@ -1,4 +1,4 @@
-# BadVpn Windows MVP QA Matrix
+# BPN Client Windows MVP QA Matrix
 
 This document owns manual Windows validation. Keep architecture in `docs/BADVPN_IMPLEMENTATION_PLAN.md`, runtime mechanics in `docs/runtime-mihomo-zapret.md`, and release/update gates in `docs/update-release.md`.
 
@@ -28,7 +28,7 @@ This document owns manual Windows validation. Keep architecture in `docs/BADVPN_
 
 ```text
 [ ] Connect sends runtime work through `badvpn-agent`.
-[ ] Disconnect stops BadVpn-owned Mihomo/winws and restores owned route/DNS changes.
+[ ] Disconnect stops BPN Client-owned Mihomo/winws and restores owned route/DNS changes.
 [ ] Restart performs stop then start without manual cleanup.
 [ ] App restart shows the correct current state.
 [ ] Windows reboot restores intended state or enters safe mode with an actionable message.
@@ -88,6 +88,6 @@ This document owns manual Windows validation. Keep architecture in `docs/BADVPN_
 [ ] Component update stages files before swap.
 [ ] Failed component smoke check rolls back automatically.
 [ ] App update artifacts are signed before public release.
-[ ] Uninstall removes only BadVpn-owned services, files, routes, firewall rules, and scheduled tasks.
+[ ] Uninstall removes only BPN Client-owned services, files, routes, firewall rules, and scheduled tasks.
 [ ] Uninstall does not remove unrelated VPN/DPI tools.
 ```

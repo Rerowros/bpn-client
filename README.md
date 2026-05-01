@@ -6,9 +6,9 @@ This repository is in active MVP development. The current source of truth is the
 
 ## Development Model
 
-BPN Client is an AI-first source-available project. The initial planning, architecture notes, implementation passes, and review preparation were built with frontier GPT-5.5-class models and then checked against local code, documentation, and manual Windows runtime expectations.
+BPN Client is a source-available project in active MVP development. Contributors with real engineering experience in Windows networking, Rust, Tauri, VPN routing, privileged services, installer and update systems, or security are especially welcome. Large redesign proposals are accepted when they clearly explain the current limitation, the proposed architecture, migration path, risk, and validation plan.
 
-The project is not presented as a finished senior-engineered VPN platform. Developers with strong architecture, Windows networking, Rust, Tauri, VPN, routing, security, installer, or update-system experience are especially welcome. Large redesign proposals are allowed when they clearly explain the current limitation, the proposed architecture, migration path, risk, and validation plan.
+AI tools are allowed and encouraged, but the human contributor is fully responsible for the result. Meaningful AI assistance must be disclosed in the PR template.
 
 ## Start Here
 

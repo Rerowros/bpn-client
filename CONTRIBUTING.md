@@ -1,8 +1,10 @@
-# Contributing to BadVpn
+# Contributing to BPN Client
 
-Thanks for helping improve BadVpn. This project is security-sensitive because it manages VPN routing, a privileged Windows service, runtime binaries, local controller secrets, and user subscription data.
+Thanks for helping improve BPN Client. This project is security-sensitive because it manages VPN routing, a privileged Windows service, runtime binaries, local controller secrets, and user subscription data.
 
-BadVpn is an AI-first project. The initial roadmap, architecture drafts, implementation passes, and review notes were produced with GPT-assisted planning and coding, then checked against the repository and Windows runtime expectations. Contributions from developers with architecture, networking, Rust, Tauri, Windows service, VPN, installer, update, or security experience are welcome precisely because the current design should be challenged where it is weak.
+BPN Client actively looks for contributors with real engineering experience: Windows networking, Rust, Tauri, VPN routing, privileged services, installer and update systems, or security. The codebase needs people who can challenge weak design with evidence, propose concrete alternatives, and own the outcome. If you see something wrong architecturally, open a proposal — that kind of input is especially valued.
+
+AI tools are allowed and encouraged, but the human contributor is fully responsible for correctness, security, testing, and documentation. Meaningful AI assistance must be disclosed in the PR template. Do not treat AI output as trusted authority.
 
 Before changing product behavior or architecture, read:
 
@@ -101,7 +103,7 @@ AI tools are allowed and expected in this project, but the human author owns the
 
 Use the bug report issue form and include:
 
-- BadVpn version or commit.
+- BPN Client version or commit.
 - Windows version.
 - Route mode: `Smart` or `VPN Only`.
 - Whether Mihomo, winws/zapret, or `badvpn-agent` is involved.

@@ -1,6 +1,6 @@
-# BadVpn Agent Rules
+# BPN Client Agent Rules
 
-This repository is for **BadVpn**, a Windows-first desktop VPN client for our VPN service.
+This repository is for **BPN Client**, a Windows-first desktop VPN client for the BPN VPN service.
 
 Read [docs/BADVPN_IMPLEMENTATION_PLAN.md](docs/BADVPN_IMPLEMENTATION_PLAN.md) before making product, architecture, routing, installer, service, or update changes.
 
@@ -21,7 +21,7 @@ Read [docs/BADVPN_IMPLEMENTATION_PLAN.md](docs/BADVPN_IMPLEMENTATION_PLAN.md) be
 - Follow [CONTRIBUTING.md](CONTRIBUTING.md) for branches, PRs, AI-assisted work, architecture proposals, and review expectations.
 - Follow [TRADEMARKS.md](TRADEMARKS.md) for official service-link and brand attribution rules.
 - Keep PRs focused and reviewable. Split unrelated product, runtime, docs, and CI changes unless a maintainer explicitly asks for one combined PR.
-- Disclose meaningful AI assistance in the PR template. The human contributor remains responsible for correctness, security, testing, and docs.
+- AI tools are allowed. Disclose meaningful AI assistance in the PR template. The human contributor owns the result and is fully responsible for correctness, security, testing, and docs. Do not treat AI output as trusted authority without verification.
 - Security-sensitive changes require maintainer review even if generated tests pass.
 
 ## Mandatory Research Gate
@@ -79,7 +79,7 @@ For crate-specific work, resolve/query the exact crate or docs source through Co
 - Windows documentation: https://github.com/bol-van/zapret/blob/master/docs/windows.en.md
 - Windows quick start: https://github.com/bol-van/zapret/blob/master/docs/quick_start_windows.md
 - Windows bundle releases: https://github.com/bol-van/zapret-win-bundle/releases
-- Existing local Flowseal-style reference, when available on the workstation: `C:\Users\yp328\Desktop\z\service.bat`
+- Existing local Flowseal-style reference: check `service.bat` from the local zapret-win-bundle if available on the workstation.
 
 ## Architecture Constraints
 

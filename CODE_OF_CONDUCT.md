@@ -1,6 +1,6 @@
 # Code of Conduct
 
-BadVpn uses a practical contributor conduct policy focused on technical collaboration.
+BPN Client uses a practical contributor conduct policy focused on technical collaboration.
 
 ## Expected Behavior
 
