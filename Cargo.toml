@@ -29,4 +29,4 @@ url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 windows-sys = "0.61"
 windows-service = "0.8"
-zip = { version = "4", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
