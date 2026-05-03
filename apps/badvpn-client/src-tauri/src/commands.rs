@@ -81,7 +81,7 @@ static LAST_ACTIVE_CONNECTIONS: OnceLock<Mutex<Vec<TrackedConnection>>> = OnceLo
 static CLOSED_CONNECTIONS: OnceLock<Mutex<Vec<TrackedConnection>>> = OnceLock::new();
 static LAST_LIST_REFRESH_ATTEMPT: OnceLock<Mutex<u64>> = OnceLock::new();
 static LAST_MIHOMO_HEALTHY_AT: OnceLock<Mutex<u64>> = OnceLock::new();
-static LAST_COMPILED_POLICY: OnceLock<Mutex<Option<CompiledPolicy>>> = OnceLock::new();
+static LAST_PREVIEW_POLICY: OnceLock<Mutex<Option<CompiledPolicy>>> = OnceLock::new();
 
 fn state() -> &'static Mutex<AgentState> {
     STATE.get_or_init(|| Mutex::new(AgentState::default()))
@@ -119,12 +119,12 @@ fn last_mihomo_healthy_at() -> &'static Mutex<u64> {
     LAST_MIHOMO_HEALTHY_AT.get_or_init(|| Mutex::new(0))
 }
 
-fn last_compiled_policy() -> &'static Mutex<Option<CompiledPolicy>> {
-    LAST_COMPILED_POLICY.get_or_init(|| Mutex::new(None))
+fn last_preview_policy() -> &'static Mutex<Option<CompiledPolicy>> {
+    LAST_PREVIEW_POLICY.get_or_init(|| Mutex::new(None))
 }
 
-fn store_compiled_policy(policy: &CompiledPolicy) {
-    if let Ok(mut guard) = last_compiled_policy().lock() {
+fn store_preview_policy(policy: &CompiledPolicy) {
+    if let Ok(mut guard) = last_preview_policy().lock() {
         *guard = Some(policy.clone());
     }
 }
@@ -151,6 +151,8 @@ fn log_event(scope: &str, message: impl AsRef<str>) {
 struct AgentWireResponse {
     ok: bool,
     state: Option<AgentState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_summary: Option<badvpn_common::ipc::PolicySummaryResponse>,
     error: Option<String>,
 }
 
@@ -624,6 +626,26 @@ fn send_agent_tcp_command(command: &AgentCommand) -> Result<AgentState, String> 
     }
 }
 
+fn send_agent_tcp_command_raw(command: &AgentCommand) -> Result<AgentWireResponse, String> {
+    let mut stream = TcpStream::connect(AGENT_LOCAL_ADDR)
+        .map_err(|error| format!("BadVpn agent is not reachable at {AGENT_LOCAL_ADDR}: {error}"))?;
+    serde_json::to_writer(&mut stream, command)
+        .map_err(|error| format!("Failed to serialize agent command: {error}"))?;
+    stream
+        .write_all(b"\n")
+        .map_err(|error| format!("Failed to send agent command: {error}"))?;
+    stream
+        .flush()
+        .map_err(|error| format!("Failed to flush agent command: {error}"))?;
+
+    let mut line = String::new();
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .map_err(|error| format!("Failed to read agent response: {error}"))?;
+    serde_json::from_str::<AgentWireResponse>(&line)
+        .map_err(|error| format!("Failed to parse agent response: {error}"))
+}
+
 #[cfg(windows)]
 fn send_agent_pipe_command(command: &AgentCommand) -> Result<AgentState, String> {
     let mut data = serde_json::to_vec(command)
@@ -651,8 +673,30 @@ fn send_agent_pipe_command(command: &AgentCommand) -> Result<AgentState, String>
     result
 }
 
+#[cfg(windows)]
+fn send_agent_pipe_command_raw(command: &AgentCommand) -> Result<AgentWireResponse, String> {
+    let mut data = serde_json::to_vec(command)
+        .map_err(|error| format!("Failed to serialize agent command: {error}"))?;
+    data.push(b'\n');
+    let handle = open_agent_pipe(Duration::from_secs(4))?;
+    let result = (|| {
+        write_pipe_all(handle, &data)?;
+        let line = read_pipe_line(handle)?;
+        serde_json::from_str::<AgentWireResponse>(&line)
+            .map_err(|error| format!("Failed to parse agent response: {error}"))
+    })();
+    unsafe {
+        CloseHandle(handle);
+    }
+    result
+}
+
 #[cfg(not(windows))]
 fn send_agent_pipe_command(_command: &AgentCommand) -> Result<AgentState, String> {
+}
+
+#[cfg(not(windows))]
+fn send_agent_pipe_command_raw(_command: &AgentCommand) -> Result<AgentWireResponse, String> {
     Err("BadVpn named pipe IPC is only available on Windows.".to_string())
 }
 
@@ -2179,226 +2223,51 @@ pub async fn select_proxy(group: String, proxy: String) -> Result<ProxyCatalog, 
     proxy_catalog().await
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PolicySummaryResponse {
-    pub available: bool,
-    pub mode: String,
-    pub main_proxy_group: String,
-    pub final_rule: String,
-    pub mihomo_rules: Vec<String>,
-    pub zapret_hostlist: Vec<String>,
-    pub zapret_hostlist_exclude: Vec<String>,
-    pub zapret_ipset: Vec<String>,
-    pub zapret_ipset_exclude: Vec<String>,
-    pub dns_nameserver_policy: Vec<PolicyDnsRuleView>,
-    pub policy_rules: Vec<PolicyRuleView>,
-    pub suppressed_rules: Vec<SuppressedRuleView>,
-    pub diagnostics_expectations: Vec<RouteExpectationView>,
-    pub diagnostics_messages: Vec<String>,
-    pub managed_proxy_groups: Vec<ManagedGroupView>,
-    pub rule_count: usize,
-    pub suppressed_count: usize,
-    pub warnings_count: usize,
-    pub zapret_domain_count: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PolicyRuleView {
-    pub target_kind: String,
-    pub target_value: String,
-    pub path: String,
-    pub path_group: Option<String>,
-    pub source: String,
-    pub priority: u16,
-    pub original_rule: Option<String>,
-    pub tags: Vec<String>,
-    pub mihomo_rule: String,
-    pub zapret_effect: String,
-    pub dns_effect: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SuppressedRuleView {
-    pub original_rule: String,
-    pub chosen_rule: String,
-    pub reason: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RouteExpectationView {
-    pub target: String,
-    pub expected_path: String,
-    pub expected_mihomo_action: String,
-    pub expected_zapret: bool,
-    pub source: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PolicyDnsRuleView {
-    pub pattern: String,
-    pub nameservers: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ManagedGroupView {
-    pub name: String,
-    pub proxies: Vec<String>,
-}
-
 #[tauri::command]
-pub async fn policy_summary() -> Result<PolicySummaryResponse, String> {
-    let policy = last_compiled_policy()
+pub async fn policy_summary() -> Result<badvpn_common::ipc::PolicySummaryResponse, String> {
+    if should_use_agent_runtime() {
+        if let Ok(response) = send_agent_pipe_command_raw(&AgentCommand::PolicySummary) {
+            if response.ok {
+                if let Some(summary) = response.policy_summary {
+                    return Ok(summary);
+                }
+            }
+        } else if std::env::var("BADVPN_AGENT_TCP_FALLBACK").ok().as_deref() == Some("1") {
+            if let Ok(response) = send_agent_tcp_command_raw(&AgentCommand::PolicySummary) {
+                if response.ok {
+                    if let Some(summary) = response.policy_summary {
+                        return Ok(summary);
+                    }
+                }
+            }
+        }
+    }
+
+    let program_data = std::env::var("PROGRAMDATA").unwrap_or_else(|_| "C:\\ProgramData".to_string());
+    let path = std::path::PathBuf::from(program_data)
+        .join("BadVpn")
+        .join("runtime")
+        .join("mihomo")
+        .join("policy-summary.json");
+    
+    if let Ok(json) = std::fs::read_to_string(&path) {
+        if let Ok(summary) = serde_json::from_str::<badvpn_common::ipc::PolicySummaryResponse>(&json) {
+            return Ok(summary);
+        }
+    }
+
+    let policy = last_preview_policy()
         .lock()
         .map_err(|_| "policy lock is poisoned".to_string())?
         .clone();
 
-    let Some(policy) = policy else {
-        return Ok(PolicySummaryResponse {
-            available: false,
-            mode: String::new(),
-            main_proxy_group: String::new(),
-            final_rule: String::new(),
-            mihomo_rules: Vec::new(),
-            zapret_hostlist: Vec::new(),
-            zapret_hostlist_exclude: Vec::new(),
-            zapret_ipset: Vec::new(),
-            zapret_ipset_exclude: Vec::new(),
-            dns_nameserver_policy: Vec::new(),
-            policy_rules: Vec::new(),
-            suppressed_rules: Vec::new(),
-            diagnostics_expectations: Vec::new(),
-            diagnostics_messages: Vec::new(),
-            managed_proxy_groups: Vec::new(),
-            rule_count: 0,
-            suppressed_count: 0,
-            warnings_count: 0,
-            zapret_domain_count: 0,
-        });
-    };
+    if let Some(policy) = policy {
+        let mut summary: badvpn_common::ipc::PolicySummaryResponse = (&policy).into();
+        summary.source = "import_preview".to_string();
+        return Ok(summary);
+    }
 
-    let mode = format!("{:?}", policy.mode);
-    let final_rule = policy.mihomo_rules.last().cloned().unwrap_or_default();
-
-    let policy_rules = policy
-        .policy_rules
-        .iter()
-        .map(|rule| {
-            let path_str = match &rule.path {
-                badvpn_common::PolicyPath::DirectSafe => "DirectSafe".to_string(),
-                badvpn_common::PolicyPath::ZapretDirect => "ZapretDirect".to_string(),
-                badvpn_common::PolicyPath::VpnProxy { group } => format!("VpnProxy({})", group),
-                badvpn_common::PolicyPath::Reject => "Reject".to_string(),
-            };
-            let path_group = match &rule.path {
-                badvpn_common::PolicyPath::VpnProxy { group } => Some(group.clone()),
-                _ => None,
-            };
-            let mihomo_action = match &rule.path {
-                badvpn_common::PolicyPath::DirectSafe => "DIRECT",
-                badvpn_common::PolicyPath::ZapretDirect => "DIRECT",
-                badvpn_common::PolicyPath::VpnProxy { .. } => "proxy group",
-                badvpn_common::PolicyPath::Reject => "REJECT",
-            };
-            let target_kind_str = format!("{:?}", rule.target.kind);
-            let mihomo_rule = rule.original_rule.clone().unwrap_or_else(|| {
-                format!(
-                    "{},{},{}",
-                    target_kind_str, rule.target.value, mihomo_action
-                )
-            });
-            let zapret_effect = match &rule.path {
-                badvpn_common::PolicyPath::ZapretDirect => "hostlist/ipset".to_string(),
-                badvpn_common::PolicyPath::VpnProxy { .. } => "exclude".to_string(),
-                _ => "none".to_string(),
-            };
-            let dns_effect = if matches!(rule.path, badvpn_common::PolicyPath::VpnProxy { .. }) {
-                "trusted DoH".to_string()
-            } else {
-                "default".to_string()
-            };
-
-            PolicyRuleView {
-                target_kind: target_kind_str,
-                target_value: rule.target.value.clone(),
-                path: path_str,
-                path_group,
-                source: format!("{:?}", rule.source),
-                priority: rule.priority,
-                original_rule: rule.original_rule.clone(),
-                tags: rule.tags.clone(),
-                mihomo_rule,
-                zapret_effect,
-                dns_effect,
-            }
-        })
-        .collect();
-
-    let suppressed_rules = policy
-        .suppressed_rules
-        .iter()
-        .map(|rule| SuppressedRuleView {
-            original_rule: rule.original_rule.clone(),
-            chosen_rule: rule.chosen_rule.clone(),
-            reason: rule.reason.clone(),
-        })
-        .collect();
-
-    let diagnostics_expectations = policy
-        .diagnostics_expectations
-        .iter()
-        .map(|exp| RouteExpectationView {
-            target: exp.target.clone(),
-            expected_path: format!("{:?}", exp.expected_path),
-            expected_mihomo_action: exp.expected_mihomo_action.clone(),
-            expected_zapret: exp.expected_zapret,
-            source: format!("{:?}", exp.source),
-        })
-        .collect();
-
-    let dns_nameserver_policy = policy
-        .dns_nameserver_policy
-        .iter()
-        .map(|rule| PolicyDnsRuleView {
-            pattern: rule.pattern.clone(),
-            nameservers: rule.nameservers.clone(),
-        })
-        .collect();
-
-    let managed_proxy_groups = policy
-        .managed_proxy_groups
-        .iter()
-        .map(|group| ManagedGroupView {
-            name: group.name.clone(),
-            proxies: group.proxies.clone(),
-        })
-        .collect();
-
-    let rule_count = policy.mihomo_rules.len();
-    let suppressed_count = policy.suppressed_rules.len();
-    let warnings_count = policy.diagnostics_messages.len();
-    let zapret_domain_count = policy.zapret_hostlist.len();
-
-    Ok(PolicySummaryResponse {
-        available: true,
-        mode,
-        main_proxy_group: policy.main_proxy_group,
-        final_rule,
-        mihomo_rules: policy.mihomo_rules,
-        zapret_hostlist: policy.zapret_hostlist,
-        zapret_hostlist_exclude: policy.zapret_hostlist_exclude,
-        zapret_ipset: policy.zapret_ipset,
-        zapret_ipset_exclude: policy.zapret_ipset_exclude,
-        dns_nameserver_policy,
-        policy_rules,
-        suppressed_rules,
-        diagnostics_expectations,
-        diagnostics_messages: policy.diagnostics_messages,
-        managed_proxy_groups,
-        rule_count,
-        suppressed_count,
-        warnings_count,
-        zapret_domain_count,
-    })
+    Ok(badvpn_common::ipc::PolicySummaryResponse::empty())
 }
 
 async fn refresh_runtime_state(run_network_tests: bool) -> Result<AgentState, String> {
@@ -4564,7 +4433,7 @@ fn write_mihomo_config(subscription_body: &str) -> Result<(), String> {
         &secret,
         &options,
     )?;
-    store_compiled_policy(&generated.policy);
+    store_preview_policy(&generated.policy);
     let config_path = mihomo_config_path()?;
     let parent = config_path
         .parent()

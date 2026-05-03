@@ -2409,4 +2409,378 @@ mod tests {
             .mihomo_rules
             .contains(&"DOMAIN-SUFFIX,perplexity.ai,DIRECT".to_string()));
     }
+
+    // ---------------------------------------------------------------
+    // A1: Policy invariant validation tests
+    //
+    // These tests call validate_invariants() directly on manually
+    // constructed CompiledPolicy objects to prove each guard works
+    // independently of compile_policy logic.
+    // ---------------------------------------------------------------
+
+    fn empty_policy(mode: AppRouteMode) -> CompiledPolicy {
+        CompiledPolicy {
+            mode,
+            mihomo_rules: Vec::new(),
+            zapret_hostlist: Vec::new(),
+            zapret_hostlist_exclude: Vec::new(),
+            zapret_ipset: Vec::new(),
+            zapret_ipset_exclude: Vec::new(),
+            dns_nameserver_policy: Vec::new(),
+            diagnostics_expectations: Vec::new(),
+            diagnostics_messages: Vec::new(),
+            suppressed_rules: Vec::new(),
+            main_proxy_group: "PROXY".to_string(),
+            policy_rules: Vec::new(),
+            should_create_canonical_proxy_group: false,
+            managed_proxy_groups: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn compiled_policy_validate_smart_tail() {
+        // Smart policy with correct MATCH,DIRECT passes.
+        let mut policy = empty_policy(AppRouteMode::Smart);
+        policy.mihomo_rules = vec![
+            "GEOSITE,private,DIRECT".to_string(),
+            "MATCH,DIRECT".to_string(),
+        ];
+        assert!(policy.validate_invariants().is_ok());
+
+        // Smart policy without MATCH,DIRECT fails.
+        let mut bad_policy = empty_policy(AppRouteMode::Smart);
+        bad_policy.mihomo_rules = vec!["GEOSITE,private,DIRECT".to_string()];
+        let err = bad_policy.validate_invariants().unwrap_err();
+        assert!(
+            err.contains("Smart policy must end with MATCH,DIRECT"),
+            "unexpected error: {err}"
+        );
+
+        // Smart policy ending with MATCH,PROXY fails.
+        let mut wrong_tail = empty_policy(AppRouteMode::Smart);
+        wrong_tail.mihomo_rules = vec![
+            "GEOSITE,private,DIRECT".to_string(),
+            "MATCH,PROXY".to_string(),
+        ];
+        let err = wrong_tail.validate_invariants().unwrap_err();
+        assert!(
+            err.contains("Smart policy must end with MATCH,DIRECT"),
+            "unexpected error: {err}"
+        );
+
+        // Smart policy with empty rules fails.
+        let empty = empty_policy(AppRouteMode::Smart);
+        assert!(empty.validate_invariants().is_err());
+    }
+
+    #[test]
+    fn compiled_policy_validate_vpn_only_tail() {
+        // VPN Only with correct MATCH,PROXY passes.
+        let mut policy = empty_policy(AppRouteMode::VpnOnly);
+        policy.mihomo_rules = vec![
+            "GEOSITE,private,DIRECT".to_string(),
+            "MATCH,PROXY".to_string(),
+        ];
+        assert!(policy.validate_invariants().is_ok());
+
+        // VPN Only without MATCH,<group> fails.
+        let mut bad = empty_policy(AppRouteMode::VpnOnly);
+        bad.mihomo_rules = vec!["GEOSITE,private,DIRECT".to_string()];
+        let err = bad.validate_invariants().unwrap_err();
+        assert!(
+            err.contains("VPN Only policy must end with MATCH,PROXY"),
+            "unexpected error: {err}"
+        );
+
+        // VPN Only ending with MATCH,DIRECT fails.
+        let mut direct_tail = empty_policy(AppRouteMode::VpnOnly);
+        direct_tail.mihomo_rules = vec![
+            "GEOSITE,private,DIRECT".to_string(),
+            "MATCH,DIRECT".to_string(),
+        ];
+        let err = direct_tail.validate_invariants().unwrap_err();
+        assert!(err.contains("VPN Only"), "unexpected error: {err}");
+
+        // VPN Only with main_proxy_group = "DIRECT" fails.
+        let mut direct_group = empty_policy(AppRouteMode::VpnOnly);
+        direct_group.main_proxy_group = "DIRECT".to_string();
+        direct_group.mihomo_rules = vec!["MATCH,DIRECT".to_string()];
+        let err = direct_group.validate_invariants().unwrap_err();
+        assert!(
+            err.contains("must not be DIRECT"),
+            "unexpected error: {err}"
+        );
+
+        // VPN Only with empty rules fails.
+        let empty = empty_policy(AppRouteMode::VpnOnly);
+        assert!(empty.validate_invariants().is_err());
+    }
+
+    #[test]
+    fn compiled_policy_vpn_only_rejects_match_direct_anywhere() {
+        // VPN Only fails if MATCH,DIRECT appears anywhere (even not as tail).
+        let mut policy = empty_policy(AppRouteMode::VpnOnly);
+        policy.mihomo_rules = vec!["MATCH,DIRECT".to_string(), "MATCH,PROXY".to_string()];
+        let err = policy.validate_invariants().unwrap_err();
+        assert!(
+            err.contains("must not contain MATCH,DIRECT"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn compiled_policy_rejects_zapret_artifact_geosite() {
+        // zapret_hostlist with GEOSITE entry fails.
+        let mut policy = empty_policy(AppRouteMode::Smart);
+        policy.mihomo_rules = vec!["MATCH,DIRECT".to_string()];
+        policy.zapret_hostlist = vec!["GEOSITE,youtube".to_string()];
+        let err = policy.validate_invariants().unwrap_err();
+        assert!(
+            err.contains("non-zapret artifact value"),
+            "unexpected error: {err}"
+        );
+
+        // zapret_hostlist with GEOIP entry fails.
+        let mut policy2 = empty_policy(AppRouteMode::Smart);
+        policy2.mihomo_rules = vec!["MATCH,DIRECT".to_string()];
+        policy2.zapret_hostlist = vec!["GEOIP,ru".to_string()];
+        let err = policy2.validate_invariants().unwrap_err();
+        assert!(
+            err.contains("non-zapret artifact value"),
+            "unexpected error: {err}"
+        );
+
+        // zapret_hostlist with RULE-SET entry fails.
+        let mut policy3 = empty_policy(AppRouteMode::Smart);
+        policy3.mihomo_rules = vec!["MATCH,DIRECT".to_string()];
+        policy3.zapret_hostlist = vec!["RULE-SET,openai".to_string()];
+        let err = policy3.validate_invariants().unwrap_err();
+        assert!(
+            err.contains("non-zapret artifact value"),
+            "unexpected error: {err}"
+        );
+
+        // zapret_hostlist with bare DIRECT fails.
+        let mut policy4 = empty_policy(AppRouteMode::Smart);
+        policy4.mihomo_rules = vec!["MATCH,DIRECT".to_string()];
+        policy4.zapret_hostlist = vec!["DIRECT".to_string()];
+        let err = policy4.validate_invariants().unwrap_err();
+        assert!(
+            err.contains("non-zapret artifact value"),
+            "unexpected error: {err}"
+        );
+
+        // zapret_hostlist with bare REJECT fails.
+        let mut policy5 = empty_policy(AppRouteMode::Smart);
+        policy5.mihomo_rules = vec!["MATCH,DIRECT".to_string()];
+        policy5.zapret_hostlist = vec!["REJECT".to_string()];
+        let err = policy5.validate_invariants().unwrap_err();
+        assert!(
+            err.contains("non-zapret artifact value"),
+            "unexpected error: {err}"
+        );
+
+        // zapret_hostlist with PROCESS-NAME fails.
+        let mut policy6 = empty_policy(AppRouteMode::Smart);
+        policy6.mihomo_rules = vec!["MATCH,DIRECT".to_string()];
+        policy6.zapret_hostlist = vec!["PROCESS-NAME,game.exe".to_string()];
+        let err = policy6.validate_invariants().unwrap_err();
+        assert!(
+            err.contains("non-zapret artifact value"),
+            "unexpected error: {err}"
+        );
+
+        // zapret_hostlist with MATCH fails.
+        let mut policy7 = empty_policy(AppRouteMode::Smart);
+        policy7.mihomo_rules = vec!["MATCH,DIRECT".to_string()];
+        policy7.zapret_hostlist = vec!["MATCH,DIRECT".to_string()];
+        let err = policy7.validate_invariants().unwrap_err();
+        assert!(
+            err.contains("non-zapret artifact value"),
+            "unexpected error: {err}"
+        );
+
+        // Valid zapret hostlist entries pass.
+        let mut valid = empty_policy(AppRouteMode::Smart);
+        valid.mihomo_rules = vec!["MATCH,DIRECT".to_string()];
+        valid.zapret_hostlist = vec![
+            "youtube.com".to_string(),
+            "discord.gg".to_string(),
+            "googlevideo.com".to_string(),
+        ];
+        assert!(valid.validate_invariants().is_ok());
+    }
+
+    #[test]
+    fn compiled_policy_rejects_zapret_ipset_non_ip() {
+        // zapret_ipset with domain-like value fails.
+        let mut policy = empty_policy(AppRouteMode::Smart);
+        policy.mihomo_rules = vec!["MATCH,DIRECT".to_string()];
+        policy.zapret_ipset = vec!["youtube.com".to_string()];
+        let err = policy.validate_invariants().unwrap_err();
+        assert!(
+            err.contains("invalid zapret value"),
+            "unexpected error: {err}"
+        );
+
+        // Valid CIDR passes.
+        let mut valid = empty_policy(AppRouteMode::Smart);
+        valid.mihomo_rules = vec!["MATCH,DIRECT".to_string()];
+        valid.zapret_ipset = vec!["149.154.160.0/20".to_string(), "2001:db8::/32".to_string()];
+        assert!(valid.validate_invariants().is_ok());
+    }
+
+    #[test]
+    fn compiled_policy_rejects_vpn_only_zapret_artifacts() {
+        // VPN Only with zapret_hostlist fails.
+        let mut policy = empty_policy(AppRouteMode::VpnOnly);
+        policy.mihomo_rules = vec!["MATCH,PROXY".to_string()];
+        policy.zapret_hostlist = vec!["youtube.com".to_string()];
+        let err = policy.validate_invariants().unwrap_err();
+        assert!(
+            err.contains("must not emit zapret artifacts"),
+            "unexpected error: {err}"
+        );
+
+        // VPN Only with zapret_ipset fails.
+        let mut policy2 = empty_policy(AppRouteMode::VpnOnly);
+        policy2.mihomo_rules = vec!["MATCH,PROXY".to_string()];
+        policy2.zapret_ipset = vec!["149.154.160.0/20".to_string()];
+        let err = policy2.validate_invariants().unwrap_err();
+        assert!(
+            err.contains("must not emit zapret artifacts"),
+            "unexpected error: {err}"
+        );
+
+        // VPN Only with zapret_hostlist_exclude fails.
+        let mut policy3 = empty_policy(AppRouteMode::VpnOnly);
+        policy3.mihomo_rules = vec!["MATCH,PROXY".to_string()];
+        policy3.zapret_hostlist_exclude = vec!["chatgpt.com".to_string()];
+        let err = policy3.validate_invariants().unwrap_err();
+        assert!(
+            err.contains("must not emit zapret artifacts"),
+            "unexpected error: {err}"
+        );
+
+        // VPN Only with zapret_ipset_exclude fails.
+        let mut policy4 = empty_policy(AppRouteMode::VpnOnly);
+        policy4.mihomo_rules = vec!["MATCH,PROXY".to_string()];
+        policy4.zapret_ipset_exclude = vec!["1.2.3.4".to_string()];
+        let err = policy4.validate_invariants().unwrap_err();
+        assert!(
+            err.contains("must not emit zapret artifacts"),
+            "unexpected error: {err}"
+        );
+
+        // VPN Only with no zapret artifacts passes.
+        let mut clean = empty_policy(AppRouteMode::VpnOnly);
+        clean.mihomo_rules = vec!["MATCH,PROXY".to_string()];
+        assert!(clean.validate_invariants().is_ok());
+    }
+
+    #[test]
+    fn compiled_policy_vpn_only_rejects_provider_direct() {
+        // VPN Only fails if a non-safety, non-user-override DIRECT rule is present.
+        let mut policy = empty_policy(AppRouteMode::VpnOnly);
+        policy.mihomo_rules = vec!["MATCH,PROXY".to_string()];
+        policy.policy_rules = vec![PolicyRule {
+            target: PolicyTarget {
+                kind: PolicyTargetKind::GeoSite,
+                value: "yandex".to_string(),
+            },
+            path: PolicyPath::DirectSafe,
+            source: PolicySource::ProviderSubscription,
+            priority: 500,
+            original_rule: Some("GEOSITE,yandex,DIRECT".to_string()),
+            tags: Vec::new(),
+            options: Vec::new(),
+        }];
+        let err = policy.validate_invariants().unwrap_err();
+        assert!(
+            err.contains("kept provider DIRECT rule"),
+            "unexpected error: {err}"
+        );
+
+        // Safety-sourced DIRECT rule passes.
+        let mut safe = empty_policy(AppRouteMode::VpnOnly);
+        safe.mihomo_rules = vec!["MATCH,PROXY".to_string()];
+        safe.policy_rules = vec![PolicyRule {
+            target: PolicyTarget {
+                kind: PolicyTargetKind::Cidr,
+                value: "10.0.0.0/8".to_string(),
+            },
+            path: PolicyPath::DirectSafe,
+            source: PolicySource::Safety,
+            priority: 1000,
+            original_rule: None,
+            tags: vec!["safety".to_string()],
+            options: vec!["no-resolve".to_string()],
+        }];
+        assert!(safe.validate_invariants().is_ok());
+
+        // User override DIRECT rule passes.
+        let mut user = empty_policy(AppRouteMode::VpnOnly);
+        user.mihomo_rules = vec!["MATCH,PROXY".to_string()];
+        user.policy_rules = vec![PolicyRule {
+            target: PolicyTarget {
+                kind: PolicyTargetKind::DomainSuffix,
+                value: "custom.local".to_string(),
+            },
+            path: PolicyPath::DirectSafe,
+            source: PolicySource::LocalUserOverride,
+            priority: 900,
+            original_rule: None,
+            tags: Vec::new(),
+            options: Vec::new(),
+        }];
+        assert!(user.validate_invariants().is_ok());
+    }
+
+    #[test]
+    fn compiled_policy_invalid_compile_returns_clear_error() {
+        // compile_policy fails with clear error when no proxy groups or proxies exist.
+        let err = compile_policy(PolicyCompileInput {
+            mode: AppRouteMode::Smart,
+            provider_rules: vec!["MATCH,PROXY".to_string()],
+            proxy_groups: Vec::new(),
+            proxy_count: 0,
+            routing: RoutingPolicySettings::default(),
+            runtime_facts: RuntimeFacts::default(),
+        })
+        .unwrap_err();
+        assert!(
+            err.contains("no proxy groups or proxies"),
+            "unexpected error: {err}"
+        );
+
+        // VPN Only with only-DIRECT proxy nodes fails cleanly.
+        let err = compile_policy(PolicyCompileInput {
+            mode: AppRouteMode::VpnOnly,
+            provider_rules: vec!["MATCH,\u{0412}\u{044b}\u{0431}\u{043e}\u{0440} \u{0441}\u{0435}\u{0440}\u{0432}\u{0435}\u{0440}\u{0430}".to_string()],
+            proxy_groups: vec![ProxyGroupInfo {
+                name: "\u{0412}\u{044b}\u{0431}\u{043e}\u{0440} \u{0441}\u{0435}\u{0440}\u{0432}\u{0435}\u{0440}\u{0430}".to_string(),
+                group_type: Some("select".to_string()),
+                proxies: vec!["DIRECT".to_string()],
+            }],
+            proxy_count: 0,
+            routing: RoutingPolicySettings::default(),
+            runtime_facts: RuntimeFacts::default(),
+        })
+        .unwrap_err();
+        assert!(
+            err.contains("no non-DIRECT proxy nodes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn compiled_policy_validate_invariants_called_on_every_compile() {
+        // Ensure a valid Smart compile passes invariants.
+        let policy = compile(AppRouteMode::Smart);
+        assert!(policy.validate_invariants().is_ok());
+
+        // Ensure a valid VPN Only compile passes invariants.
+        let policy = compile(AppRouteMode::VpnOnly);
+        assert!(policy.validate_invariants().is_ok());
+    }
 }

@@ -29,6 +29,7 @@ pub struct RuntimeManager {
     component_store: ComponentStore,
     mihomo: MihomoManager,
     zapret: ZapretManager,
+    pub active_policy: Option<CompiledPolicy>,
 }
 
 impl RuntimeManager {
@@ -41,6 +42,7 @@ impl RuntimeManager {
             component_store,
             mihomo: MihomoManager::default(),
             zapret: ZapretManager::default(),
+            active_policy: None,
         }
     }
 
@@ -48,6 +50,10 @@ impl RuntimeManager {
         self.refresh_process_state();
         self.record_late_zapret_death_if_needed();
         self.snapshot.clone()
+    }
+
+    pub fn active_policy(&self) -> Option<&CompiledPolicy> {
+        self.active_policy.as_ref()
     }
 
     pub async fn connect(&mut self, mut request: ConnectRequest) -> Result<AgentRuntimeSnapshot> {
@@ -208,6 +214,11 @@ impl RuntimeManager {
             .config_store
             .promote_draft_to_run(&self.config_store.draft_path())
             .context("failed to promote Mihomo runtime config")?;
+
+        self.active_policy = Some(runtime_config.policy.clone());
+        if let Err(error) = self.config_store.write_policy_summary(&runtime_config.policy) {
+            tracing::warn!(%error, "failed to write policy summary JSON");
+        }
 
         self.snapshot.phase = RuntimePhase::StartingMihomo;
         self.snapshot.mihomo = RuntimeComponentSnapshot::new(RuntimeComponentState::Starting, None);
@@ -801,6 +812,19 @@ impl RuntimeConfigStore {
 
     fn last_working_path(&self) -> PathBuf {
         self.root.join("last-working.yaml")
+    }
+
+    fn policy_summary_path(&self) -> PathBuf {
+        self.root.join("policy-summary.json")
+    }
+
+    fn write_policy_summary(&self, policy: &CompiledPolicy) -> Result<()> {
+        let mut response: badvpn_common::ipc::PolicySummaryResponse = policy.into();
+        response.source = "agent_runtime".to_string();
+        let json = serde_json::to_string_pretty(&response)?;
+        fs::create_dir_all(&self.root)?;
+        write_file_atomically(&self.policy_summary_path(), &json)?;
+        Ok(())
     }
 
     fn write_draft(&self, content: &str) -> Result<PathBuf> {
