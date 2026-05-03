@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     mihomo_config::MihomoConfigOptions,
+    policy::{CompiledPolicy, PolicyPath},
     subscription::{SubscriptionFormat, SubscriptionUserInfo},
 };
 
@@ -345,6 +346,7 @@ pub enum AgentCommand {
     VerifyInstalledAgent,
     UpdateComponents,
     RollbackComponent { component: String },
+    PolicySummary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -460,6 +462,251 @@ impl Default for AgentState {
             metrics: TrafficMetrics::default(),
             diagnostics: DiagnosticSummary::default(),
             last_error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicySummaryResponse {
+    pub available: bool,
+    pub state: String,
+    pub source: String,
+    pub stale: bool,
+    pub compiled_at: Option<u64>,
+    pub policy_id: Option<String>,
+    pub active_config_id: Option<String>,
+    pub desired_mode: Option<RouteMode>,
+    pub effective_mode: Option<RouteMode>,
+    
+    pub mode: String,
+    pub main_proxy_group: String,
+    pub final_rule: String,
+    pub mihomo_rules: Vec<String>,
+    pub zapret_hostlist: Vec<String>,
+    pub zapret_hostlist_exclude: Vec<String>,
+    pub zapret_ipset: Vec<String>,
+    pub zapret_ipset_exclude: Vec<String>,
+    pub dns_nameserver_policy: Vec<PolicyDnsRuleView>,
+    pub policy_rules: Vec<PolicyRuleView>,
+    pub suppressed_rules: Vec<SuppressedRuleView>,
+    pub diagnostics_expectations: Vec<RouteExpectationView>,
+    pub diagnostics_messages: Vec<String>,
+    pub managed_proxy_groups: Vec<ManagedGroupView>,
+    pub rule_count: usize,
+    pub suppressed_count: usize,
+    pub warnings_count: usize,
+    pub zapret_domain_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyRuleView {
+    pub target_kind: String,
+    pub target_value: String,
+    pub path: String,
+    pub path_group: Option<String>,
+    pub source: String,
+    pub priority: u16,
+    pub original_rule: Option<String>,
+    pub tags: Vec<String>,
+    pub mihomo_rule: String,
+    pub zapret_effect: String,
+    pub dns_effect: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuppressedRuleView {
+    pub original_rule: String,
+    pub chosen_rule: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteExpectationView {
+    pub target: String,
+    pub expected_path: String,
+    pub expected_mihomo_action: String,
+    pub expected_zapret: bool,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyDnsRuleView {
+    pub pattern: String,
+    pub nameservers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedGroupView {
+    pub name: String,
+    pub proxies: Vec<String>,
+}
+
+impl PolicySummaryResponse {
+    pub fn empty() -> Self {
+        Self {
+            available: false,
+            state: "none".to_string(),
+            source: "none".to_string(),
+            stale: false,
+            compiled_at: None,
+            policy_id: None,
+            active_config_id: None,
+            desired_mode: None,
+            effective_mode: None,
+            mode: String::new(),
+            main_proxy_group: String::new(),
+            final_rule: String::new(),
+            mihomo_rules: Vec::new(),
+            zapret_hostlist: Vec::new(),
+            zapret_hostlist_exclude: Vec::new(),
+            zapret_ipset: Vec::new(),
+            zapret_ipset_exclude: Vec::new(),
+            dns_nameserver_policy: Vec::new(),
+            policy_rules: Vec::new(),
+            suppressed_rules: Vec::new(),
+            diagnostics_expectations: Vec::new(),
+            diagnostics_messages: Vec::new(),
+            managed_proxy_groups: Vec::new(),
+            rule_count: 0,
+            suppressed_count: 0,
+            warnings_count: 0,
+            zapret_domain_count: 0,
+        }
+    }
+}
+
+impl From<&CompiledPolicy> for PolicySummaryResponse {
+    fn from(policy: &CompiledPolicy) -> Self {
+        let mode = format!("{:?}", policy.mode);
+        let final_rule = policy.mihomo_rules.last().cloned().unwrap_or_default();
+
+        let policy_rules = policy
+            .policy_rules
+            .iter()
+            .map(|rule| {
+                let path_str = match &rule.path {
+                    PolicyPath::DirectSafe => "DirectSafe".to_string(),
+                    PolicyPath::ZapretDirect => "ZapretDirect".to_string(),
+                    PolicyPath::VpnProxy { group } => format!("VpnProxy({})", group),
+                    PolicyPath::Reject => "Reject".to_string(),
+                };
+                let path_group = match &rule.path {
+                    PolicyPath::VpnProxy { group } => Some(group.clone()),
+                    _ => None,
+                };
+                let mihomo_action = match &rule.path {
+                    PolicyPath::DirectSafe => "DIRECT",
+                    PolicyPath::ZapretDirect => "DIRECT",
+                    PolicyPath::VpnProxy { .. } => "proxy group",
+                    PolicyPath::Reject => "REJECT",
+                };
+                let target_kind_str = format!("{:?}", rule.target.kind);
+                let mihomo_rule = rule.original_rule.clone().unwrap_or_else(|| {
+                    format!(
+                        "{},{},{}",
+                        target_kind_str, rule.target.value, mihomo_action
+                    )
+                });
+                let zapret_effect = match &rule.path {
+                    PolicyPath::ZapretDirect => "hostlist/ipset".to_string(),
+                    PolicyPath::VpnProxy { .. } => "exclude".to_string(),
+                    _ => "none".to_string(),
+                };
+                let dns_effect = if matches!(rule.path, PolicyPath::VpnProxy { .. }) {
+                    "trusted DoH".to_string()
+                } else {
+                    "default".to_string()
+                };
+
+                PolicyRuleView {
+                    target_kind: target_kind_str,
+                    target_value: rule.target.value.clone(),
+                    path: path_str,
+                    path_group,
+                    source: format!("{:?}", rule.source),
+                    priority: rule.priority,
+                    original_rule: rule.original_rule.clone(),
+                    tags: rule.tags.clone(),
+                    mihomo_rule,
+                    zapret_effect,
+                    dns_effect,
+                }
+            })
+            .collect();
+
+        let suppressed_rules = policy
+            .suppressed_rules
+            .iter()
+            .map(|rule| SuppressedRuleView {
+                original_rule: rule.original_rule.clone(),
+                chosen_rule: rule.chosen_rule.clone(),
+                reason: rule.reason.clone(),
+            })
+            .collect();
+
+        let diagnostics_expectations = policy
+            .diagnostics_expectations
+            .iter()
+            .map(|exp| RouteExpectationView {
+                target: exp.target.clone(),
+                expected_path: format!("{:?}", exp.expected_path),
+                expected_mihomo_action: exp.expected_mihomo_action.clone(),
+                expected_zapret: exp.expected_zapret,
+                source: format!("{:?}", exp.source),
+            })
+            .collect();
+
+        let dns_nameserver_policy = policy
+            .dns_nameserver_policy
+            .iter()
+            .map(|rule| PolicyDnsRuleView {
+                pattern: rule.pattern.clone(),
+                nameservers: rule.nameservers.clone(),
+            })
+            .collect();
+
+        let managed_proxy_groups = policy
+            .managed_proxy_groups
+            .iter()
+            .map(|group| ManagedGroupView {
+                name: group.name.clone(),
+                proxies: group.proxies.clone(),
+            })
+            .collect();
+
+        let rule_count = policy.mihomo_rules.len();
+        let suppressed_count = policy.suppressed_rules.len();
+        let warnings_count = policy.diagnostics_messages.len();
+        let zapret_domain_count = policy.zapret_hostlist.len();
+
+        Self {
+            available: true,
+            state: "active".to_string(),
+            source: "cache".to_string(),
+            stale: false,
+            compiled_at: None,
+            policy_id: None,
+            active_config_id: None,
+            desired_mode: None,
+            effective_mode: None,
+            mode,
+            main_proxy_group: policy.main_proxy_group.clone(),
+            final_rule,
+            mihomo_rules: policy.mihomo_rules.clone(),
+            zapret_hostlist: policy.zapret_hostlist.clone(),
+            zapret_hostlist_exclude: policy.zapret_hostlist_exclude.clone(),
+            zapret_ipset: policy.zapret_ipset.clone(),
+            zapret_ipset_exclude: policy.zapret_ipset_exclude.clone(),
+            dns_nameserver_policy,
+            policy_rules,
+            suppressed_rules,
+            diagnostics_expectations,
+            diagnostics_messages: policy.diagnostics_messages.clone(),
+            managed_proxy_groups,
+            rule_count,
+            suppressed_count,
+            warnings_count,
+            zapret_domain_count,
         }
     }
 }

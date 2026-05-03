@@ -3837,3 +3837,333 @@ select:focus {
   border-color: rgba(76, 194, 255, 0.42);
   color: var(--win-text);
 }
+
+/* ── Policy viewer ────────────────────────────────── */
+
+.policyPanel {
+  display: grid;
+  gap: 20px;
+  align-content: start;
+  overflow: auto;
+}
+
+.policySummaryCards {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+}
+
+.policySummaryCard {
+  background: var(--win-pane-alt);
+  border: 1px solid var(--win-border);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 14px 16px;
+  transition: border-color 0.15s;
+}
+
+.policySummaryCard:hover {
+  border-color: var(--win-border-strong);
+}
+
+.policySummaryCard.span2 {
+  grid-column: span 2;
+}
+
+.policySummaryLabel {
+  color: var(--win-text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.policySummaryValue {
+  color: var(--win-text);
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1.2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.policySummaryValue.mono {
+  font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", monospace;
+  font-size: 13px;
+  font-weight: 500;
+  white-space: normal;
+  word-break: break-all;
+}
+
+.policySummaryValue.warn {
+  color: var(--warning);
+}
+
+.policySection {
+  display: grid;
+  gap: 10px;
+}
+
+.policySection h2 {
+  align-items: center;
+  display: flex;
+  font-size: 14px;
+  gap: 8px;
+}
+
+.policyCount {
+  background: rgba(76, 194, 255, 0.12);
+  border-radius: 999px;
+  color: var(--win-accent);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  padding: 3px 8px;
+}
+
+.policyCount.warn {
+  background: rgba(247, 201, 72, 0.14);
+  color: var(--warning);
+}
+
+.policyTableWrap {
+  border: 1px solid var(--win-border);
+  border-radius: 8px;
+  max-height: 480px;
+  overflow: auto;
+  scrollbar-color: rgba(148, 163, 184, 0.28) transparent;
+  scrollbar-width: thin;
+}
+
+.policyTable {
+  border-collapse: collapse;
+  font-size: 12px;
+  width: 100%;
+}
+
+.policyTable thead {
+  background: rgba(17, 26, 41, 0.92);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.policyTable th {
+  border-bottom: 1px solid var(--win-border);
+  color: var(--win-text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  padding: 9px 12px;
+  text-align: left;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.policyTable td {
+  border-bottom: 1px solid rgba(203, 213, 225, 0.06);
+  color: var(--win-text-secondary);
+  padding: 7px 12px;
+  vertical-align: top;
+}
+
+.policyTable tbody tr:hover {
+  background: rgba(148, 163, 184, 0.06);
+}
+
+.policyTable td.mono,
+.policyTable th.mono {
+  font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", monospace;
+  font-size: 11px;
+}
+
+.policyTable td.wrap {
+  max-width: 240px;
+  overflow-wrap: break-word;
+  word-break: break-all;
+}
+
+.policyTable tbody tr.vpn td:first-child {
+  box-shadow: inset 3px 0 0 #0078d4;
+}
+
+.policyTable tbody tr.zapret td:first-child {
+  box-shadow: inset 3px 0 0 #f59e0b;
+}
+
+.policyTable tbody tr.direct td:first-child {
+  box-shadow: inset 3px 0 0 var(--success);
+}
+
+.policyTable tbody tr.reject td:first-child {
+  box-shadow: inset 3px 0 0 var(--danger);
+}
+
+.policyPathBadge {
+  border-radius: 4px;
+  display: inline-block;
+  font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", monospace;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 3px 7px;
+  white-space: nowrap;
+}
+
+.policyPathBadge.vpn {
+  background: rgba(0, 120, 212, 0.18);
+  color: var(--win-accent);
+}
+
+.policyPathBadge.zapret {
+  background: rgba(245, 158, 11, 0.16);
+  color: #f59e0b;
+}
+
+.policyPathBadge.direct {
+  background: rgba(104, 211, 145, 0.14);
+  color: var(--success);
+}
+
+.policyPathBadge.reject {
+  background: rgba(255, 138, 138, 0.14);
+  color: var(--danger);
+}
+
+.policyRuleList {
+  background: rgba(17, 26, 41, 0.54);
+  border: 1px solid var(--win-border);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  max-height: 400px;
+  overflow: auto;
+  scrollbar-color: rgba(148, 163, 184, 0.28) transparent;
+  scrollbar-width: thin;
+}
+
+.policyRuleList.compact {
+  flex-direction: column;
+  gap: 0;
+  max-height: 280px;
+  padding: 6px 0;
+}
+
+.policyRuleList.compact code {
+  border-bottom: 1px solid rgba(203, 213, 225, 0.04);
+  color: var(--win-text-secondary);
+  display: block;
+  font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", monospace;
+  font-size: 11px;
+  line-height: 1.8;
+  padding: 1px 14px;
+}
+
+.policyRuleList.compact code:hover {
+  background: rgba(148, 163, 184, 0.06);
+}
+
+.policyRuleLine {
+  align-items: baseline;
+  display: flex;
+  gap: 12px;
+  padding: 3px 14px;
+}
+
+.policyRuleLine:hover {
+  background: rgba(148, 163, 184, 0.06);
+}
+
+.policyRuleIndex {
+  color: var(--win-text-muted);
+  flex-shrink: 0;
+  font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", monospace;
+  font-size: 10px;
+  min-width: 28px;
+  opacity: 0.6;
+  text-align: right;
+}
+
+.policyRuleLine code {
+  color: var(--win-text-secondary);
+  font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", monospace;
+  font-size: 11px;
+  overflow-wrap: break-word;
+  word-break: break-all;
+}
+
+.policyArtifactGrid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+}
+
+.policyArtifact {
+  display: grid;
+  gap: 8px;
+}
+
+.policyArtifact h3 {
+  align-items: center;
+  color: var(--win-text-secondary);
+  display: flex;
+  font-size: 12px;
+  font-weight: 650;
+  gap: 6px;
+}
+
+.policyManagedGroup {
+  align-items: baseline;
+  background: var(--win-pane-alt);
+  border: 1px solid var(--win-border);
+  border-radius: 6px;
+  display: flex;
+  gap: 10px;
+  margin-bottom: 4px;
+  padding: 10px 14px;
+}
+
+.policyManagedGroup strong {
+  color: var(--win-text);
+  font-size: 13px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.policyManagedGroup span {
+  color: var(--win-text-muted);
+  font-size: 12px;
+  overflow-wrap: break-word;
+}
+
+.policyWarningList {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.policyWarning {
+  align-items: start;
+  background: rgba(247, 201, 72, 0.06);
+  border: 1px solid rgba(247, 201, 72, 0.16);
+  border-radius: 6px;
+  display: flex;
+  gap: 10px;
+  padding: 10px 14px;
+}
+
+.policyWarning svg {
+  color: var(--warning);
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.policyWarning span {
+  color: var(--win-text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: break-word;
+}

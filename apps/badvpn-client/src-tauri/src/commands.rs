@@ -8,8 +8,8 @@ use badvpn_common::{
     generate_mihomo_config_from_subscription_with_options, overlay_mihomo_config_yaml,
     parse_subscription_userinfo, summarize_subscription_body, zapret_default_hostlist,
     zapret_default_ipset, zapret_user_placeholder_hostlist, AgentCommand, AgentState, AppPhase,
-    ConnectRequest, ConnectionStatus, DiagnosticSummary, MihomoConfigOptions, RouteMode,
-    RuntimeDiagnosticsSettings, RuntimeGameProfile, RuntimeMode, RuntimeSettings,
+    CompiledPolicy, ConnectRequest, ConnectionStatus, DiagnosticSummary, MihomoConfigOptions,
+    RouteMode, RuntimeDiagnosticsSettings, RuntimeGameProfile, RuntimeMode, RuntimeSettings,
     RuntimeZapretSettings, SubscriptionFormat, SubscriptionState, AGENT_LOCAL_ADDR,
     AGENT_PIPE_NAME,
 };
@@ -81,6 +81,7 @@ static LAST_ACTIVE_CONNECTIONS: OnceLock<Mutex<Vec<TrackedConnection>>> = OnceLo
 static CLOSED_CONNECTIONS: OnceLock<Mutex<Vec<TrackedConnection>>> = OnceLock::new();
 static LAST_LIST_REFRESH_ATTEMPT: OnceLock<Mutex<u64>> = OnceLock::new();
 static LAST_MIHOMO_HEALTHY_AT: OnceLock<Mutex<u64>> = OnceLock::new();
+static LAST_PREVIEW_POLICY: OnceLock<Mutex<Option<CompiledPolicy>>> = OnceLock::new();
 
 fn state() -> &'static Mutex<AgentState> {
     STATE.get_or_init(|| Mutex::new(AgentState::default()))
@@ -118,6 +119,16 @@ fn last_mihomo_healthy_at() -> &'static Mutex<u64> {
     LAST_MIHOMO_HEALTHY_AT.get_or_init(|| Mutex::new(0))
 }
 
+fn last_preview_policy() -> &'static Mutex<Option<CompiledPolicy>> {
+    LAST_PREVIEW_POLICY.get_or_init(|| Mutex::new(None))
+}
+
+fn store_preview_policy(policy: &CompiledPolicy) {
+    if let Ok(mut guard) = last_preview_policy().lock() {
+        *guard = Some(policy.clone());
+    }
+}
+
 fn log_event(scope: &str, message: impl AsRef<str>) {
     let message = message.as_ref().replace(['\r', '\n'], " ");
     let line = format!("{} [{scope}] {message}\n", current_unix_timestamp());
@@ -140,6 +151,8 @@ fn log_event(scope: &str, message: impl AsRef<str>) {
 struct AgentWireResponse {
     ok: bool,
     state: Option<AgentState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_summary: Option<badvpn_common::ipc::PolicySummaryResponse>,
     error: Option<String>,
 }
 
@@ -613,6 +626,26 @@ fn send_agent_tcp_command(command: &AgentCommand) -> Result<AgentState, String> 
     }
 }
 
+fn send_agent_tcp_command_raw(command: &AgentCommand) -> Result<AgentWireResponse, String> {
+    let mut stream = TcpStream::connect(AGENT_LOCAL_ADDR)
+        .map_err(|error| format!("BadVpn agent is not reachable at {AGENT_LOCAL_ADDR}: {error}"))?;
+    serde_json::to_writer(&mut stream, command)
+        .map_err(|error| format!("Failed to serialize agent command: {error}"))?;
+    stream
+        .write_all(b"\n")
+        .map_err(|error| format!("Failed to send agent command: {error}"))?;
+    stream
+        .flush()
+        .map_err(|error| format!("Failed to flush agent command: {error}"))?;
+
+    let mut line = String::new();
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .map_err(|error| format!("Failed to read agent response: {error}"))?;
+    serde_json::from_str::<AgentWireResponse>(&line)
+        .map_err(|error| format!("Failed to parse agent response: {error}"))
+}
+
 #[cfg(windows)]
 fn send_agent_pipe_command(command: &AgentCommand) -> Result<AgentState, String> {
     let mut data = serde_json::to_vec(command)
@@ -640,8 +673,30 @@ fn send_agent_pipe_command(command: &AgentCommand) -> Result<AgentState, String>
     result
 }
 
+#[cfg(windows)]
+fn send_agent_pipe_command_raw(command: &AgentCommand) -> Result<AgentWireResponse, String> {
+    let mut data = serde_json::to_vec(command)
+        .map_err(|error| format!("Failed to serialize agent command: {error}"))?;
+    data.push(b'\n');
+    let handle = open_agent_pipe(Duration::from_secs(4))?;
+    let result = (|| {
+        write_pipe_all(handle, &data)?;
+        let line = read_pipe_line(handle)?;
+        serde_json::from_str::<AgentWireResponse>(&line)
+            .map_err(|error| format!("Failed to parse agent response: {error}"))
+    })();
+    unsafe {
+        CloseHandle(handle);
+    }
+    result
+}
+
 #[cfg(not(windows))]
 fn send_agent_pipe_command(_command: &AgentCommand) -> Result<AgentState, String> {
+}
+
+#[cfg(not(windows))]
+fn send_agent_pipe_command_raw(_command: &AgentCommand) -> Result<AgentWireResponse, String> {
     Err("BadVpn named pipe IPC is only available on Windows.".to_string())
 }
 
@@ -2166,6 +2221,53 @@ pub async fn select_proxy(group: String, proxy: String) -> Result<ProxyCatalog, 
         .map_err(|error| format!("Mihomo rejected proxy selection: {error}"))?;
     persist_proxy_selection(group.trim(), proxy.trim())?;
     proxy_catalog().await
+}
+
+#[tauri::command]
+pub async fn policy_summary() -> Result<badvpn_common::ipc::PolicySummaryResponse, String> {
+    if should_use_agent_runtime() {
+        if let Ok(response) = send_agent_pipe_command_raw(&AgentCommand::PolicySummary) {
+            if response.ok {
+                if let Some(summary) = response.policy_summary {
+                    return Ok(summary);
+                }
+            }
+        } else if std::env::var("BADVPN_AGENT_TCP_FALLBACK").ok().as_deref() == Some("1") {
+            if let Ok(response) = send_agent_tcp_command_raw(&AgentCommand::PolicySummary) {
+                if response.ok {
+                    if let Some(summary) = response.policy_summary {
+                        return Ok(summary);
+                    }
+                }
+            }
+        }
+    }
+
+    let program_data = std::env::var("PROGRAMDATA").unwrap_or_else(|_| "C:\\ProgramData".to_string());
+    let path = std::path::PathBuf::from(program_data)
+        .join("BadVpn")
+        .join("runtime")
+        .join("mihomo")
+        .join("policy-summary.json");
+    
+    if let Ok(json) = std::fs::read_to_string(&path) {
+        if let Ok(summary) = serde_json::from_str::<badvpn_common::ipc::PolicySummaryResponse>(&json) {
+            return Ok(summary);
+        }
+    }
+
+    let policy = last_preview_policy()
+        .lock()
+        .map_err(|_| "policy lock is poisoned".to_string())?
+        .clone();
+
+    if let Some(policy) = policy {
+        let mut summary: badvpn_common::ipc::PolicySummaryResponse = (&policy).into();
+        summary.source = "import_preview".to_string();
+        return Ok(summary);
+    }
+
+    Ok(badvpn_common::ipc::PolicySummaryResponse::empty())
 }
 
 async fn refresh_runtime_state(run_network_tests: bool) -> Result<AgentState, String> {
@@ -4331,6 +4433,7 @@ fn write_mihomo_config(subscription_body: &str) -> Result<(), String> {
         &secret,
         &options,
     )?;
+    store_preview_policy(&generated.policy);
     let config_path = mihomo_config_path()?;
     let parent = config_path
         .parent()

@@ -43,7 +43,8 @@ impl AgentController {
             | AgentCommand::SetRouteMode { .. }
             | AgentCommand::SetDpiProfile { .. }
             | AgentCommand::UpdateComponents
-            | AgentCommand::RollbackComponent { .. } => {
+            | AgentCommand::RollbackComponent { .. }
+            | AgentCommand::PolicySummary => {
                 self.runtime
                     .set_error("command is planned but not implemented in M1 scaffold");
                 Ok(self.runtime.snapshot())
@@ -58,6 +59,16 @@ impl AgentController {
             self.runtime.subscription.clone(),
         ));
         self.runtime.snapshot()
+    }
+
+    pub fn policy_summary(&self) -> anyhow::Result<badvpn_common::ipc::PolicySummaryResponse> {
+        if let Some(policy) = self.manager.active_policy() {
+            let mut response: badvpn_common::ipc::PolicySummaryResponse = policy.into();
+            response.source = "agent_runtime".to_string();
+            Ok(response)
+        } else {
+            anyhow::bail!("no active policy");
+        }
     }
 
     async fn connect(&mut self, request: ConnectRequest) -> BadVpnResult<AgentState> {
@@ -248,5 +259,6 @@ fn command_kind(command: &AgentCommand) -> &'static str {
         AgentCommand::VerifyInstalledAgent => "verify_installed_agent",
         AgentCommand::UpdateComponents => "update_components",
         AgentCommand::RollbackComponent { .. } => "rollback_component",
+        AgentCommand::PolicySummary => "policy_summary",
     }
 }

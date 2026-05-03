@@ -19,6 +19,8 @@ pub const PIPE_NAME: &str = AGENT_PIPE_NAME;
 struct AgentWireResponse {
     ok: bool,
     state: Option<AgentState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_summary: Option<badvpn_common::ipc::PolicySummaryResponse>,
     error: Option<String>,
 }
 
@@ -59,6 +61,7 @@ async fn serve_agent_tcp_ipc(shutdown: Arc<AtomicBool>) -> anyhow::Result<()> {
                             AgentWireResponse {
                                 ok: false,
                                 state: None,
+                                policy_summary: None,
                                 error: Some(format!("failed to read command: {error}")),
                             },
                         );
@@ -67,21 +70,38 @@ async fn serve_agent_tcp_ipc(shutdown: Arc<AtomicBool>) -> anyhow::Result<()> {
                 }
 
                 let response = match serde_json::from_str::<AgentCommand>(&line) {
-                    Ok(command) => match controller.handle(command).await {
-                        Ok(state) => AgentWireResponse {
+                    Ok(AgentCommand::PolicySummary) => match controller.policy_summary() {
+                        Ok(summary) => AgentWireResponse {
                             ok: true,
-                            state: Some(state),
+                            state: None,
+                            policy_summary: Some(summary),
                             error: None,
                         },
                         Err(error) => AgentWireResponse {
                             ok: false,
                             state: None,
+                            policy_summary: None,
+                            error: Some(error.to_string()),
+                        },
+                    },
+                    Ok(command) => match controller.handle(command).await {
+                        Ok(state) => AgentWireResponse {
+                            ok: true,
+                            state: Some(state),
+                            policy_summary: None,
+                            error: None,
+                        },
+                        Err(error) => AgentWireResponse {
+                            ok: false,
+                            state: None,
+                            policy_summary: None,
                             error: Some(error.to_string()),
                         },
                     },
                     Err(error) => AgentWireResponse {
                         ok: false,
                         state: None,
+                        policy_summary: None,
                         error: Some(format!("failed to parse command: {error}")),
                     },
                 };
@@ -227,6 +247,7 @@ async fn serve_agent_named_pipe_ipc(shutdown: Arc<AtomicBool>) -> anyhow::Result
                     AgentWireResponse {
                         ok: false,
                         state: None,
+                        policy_summary: None,
                         error: Some(format!("failed to read command: {error}")),
                     },
                 );
@@ -240,21 +261,38 @@ async fn serve_agent_named_pipe_ipc(shutdown: Arc<AtomicBool>) -> anyhow::Result
         };
 
         let response = match serde_json::from_str::<AgentCommand>(&line) {
-            Ok(command) => match controller.handle(command).await {
-                Ok(state) => AgentWireResponse {
+            Ok(AgentCommand::PolicySummary) => match controller.policy_summary() {
+                Ok(summary) => AgentWireResponse {
                     ok: true,
-                    state: Some(state),
+                    state: None,
+                    policy_summary: Some(summary),
                     error: None,
                 },
                 Err(error) => AgentWireResponse {
                     ok: false,
                     state: None,
+                    policy_summary: None,
+                    error: Some(error.to_string()),
+                },
+            },
+            Ok(command) => match controller.handle(command).await {
+                Ok(state) => AgentWireResponse {
+                    ok: true,
+                    state: Some(state),
+                    policy_summary: None,
+                    error: None,
+                },
+                Err(error) => AgentWireResponse {
+                    ok: false,
+                    state: None,
+                    policy_summary: None,
                     error: Some(error.to_string()),
                 },
             },
             Err(error) => AgentWireResponse {
                 ok: false,
                 state: None,
+                policy_summary: None,
                 error: Some(format!("failed to parse command: {error}")),
             },
         };
