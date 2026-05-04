@@ -1,0 +1,13 @@
+proxies:
+  - name: Node-DE
+    type: http
+    server: 198.51.100.40
+    port: 443
+proxy-groups:
+  - name: MainProxy
+    type: select
+    proxies:
+      - Node-DE
+rules:
+  - GEOSITE,openai,MainProxy
+  - GEOSITE,telegram,MainProxy

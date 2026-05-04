@@ -46,7 +46,7 @@ The product goal is not to be a generic Clash/Mihomo GUI. BPN Client is a policy
 Only two user-facing modes are allowed:
 
 1. **Smart**
-   - Default route is direct.
+   - Default route is the selected VPN/proxy group.
    - YouTube, Discord, and configured game targets go through `DIRECT + zapret`.
    - AI/social/provider-proxy targets go through VPN.
    - RU/local/safe targets remain direct.
@@ -204,7 +204,7 @@ GEOIP,ru
 RULE-SET,openai
 PROCESS-NAME,game.exe
 DOMAIN-KEYWORD,sberbank
-MATCH,DIRECT
+MATCH,MainProxy
 REJECT
 📺 YouTube и Discord
 ```
@@ -254,7 +254,7 @@ The current implementation has moved toward the intended architecture:
 - old route modes deserialize through compatibility aliases;
 - Smart Routing Core exists in `policy.rs`;
 - Mihomo rules, zapret artifacts, DNS policy, diagnostics expectations, and suppressed rules are produced from `CompiledPolicy`;
-- Smart final rule is `MATCH,DIRECT`;
+- Smart final rule is `MATCH,<main_proxy_group>` or a managed no-DIRECT group;
 - VPN Only final rule is `MATCH,<main_proxy_group>` or a managed no-DIRECT group;
 - zapret artifacts reject Mihomo-only tokens;
 - GEOSITE YouTube/Discord expands to concrete zapret domains;
@@ -350,11 +350,11 @@ Ensure `CompiledPolicy::validate_invariants()` is called in the production compi
 Acceptance criteria:
 
 ```text
-[ ] Smart policy cannot be returned without MATCH,DIRECT.
-[ ] VPN Only policy cannot be returned with MATCH,DIRECT.
-[ ] VPN Only policy cannot return zapret artifacts.
-[ ] zapret artifacts cannot contain Mihomo-only tokens.
-[ ] invalid policy compile returns a clear error.
+[x] Smart policy cannot be returned with a final rule other than MATCH,<main_proxy_group>.
+[x] VPN Only policy cannot be returned with MATCH,DIRECT.
+[x] VPN Only policy cannot return zapret artifacts.
+[x] zapret artifacts cannot contain Mihomo-only tokens.
+[x] invalid policy compile returns a clear error.
 ```
 
 Suggested tests:
@@ -386,9 +386,9 @@ provider_geosite_ai_youtube_discord.yaml
 Acceptance criteria:
 
 ```text
-[ ] All fixtures compile in Smart and VPN Only or fail with expected error.
-[ ] Rendered YAML reparses through serde_yaml.
-[ ] No fixture contains real credentials, UUIDs, subscription URLs, or real node details.
+[x] All fixtures compile in Smart and VPN Only or fail with expected error.
+[x] Rendered YAML reparses through serde_yaml.
+[x] No fixture contains real credentials, UUIDs, subscription URLs, or real node details.
 ```
 
 #### A3. Validate Smart behavior on fixture set
@@ -396,12 +396,12 @@ Acceptance criteria:
 Acceptance criteria:
 
 ```text
-[ ] YouTube/Discord provider proxy rules become DIRECT + concrete zapret hostlist.
-[ ] AI/social/provider proxy rules remain proxy group routes.
-[ ] Telegram/provider group rules remain proxy group routes.
-[ ] RU/Yandex/VK/bank provider DIRECT remains DirectSafe in Smart.
-[ ] Provider MATCH is replaced by MATCH,DIRECT.
-[ ] Suppressed provider rules include override reasons.
+[x] YouTube/Discord provider proxy rules become DIRECT + concrete zapret hostlist.
+[x] AI/social/provider proxy rules remain proxy group routes.
+[x] Telegram/provider group rules remain proxy group routes.
+[x] RU/Yandex/VK/bank provider DIRECT remains DirectSafe in Smart.
+[x] Provider MATCH is replaced by MATCH,<main_proxy_group>.
+[x] Suppressed provider rules include override reasons.
 ```
 
 #### A4. Validate VPN Only behavior on fixture set
@@ -409,13 +409,13 @@ Acceptance criteria:
 Acceptance criteria:
 
 ```text
-[ ] External provider DIRECT rules are suppressed.
-[ ] private/LAN/safety DIRECT remains.
-[ ] REJECT remains.
-[ ] provider proxy group rules remain.
-[ ] main group with DIRECT creates managed no-DIRECT group.
-[ ] nested group with DIRECT is detected transitively.
-[ ] provider-only DIRECT config fails cleanly if no proxy exists.
+[x] External provider DIRECT rules are suppressed.
+[x] private/LAN/safety DIRECT remains.
+[x] REJECT remains.
+[x] provider proxy group rules remain.
+[x] main group with DIRECT creates managed no-DIRECT group.
+[x] nested group with DIRECT is detected transitively.
+[x] provider-only DIRECT config fails cleanly if no proxy exists.
 ```
 
 #### A5. Verify Smart fallback
@@ -423,12 +423,12 @@ Acceptance criteria:
 Acceptance criteria:
 
 ```text
-[ ] zapret start failure triggers fresh VpnOnly compile.
-[ ] fallback config has no MATCH,DIRECT.
-[ ] fallback config has no YouTube/Discord DIRECT rules.
-[ ] fallback zapret artifacts are empty.
-[ ] phase is DegradedVpnOnly only when user requested Smart.
-[ ] user-requested VPN Only is Running, not degraded.
+[x] zapret start failure triggers fresh VpnOnly compile.
+[x] fallback config has no MATCH,DIRECT.
+[x] fallback config has no YouTube/Discord DIRECT rules.
+[x] fallback zapret artifacts are empty.
+[x] phase is DegradedVpnOnly only when user requested Smart.
+[x] user-requested VPN Only is Running, not degraded.
 ```
 
 ---
@@ -477,10 +477,10 @@ fallback if needed
 Acceptance criteria:
 
 ```text
-[ ] A new user does not need to visit advanced settings to connect.
-[ ] Button state reflects idle/connecting/connected/disconnecting/error.
-[ ] Smart fallback is shown as fallback, not as silent success.
-[ ] User gets one concise error message with a Details option.
+[x] A new user does not need to visit advanced settings to connect.
+[x] Button state reflects idle/connecting/connected/disconnecting/error.
+[x] Smart fallback is shown as fallback, not as silent success.
+[x] User gets one concise error message with a Details option.
 ```
 
 #### B2. First-run setup flow
@@ -488,12 +488,12 @@ Acceptance criteria:
 Acceptance criteria:
 
 ```text
-[ ] App detects missing subscription.
-[ ] App explains what subscription is needed.
-[ ] App validates imported profile.
-[ ] App detects missing agent/components.
-[ ] App offers install/repair action.
-[ ] GUI does not require admin privileges.
+[x] App detects missing subscription.
+[x] App explains what subscription is needed.
+[x] App validates imported profile.
+[x] App detects missing agent/components.
+[x] App offers install/repair action.
+[x] GUI does not require admin privileges.
 ```
 
 #### B3. Startup progress UI
@@ -511,9 +511,9 @@ Connected
 Acceptance criteria:
 
 ```text
-[ ] User sees progress within 500 ms of pressing Connect.
-[ ] Long operations have status text.
-[ ] Failures show which stage failed.
+[x] User sees progress within 500 ms of pressing Connect.
+[x] Long operations have status text.
+[x] Failures show which stage failed.
 ```
 
 #### B4. Basic/Advanced settings split
@@ -539,9 +539,9 @@ DNS/TUN/ports/logs
 Acceptance criteria:
 
 ```text
-[ ] Legacy low-level options are hidden from normal users.
-[ ] Advanced section is clearly marked.
-[ ] Existing settings continue to deserialize.
+[x] Legacy low-level options are hidden from normal users.
+[x] Advanced section is clearly marked.
+[x] Existing settings continue to deserialize.
 ```
 
 ---
@@ -1351,8 +1351,8 @@ If any check is skipped, the PR must explain why.
 | Yandex/VK/RU | DIRECT safe | VPN unless Force DIRECT |
 | Bank domains | DIRECT safe | VPN unless Force DIRECT |
 | winws killed | fallback/degraded | not applicable |
-| provider group has DIRECT | Smart unaffected where direct allowed | managed no-DIRECT group |
-| no non-DIRECT proxies | error if VPN needed | clean error |
+| provider group has DIRECT | managed no-DIRECT group when used as a proxy path | managed no-DIRECT group |
+| no non-DIRECT proxies | clean error when VPN path is needed | clean error |
 | Broad enabled | warning, experimental | normally not needed |
 
 ### 17.3. QA artifacts

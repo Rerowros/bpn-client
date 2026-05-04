@@ -119,7 +119,7 @@ VPN Only не должен случайно обходить VPN через prov
 - Публичные режимы сведены к `smart` и `vpn_only`.
 - Старые route mode значения мигрируют через serde aliases.
 - Mihomo rules, zapret artifacts, DNS policy и diagnostics строятся из `CompiledPolicy`.
-- Smart рендерит `MATCH,DIRECT`.
+- Smart рендерит `MATCH,<main_proxy_group>` или managed group без `DIRECT`.
 - VPN Only рендерит `MATCH,<main_proxy_group>` или managed group без `DIRECT`.
 - YouTube/Discord provider proxy rules в Smart переопределяются в `ZapretDirect`.
 - zapret artifacts валидируются и не принимают `GEOSITE`, `GEOIP`, `RULE-SET`, `PROCESS-NAME`, `DOMAIN-KEYWORD`, `MATCH`, `DIRECT`, `REJECT` и complex rule tokens.
@@ -170,7 +170,7 @@ VPN Only не должен случайно обходить VPN через prov
 ```text
 [ ] UI показывает только Smart и VPN Only.
 [ ] Старые route modes читаются и мигрируют.
-[ ] Smart emits MATCH,DIRECT.
+[ ] Smart emits MATCH,<safe_proxy_group>.
 [ ] VPN Only emits MATCH,<safe_proxy_group>.
 [ ] VPN Only не оставляет external provider DIRECT.
 [ ] VPN Only не использует group с DIRECT напрямую или транзитивно.
@@ -192,7 +192,7 @@ VPN Only не должен случайно обходить VPN через prov
 ```text
 Mihomo: running
 zapret/winws: running
-final rule: MATCH,DIRECT
+final rule: MATCH,<main_proxy_group> или MATCH,__BADVPN_VPN_ONLY__
 YouTube: DIRECT + winws active
 Discord: DIRECT + winws active
 AI/OpenAI/Claude: proxy group
@@ -208,7 +208,7 @@ DOMAIN-SUFFIX,googlevideo.com,DIRECT
 GEOSITE,discord,DIRECT
 GEOSITE,openai,🤖 AI
 GEOSITE,telegram,Выбор сервера
-MATCH,DIRECT
+MATCH,MainProxy
 ```
 
 Проверить zapret hostlist:
@@ -559,7 +559,7 @@ VPN Only
 Smart explanation:
 
 ```text
-Умный режим для РФ: YouTube, Discord и игры идут напрямую через zapret для низкого ping. AI, соцсети и сайты из VPN-правил идут через VPN. Остальное — напрямую.
+Умный режим для РФ: YouTube, Discord и игры идут напрямую через zapret для низкого ping. AI, соцсети, сайты из VPN-правил и остальной внешний трафик идут через VPN.
 ```
 
 VPN Only explanation:
@@ -748,8 +748,8 @@ Where feasible:
 | Yandex/VK/RU | yes | yes | Smart DIRECT, VPN Only proxy unless Force DIRECT |
 | Bank domains | yes | yes | Smart DIRECT, VPN Only proxy unless Force DIRECT |
 | winws killed | yes | no | Smart degraded/fallback |
-| group with DIRECT | no | yes | managed no-DIRECT group |
-| no non-DIRECT proxies | no | yes | clean error |
+| group with DIRECT | yes | yes | managed no-DIRECT group when used as a proxy path |
+| no non-DIRECT proxies | yes | yes | clean error when VPN path is needed |
 | Broad | yes | no | warning, experimental |
 
 ---
