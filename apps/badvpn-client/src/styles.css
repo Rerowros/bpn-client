@@ -540,6 +540,81 @@ textarea:focus {
   font-size: 12px;
 }
 
+.setupReadiness {
+  display: grid;
+  gap: 8px;
+  max-width: 720px;
+}
+
+.setupStep {
+  align-items: center;
+  background: var(--surface-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  display: grid;
+  gap: 10px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  min-height: 58px;
+  padding: 9px 10px;
+}
+
+.setupStep.ready {
+  border-color: rgba(94, 224, 160, 0.28);
+}
+
+.setupStep.pending {
+  border-color: rgba(96, 165, 250, 0.28);
+}
+
+.setupStep.blocked {
+  border-color: rgba(246, 192, 95, 0.34);
+}
+
+.setupStepIcon {
+  align-items: center;
+  border-radius: 999px;
+  display: inline-flex;
+  height: 30px;
+  justify-content: center;
+  width: 30px;
+}
+
+.setupStep.ready .setupStepIcon {
+  background: rgba(94, 224, 160, 0.12);
+  color: var(--success);
+}
+
+.setupStep.pending .setupStepIcon {
+  background: rgba(96, 165, 250, 0.12);
+  color: var(--accent);
+}
+
+.setupStep.blocked .setupStepIcon {
+  background: rgba(246, 192, 95, 0.12);
+  color: var(--warning);
+}
+
+.setupStep div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.setupStep strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.setupStep span {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.setupStepAction {
+  justify-items: end;
+}
+
 .connectionPane {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) 96px;
@@ -575,10 +650,17 @@ textarea:focus {
 .connectCenter {
   align-content: center;
   display: grid;
-  gap: 14px;
+  gap: 12px;
   justify-items: center;
   min-height: 0;
   padding: 20px;
+}
+
+.modeLine {
+  align-items: center;
+  display: inline-flex;
+  gap: 8px;
+  min-height: 24px;
 }
 
 .modeText {
@@ -587,6 +669,18 @@ textarea:focus {
   font-weight: 800;
   letter-spacing: 0;
   text-transform: uppercase;
+}
+
+.fallbackBadge {
+  background: rgba(246, 192, 95, 0.13);
+  border: 1px solid rgba(246, 192, 95, 0.42);
+  border-radius: 999px;
+  color: #ffe0a8;
+  font-size: 11px;
+  font-weight: 820;
+  height: 22px;
+  line-height: 20px;
+  padding: 0 8px;
 }
 
 .connectButton {
@@ -613,8 +707,143 @@ textarea:focus {
   box-shadow: 0 0 0 8px rgba(94, 224, 160, 0.12);
 }
 
+.connectButton.pending {
+  background: rgba(96, 165, 250, 0.22);
+  border-color: rgba(96, 165, 250, 0.44);
+}
+
+.connectButton.pending svg,
+.progressStep.active svg {
+  animation: spin 1.1s linear infinite;
+}
+
 .connectCenter strong {
   font-size: 16px;
+}
+
+.connectionProgress {
+  display: grid;
+  gap: 8px;
+  max-width: 620px;
+  min-height: 58px;
+  width: min(100%, 620px);
+}
+
+.connectionProgress > span {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 760;
+  text-align: center;
+}
+
+.progressSteps {
+  display: grid;
+  gap: 6px;
+  grid-template-columns: repeat(auto-fit, minmax(104px, 1fr));
+}
+
+.progressStep {
+  align-items: center;
+  background: var(--surface-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  display: inline-flex;
+  font-size: 11px;
+  font-weight: 760;
+  gap: 5px;
+  height: 30px;
+  justify-content: center;
+  min-width: 0;
+  overflow: hidden;
+  padding: 0 7px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.progressStep.done {
+  border-color: rgba(94, 224, 160, 0.3);
+  color: var(--success);
+}
+
+.progressStep.active {
+  border-color: rgba(96, 165, 250, 0.46);
+  color: var(--text);
+}
+
+.connectionNotice {
+  align-items: center;
+  border-radius: var(--radius-sm);
+  display: grid;
+  gap: 8px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  max-width: 620px;
+  min-height: 40px;
+  padding: 8px 10px;
+  width: min(100%, 620px);
+}
+
+.connectionNotice span {
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.35;
+  min-width: 0;
+}
+
+.connectionNotice button {
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 820;
+  height: 26px;
+  padding: 0 6px;
+}
+
+.connectionNotice.warning {
+  background: rgba(246, 192, 95, 0.1);
+  border: 1px solid rgba(246, 192, 95, 0.32);
+  color: var(--warning);
+}
+
+.connectionNotice.error {
+  background: rgba(255, 143, 134, 0.1);
+  border: 1px solid rgba(255, 143, 134, 0.34);
+  color: var(--danger);
+}
+
+.homeRouteSummary {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  max-width: 620px;
+  width: min(100%, 620px);
+}
+
+.homeRouteItem {
+  background: var(--surface-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  display: grid;
+  gap: 4px;
+  min-height: 52px;
+  min-width: 0;
+  padding: 8px 10px;
+}
+
+.homeRouteItem span {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 780;
+  text-transform: uppercase;
+}
+
+.homeRouteItem strong {
+  color: var(--text);
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .meterGrid {
@@ -706,6 +935,34 @@ textarea:focus {
   overflow: hidden;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 3;
+}
+
+.timelineChips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.timelineChips span {
+  align-items: center;
+  background: var(--surface-muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-muted);
+  display: inline-flex;
+  font-size: 11px;
+  gap: 5px;
+  height: 24px;
+  max-width: 100%;
+  min-width: 0;
+  padding: 0 8px;
+}
+
+.timelineChips strong {
+  color: var(--text-secondary);
+  font-size: 11px;
+  white-space: nowrap;
 }
 
 .successText {
@@ -861,6 +1118,12 @@ textarea:focus {
   color: var(--text-muted);
   height: 26px;
   padding: 0 4px;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .pageWorkspace {

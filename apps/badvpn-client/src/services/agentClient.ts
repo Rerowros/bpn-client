@@ -323,6 +323,16 @@ export interface AgentServiceStatus {
   message: string;
 }
 
+export interface RuntimeReadinessResponse {
+  agent: AgentServiceStatus;
+  mihomo_ready: boolean;
+  zapret_ready: boolean;
+  needs_zapret: boolean;
+  components_ready: boolean;
+  ready: boolean;
+  message: string;
+}
+
 export type RuntimeCheckStatus = "ok" | "warning" | "error";
 
 export interface RuntimeDiagnosticCheck {
@@ -443,6 +453,10 @@ export function removeSubscriptionProfile(id: string): Promise<SubscriptionProfi
 
 export function checkComponentUpdates(): Promise<ComponentUpdateReport> {
   return invoke<ComponentUpdateReport>("check_component_updates");
+}
+
+export function getRuntimeReadiness(): Promise<RuntimeReadinessResponse> {
+  return invoke<RuntimeReadinessResponse>("runtime_readiness");
 }
 
 export function getSettings(): Promise<AppSettings> {

@@ -1,0 +1,20 @@
+proxies:
+  - name: Node-DE
+    type: http
+    server: 198.51.100.60
+    port: 443
+proxy-groups:
+  - name: MainProxy
+    type: select
+    proxies:
+      - Node-DE
+rules:
+  - DOMAIN,exact.example.test,MainProxy
+  - DOMAIN-SUFFIX,cdn.example.test,MainProxy
+  - DST-PORT,443,MainProxy
+  - NETWORK,UDP,MainProxy
+  - AND,((DOMAIN,voice.example.test),(NETWORK,UDP)),MainProxy
+  - SRC-IP-CIDR,192.0.2.10/32,MainProxy
+  - DOMAIN-SUFFIX,local-direct.example,DIRECT
+  - GEOSITE,category-ads-all,REJECT
+  - MATCH,MainProxy

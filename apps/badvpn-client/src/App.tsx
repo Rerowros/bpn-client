@@ -41,6 +41,7 @@ import {
   ProxyGroupView,
   ProxyNodeView,
   RuntimeDiagnosticsReport,
+  RuntimeReadinessResponse,
   SubscriptionProfilesState,
   TrackedConnection,
   ZapretServiceStatus,
@@ -52,6 +53,7 @@ import {
   getConnectionsSnapshot,
   getPolicySummary,
   getProxyCatalog,
+  getRuntimeReadiness,
   getSettings,
   getStatus,
   getSubscriptionProfiles,
@@ -77,7 +79,9 @@ import { AppUpdateStatus, checkAppUpdate, installAppUpdate } from "./services/up
 type AppView = "overview" | "connections" | "servers" | "policy" | "settings";
 type ConnectionTab = "active" | "closed";
 type ConnectionPathFilter = "all" | ConnectionPath;
-type SettingsSection = "core" | "tun" | "zapret" | "updates";
+type SettingsSection = "basic" | "advanced" | "updates";
+type ConnectionAttempt = { action: "connect" | "disconnect"; startedAt: number };
+
 const emptyState: AgentState = {
   installed: false,
   running: false,
@@ -239,6 +243,7 @@ export function App() {
   const [selectedGroup, setSelectedGroup] = useState<string | null>(null);
   const [catalogBusy, setCatalogBusy] = useState(false);
   const [runtimeDiagnostics, setRuntimeDiagnostics] = useState<RuntimeDiagnosticsReport | null>(null);
+  const [runtimeReadiness, setRuntimeReadiness] = useState<RuntimeReadinessResponse | null>(null);
   const [diagnosticBusy, setDiagnosticBusy] = useState(false);
   const [policySummary, setPolicySummary] = useState<PolicySummaryResponse | null>(null);
   const [policyBusy, setPolicyBusy] = useState(false);
@@ -247,10 +252,14 @@ export function App() {
   const [zapretService, setZapretService] = useState<ZapretServiceStatus | null>(null);
   const [zapretServiceBusy, setZapretServiceBusy] = useState(false);
   const [settings, setSettings] = useState<AppSettings>(defaultSettings);
-  const [settingsSection, setSettingsSection] = useState<SettingsSection>("core");
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>("basic");
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [settingsRestartRequired, setSettingsRestartRequired] = useState(false);
   const [lastConnectionsError, setLastConnectionsError] = useState<string | null>(null);
+  const [connectionAttempt, setConnectionAttempt] = useState<ConnectionAttempt | null>(null);
+  const [progressNow, setProgressNow] = useState(() => Date.now());
+  const [showConnectionDetails, setShowConnectionDetails] = useState(false);
+  const [connectionFailureStage, setConnectionFailureStage] = useState<string | null>(null);
 
   function pushNotification({
     tone,
@@ -304,6 +313,11 @@ export function App() {
       tone: "error",
       title,
       message: nextState.last_error,
+      actionLabel: "Details",
+      action: () => {
+        setView("overview");
+        setShowConnectionDetails(true);
+      },
       autoDismiss: false,
     });
   }
@@ -327,12 +341,21 @@ export function App() {
     void refreshSubscriptionProfiles(false);
     void refreshAgentService(false);
     void refreshZapretService(false);
+    void refreshRuntimeReadiness(false);
   }, []);
 
   useEffect(() => {
     const timer = window.setInterval(() => void runAction(() => getStatus(), false), 5000);
     return () => window.clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    if (!connectionAttempt) {
+      return;
+    }
+    const timer = window.setInterval(() => setProgressNow(Date.now()), 450);
+    return () => window.clearInterval(timer);
+  }, [connectionAttempt]);
 
   useEffect(() => {
     if (!state.connection.connected || !settings.diagnostics.runtime_checks_after_connect) {
@@ -383,6 +406,19 @@ export function App() {
   const announceUrl = state.subscription.announce_url || state.subscription.profile_web_page_url;
   const isRuntimeTransitioning = state.connection.status === "starting" || state.connection.status === "stopping";
   const isConnected = state.connection.connected && state.connection.status === "running";
+  const smartFallbackActive =
+    isConnected && settings.core.route_mode === "smart" && state.connection.route_mode === "vpn_only";
+  const agentReady = Boolean(agentService?.installed && agentService.ipc_ready);
+  const runtimeComponentStatus = getRuntimeComponentStatus(componentUpdates, runtimeReadiness);
+  const connectionProgress = getConnectionProgress({
+    attempt: connectionAttempt,
+    now: progressNow,
+    routeMode: settings.core.route_mode,
+    status: state.connection.status,
+    connected: isConnected,
+    fallbackActive: smartFallbackActive,
+    lastError: state.last_error,
+  });
   const statusLabel = useMemo(() => {
     if (state.connection.status === "starting") {
       return "Starting";
@@ -401,6 +437,9 @@ export function App() {
     }
     return "Not configured";
   }, [hasSubscription, isConnected, state.connection.status, state.last_error]);
+
+  const routeSummary = getHomeRouteSummary(settings.core.route_mode, smartFallbackActive);
+  const startupTimeline = parseStartupTimeline(state.diagnostics.message);
 
   async function runAction(action: () => Promise<AgentState>, showBusy = true) {
     if (showBusy) {
@@ -426,6 +465,106 @@ export function App() {
       if (showBusy) {
         setBusy(false);
       }
+    }
+  }
+
+  async function handlePrimaryConnectionAction() {
+    const action = isConnected ? "disconnect" : "connect";
+    const attempt = { action, startedAt: Date.now() } satisfies ConnectionAttempt;
+    setConnectionAttempt(attempt);
+    setProgressNow(Date.now());
+    setShowConnectionDetails(false);
+    setConnectionFailureStage(null);
+    setBusy(true);
+    setState((current) => ({
+      ...current,
+      phase: action === "connect" ? "connecting" : "disconnecting",
+      last_error: null,
+      connection: {
+        ...current.connection,
+        status: action === "connect" ? "starting" : "stopping",
+      },
+      diagnostics: {
+        ...current.diagnostics,
+        message: action === "connect" ? "Preparing policy..." : "Disconnecting...",
+      },
+    }));
+
+    try {
+      const nextState = await (action === "connect" ? startConnection() : stopConnection());
+      setState(nextState);
+      if (nextState.last_error) {
+        setConnectionFailureStage(
+          getConnectionProgress({
+            attempt,
+            now: Date.now(),
+            routeMode: settings.core.route_mode,
+            status: nextState.connection.status,
+            connected: nextState.connection.connected,
+            fallbackActive: false,
+            lastError: null,
+          })?.label ?? null,
+        );
+        notifyAgentError(action === "connect" ? "Connect failed" : "Disconnect failed", nextState);
+        setShowConnectionDetails(true);
+      } else if (
+        action === "connect" &&
+        settings.core.route_mode === "smart" &&
+        nextState.connection.connected &&
+        nextState.connection.route_mode === "vpn_only"
+      ) {
+        pushNotification({
+          tone: "warning",
+          title: "Smart fallback active",
+          message: "Connected in VPN Only because zapret is not ready.",
+          actionLabel: "Details",
+          action: () => {
+            setView("policy");
+          },
+          autoDismiss: false,
+        });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setConnectionFailureStage(
+        getConnectionProgress({
+          attempt,
+          now: Date.now(),
+          routeMode: settings.core.route_mode,
+          status: action === "connect" ? "starting" : "stopping",
+          connected: false,
+          fallbackActive: false,
+          lastError: null,
+        })?.label ?? null,
+      );
+      setState((current) => ({
+        ...current,
+        phase: "error",
+        connection: {
+          ...current.connection,
+          status: "error",
+        },
+        last_error: message,
+        diagnostics: {
+          ...current.diagnostics,
+          message,
+        },
+      }));
+      pushNotification({
+        tone: "error",
+        title: action === "connect" ? "Connect failed" : "Disconnect failed",
+        message,
+        actionLabel: "Details",
+        action: () => {
+          setView("overview");
+          setShowConnectionDetails(true);
+        },
+        autoDismiss: false,
+      });
+      setShowConnectionDetails(true);
+    } finally {
+      setBusy(false);
+      window.setTimeout(() => setConnectionAttempt(null), 700);
     }
   }
 
@@ -523,6 +662,7 @@ export function App() {
       ]);
       setAppUpdate(nextAppUpdate);
       setComponentUpdates(componentReport.components);
+      await refreshRuntimeReadiness(false);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setAppUpdate({
@@ -567,6 +707,7 @@ export function App() {
       });
       const componentReport = await checkComponentUpdates();
       setComponentUpdates(componentReport.components);
+      await refreshRuntimeReadiness(false);
       await refreshZapretService(false);
     } catch (error) {
       notifyFromError("Runtime update failed", error);
@@ -667,7 +808,9 @@ export function App() {
     try {
       const status = await installAgentService();
       setAgentService(status);
+      setRuntimeReadiness((current) => current ? { ...current, agent: status, ready: status.ipc_ready && current.components_ready } : current);
       pushNotification({ tone: "success", title: "Agent service updated", message: status.message });
+      await refreshRuntimeReadiness(false);
       await runAction(() => getStatus(), false);
     } catch (error) {
       notifyFromError("Agent service failed", error);
@@ -699,6 +842,23 @@ export function App() {
     } finally {
       if (showBusy) {
         setZapretServiceBusy(false);
+      }
+    }
+  }
+
+  async function refreshRuntimeReadiness(showBusy = true) {
+    if (showBusy) {
+      setUpdateBusy(true);
+    }
+    try {
+      const readiness = await getRuntimeReadiness();
+      setRuntimeReadiness(readiness);
+      setAgentService(readiness.agent);
+    } catch (error) {
+      notifyFromError("Runtime readiness failed", error);
+    } finally {
+      if (showBusy) {
+        setUpdateBusy(false);
       }
     }
   }
@@ -872,6 +1032,7 @@ export function App() {
           appUpdate,
           componentUpdates,
           runtimeDiagnostics,
+          runtimeReadiness,
           subscriptionProfiles,
           profileUrl,
           agentService,
@@ -901,6 +1062,7 @@ export function App() {
           installAgentService: () => void handleInstallAgentService(),
           removeAgentService: () => void handleRemoveAgentService(),
           refreshZapretService: () => void refreshZapretService(),
+          openServers: () => setView("servers"),
         });
       default:
         return renderOverview();
@@ -938,6 +1100,63 @@ export function App() {
                 <span className="inlineError">{state.subscription.validation_error}</span>
               ) : null}
             </form>
+
+            <div className="setupReadiness" aria-label="First run readiness">
+              <SetupStep
+                title="Subscription"
+                status={hasSubscription ? "ready" : state.subscription.validation_error ? "blocked" : "pending"}
+                detail={
+                  hasSubscription
+                    ? `${state.subscription.node_count || "Imported"} nodes ready`
+                    : "Paste your BPN Clash/Mihomo subscription URL first."
+                }
+              />
+              <SetupStep
+                title="Agent"
+                status={agentReady ? "ready" : agentService?.installed ? "pending" : "blocked"}
+                detail={
+                  agentReady
+                    ? "badvpn-agent is installed and reachable."
+                    : agentService?.installed
+                      ? agentService.message
+                      : "Install the privileged agent once; the GUI will stay non-admin after setup."
+                }
+                action={
+                  agentReady ? null : (
+                    <button className="subtleButton" type="button" onClick={() => void handleInstallAgentService()} disabled={agentServiceBusy}>
+                      <Shield size={15} aria-hidden="true" />
+                      Install / repair
+                    </button>
+                  )
+                }
+              />
+              <SetupStep
+                title="Runtime"
+                status={runtimeComponentStatus.status}
+                detail={runtimeComponentStatus.detail}
+                action={
+                  <div className="buttonRow">
+                    <button className="subtleButton" type="button" onClick={() => void handleCheckUpdates()} disabled={updateBusy}>
+                      <RefreshCw size={15} aria-hidden="true" />
+                      Check
+                    </button>
+                    <button className="subtleButton" type="button" onClick={() => void handleRuntimeUpdate()} disabled={updateBusy}>
+                      <Download size={15} aria-hidden="true" />
+                      Prepare
+                    </button>
+                  </div>
+                }
+              />
+              <SetupStep
+                title="Mode"
+                status="ready"
+                detail={
+                  settings.core.route_mode === "smart"
+                    ? "Smart starts as default and falls back to VPN Only if zapret is not ready."
+                    : "VPN Only is selected; zapret is skipped."
+                }
+              />
+            </div>
           </section>
         ) : (
           <section className="connectionPane">
@@ -954,17 +1173,50 @@ export function App() {
             ) : null}
 
             <div className="connectCenter">
-              <span className="modeText">{formatRouteMode(state.connection.route_mode)}</span>
+              <div className="modeLine">
+                <span className="modeText">{formatRouteMode(state.connection.route_mode)}</span>
+                {smartFallbackActive ? <span className="fallbackBadge">Fallback</span> : null}
+              </div>
               <button
                 className={isConnected ? "connectButton connected" : isRuntimeTransitioning ? "connectButton pending" : "connectButton"}
                 type="button"
-                onClick={() => void runAction(isConnected ? stopConnection : startConnection)}
+                onClick={() => void handlePrimaryConnectionAction()}
                 disabled={busy || isRuntimeTransitioning}
                 aria-label={isConnected ? "Disconnect" : "Connect"}
               >
                 {isRuntimeTransitioning ? <RefreshCw size={46} /> : isConnected ? <CirclePause size={48} /> : <Power size={48} />}
               </button>
               <strong>{statusLabel}</strong>
+              <ConnectionProgressView progress={connectionProgress} />
+              {smartFallbackActive ? (
+                <div className="connectionNotice warning">
+                  <AlertTriangle size={16} aria-hidden="true" />
+                  <span>Smart fallback: VPN Only is active because zapret is not ready.</span>
+                  <button type="button" onClick={() => setView("policy")}>
+                    Details
+                  </button>
+                </div>
+              ) : null}
+              {state.last_error ? (
+                <div className="connectionNotice error">
+                  <AlertTriangle size={16} aria-hidden="true" />
+                  <span>
+                    {connectionFailureStage ? `Failed at ${connectionFailureStage}. ` : ""}
+                    {showConnectionDetails ? state.last_error : conciseError(state.last_error)}
+                  </span>
+                  <button type="button" onClick={() => setShowConnectionDetails((visible) => !visible)}>
+                    {showConnectionDetails ? "Hide" : "Details"}
+                  </button>
+                </div>
+              ) : null}
+              <div className="homeRouteSummary">
+                {routeSummary.map((item) => (
+                  <div key={item.label} className="homeRouteItem">
+                    <span>{item.label}</span>
+                    <strong>{item.value}</strong>
+                  </div>
+                ))}
+              </div>
             </div>
 
             <div className="meterGrid">
@@ -985,6 +1237,15 @@ export function App() {
               good={state.diagnostics.zapret_healthy}
             />
             <p className="diagnosticText">{state.diagnostics.message ?? "No diagnostics yet."}</p>
+            {startupTimeline.length > 0 ? (
+              <div className="timelineChips" aria-label="Startup timeline">
+                {startupTimeline.slice(0, 6).map((item) => (
+                  <span key={item.name}>
+                    {formatTimelineKey(item.name)} <strong>{item.value} ms</strong>
+                  </span>
+                ))}
+              </div>
+            ) : null}
           </Panel>
 
           <Panel title="Subscription">
@@ -1004,9 +1265,12 @@ export function App() {
           </Panel>
 
           <Panel title="Routes">
-            <StatusRow label="VPN" value="MATCH -> PROXY" good={hasSubscription} />
-            <StatusRow label="zapret" value="Discord/YouTube DIRECT" good={state.diagnostics.zapret_healthy} />
-            <p className="diagnosticText">Connections page explains how each active flow is routed.</p>
+            {routeSummary.map((item) => (
+              <StatusRow key={item.label} label={item.label} value={item.value} good={item.good} />
+            ))}
+            <p className="diagnosticText">
+              {smartFallbackActive ? "Smart direct routes are paused until zapret recovers." : "Connections page shows active flow paths."}
+            </p>
           </Panel>
         </aside>
       </div>
@@ -1091,6 +1355,64 @@ export function App() {
       </section>
       <NotificationCenter notifications={notifications} dismiss={dismissNotification} />
     </main>
+  );
+}
+
+type ConnectionProgressModel = {
+  label: string;
+  steps: Array<{ label: string; state: "done" | "active" | "pending" }>;
+};
+
+function SetupStep({
+  title,
+  status,
+  detail,
+  action,
+}: {
+  title: string;
+  status: "ready" | "pending" | "blocked";
+  detail: string;
+  action?: ReactNode;
+}) {
+  const icon =
+    status === "ready" ? (
+      <CheckCircle2 size={18} aria-hidden="true" />
+    ) : status === "blocked" ? (
+      <AlertTriangle size={18} aria-hidden="true" />
+    ) : (
+      <RefreshCw size={18} aria-hidden="true" />
+    );
+
+  return (
+    <div className={`setupStep ${status}`}>
+      <span className="setupStepIcon">{icon}</span>
+      <div>
+        <strong>{title}</strong>
+        <span>{detail}</span>
+      </div>
+      {action ? <div className="setupStepAction">{action}</div> : null}
+    </div>
+  );
+}
+
+function ConnectionProgressView({ progress }: { progress: ConnectionProgressModel | null }) {
+  if (!progress) {
+    return null;
+  }
+
+  return (
+    <div className="connectionProgress" aria-live="polite">
+      <span>{progress.label}</span>
+      <div className="progressSteps">
+        {progress.steps.map((step) => (
+          <span key={step.label} className={`progressStep ${step.state}`}>
+            {step.state === "done" ? <CheckCircle2 size={12} aria-hidden="true" /> : null}
+            {step.state === "active" ? <RefreshCw size={12} aria-hidden="true" /> : null}
+            {step.label}
+          </span>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -1581,6 +1903,7 @@ function renderSettingsPage({
   appUpdate,
   componentUpdates,
   runtimeDiagnostics,
+  runtimeReadiness,
   subscriptionProfiles,
   profileUrl,
   agentService,
@@ -1610,6 +1933,7 @@ function renderSettingsPage({
   installAgentService,
   removeAgentService,
   refreshZapretService,
+  openServers,
 }: {
   state: AgentState;
   hasSubscription: boolean;
@@ -1618,6 +1942,7 @@ function renderSettingsPage({
   appUpdate: AppUpdateStatus;
   componentUpdates: ComponentUpdate[];
   runtimeDiagnostics: RuntimeDiagnosticsReport | null;
+  runtimeReadiness: RuntimeReadinessResponse | null;
   subscriptionProfiles: SubscriptionProfilesState;
   profileUrl: string;
   agentService: AgentServiceStatus | null;
@@ -1647,6 +1972,7 @@ function renderSettingsPage({
   installAgentService: () => void;
   removeAgentService: () => void;
   refreshZapretService: () => void;
+  openServers: () => void;
 }) {
   const updateCore = (patch: Partial<AppSettings["core"]>) =>
     updateSettings({ ...settings, core: { ...settings.core, ...patch } });
@@ -1671,9 +1997,8 @@ function renderSettingsPage({
     <div className="workspace pageWorkspace">
       <section className="settingsShell">
         <div className="settingsSide">
-          <SettingsTab active={settingsSection === "core"} icon={<SlidersHorizontal size={16} />} label="Core" onClick={() => setSettingsSection("core")} />
-          <SettingsTab active={settingsSection === "tun"} icon={<Router size={16} />} label="TUN & DNS" onClick={() => setSettingsSection("tun")} />
-          <SettingsTab active={settingsSection === "zapret"} icon={<Zap size={16} />} label="zapret" onClick={() => setSettingsSection("zapret")} />
+          <SettingsTab active={settingsSection === "basic"} icon={<SlidersHorizontal size={16} />} label="Basic" onClick={() => setSettingsSection("basic")} />
+          <SettingsTab active={settingsSection === "advanced"} icon={<Router size={16} />} label="Advanced" onClick={() => setSettingsSection("advanced")} />
           <SettingsTab active={settingsSection === "updates"} icon={<RefreshCw size={16} />} label="Updates" onClick={() => setSettingsSection("updates")} />
         </div>
 
@@ -1688,7 +2013,61 @@ function renderSettingsPage({
             </div>
           ) : null}
 
-          {settingsSection === "core" ? (
+          {settingsSection === "basic" ? (
+            <section className="settingsPanels">
+              <Panel title="Connection">
+                <SegmentedControl
+                  label="Mode"
+                  value={settings.core.route_mode}
+                  options={[
+                    ["smart", "Smart"],
+                    ["vpn_only", "VPN Only"],
+                  ]}
+                  onChange={(value) =>
+                    updateSettings({
+                      ...settings,
+                      core: { ...settings.core, route_mode: value as AppSettings["core"]["route_mode"] },
+                      zapret: { ...settings.zapret, enabled: value === "smart" },
+                    })
+                  }
+                  disabled={settingsBusy}
+                />
+                <p className="diagnosticText">
+                  {settings.core.route_mode === "smart"
+                    ? "Smart is the default: video, Discord, and games use DIRECT + zapret while protected provider routes stay on VPN."
+                    : "VPN Only skips zapret and keeps external traffic on VPN paths."}
+                </p>
+                <StatusRow label="Selected" value={state.connection.selected_proxy ?? "Provider default"} good={hasSubscription} />
+                <button className="subtleButton" type="button" onClick={openServers} disabled={!hasSubscription}>
+                  <Server size={15} aria-hidden="true" />
+                  Servers
+                </button>
+              </Panel>
+              <Panel title="Smart presets">
+                <ToggleRow label="YouTube + Discord via zapret" checked={settings.routing_policy.smart_presets.youtube_discord_zapret} disabled={settingsBusy || settings.core.route_mode !== "smart"} onChange={(checked) => updateSmartPresets({ youtube_discord_zapret: checked })} />
+                <ToggleRow label="Games via zapret" checked={settings.routing_policy.smart_presets.games_zapret} disabled={settingsBusy || settings.core.route_mode !== "smart"} onChange={(checked) => updateSmartPresets({ games_zapret: checked })} />
+                <ToggleRow label="AI via VPN" checked={settings.routing_policy.smart_presets.ai_vpn} disabled={settingsBusy || settings.core.route_mode !== "smart"} onChange={(checked) => updateSmartPresets({ ai_vpn: checked })} />
+                <ToggleRow label="Social via VPN" checked={settings.routing_policy.smart_presets.social_vpn} disabled={settingsBusy || settings.core.route_mode !== "smart"} onChange={(checked) => updateSmartPresets({ social_vpn: checked })} />
+                <ToggleRow label="Telegram from provider" checked={settings.routing_policy.smart_presets.telegram_vpn_from_provider} disabled={settingsBusy || settings.core.route_mode !== "smart"} onChange={(checked) => updateSmartPresets({ telegram_vpn_from_provider: checked })} />
+              </Panel>
+              <Panel title="Quick actions">
+                <StatusRow label="Agent" value={agentService?.ipc_ready ? "Ready" : "Needs setup"} good={agentService?.ipc_ready ?? false} />
+                <StatusRow label="Runtime" value={formatRuntimeComponentStatus(componentUpdates, runtimeReadiness)} good={runtimeReadiness?.components_ready} />
+                <div className="buttonRow">
+                  <button className="subtleButton" type="button" onClick={refreshSubscription} disabled={busy || !hasSubscription}>
+                    <RefreshCw size={15} aria-hidden="true" />
+                    Refresh profile
+                  </button>
+                  <button className="subtleButton" type="button" onClick={runDiagnostics} disabled={diagnosticBusy}>
+                    <Activity size={15} aria-hidden="true" />
+                    Diagnostics
+                  </button>
+                </div>
+              </Panel>
+            </section>
+          ) : null}
+
+          {settingsSection === "advanced" ? (
             <section className="settingsPanels">
               <Panel title="Core">
                 <SegmentedControl
@@ -1709,7 +2088,7 @@ function renderSettingsPage({
                 />
                 <p className="diagnosticText">
                   {settings.core.route_mode === "smart"
-                    ? "Умный режим для РФ: YouTube, Discord и игры идут напрямую через zapret, AI, соцсети и VPN-правила идут через выбранные VPN-группы, остальное напрямую."
+                    ? "Умный режим для РФ: YouTube, Discord и игры идут напрямую через zapret, AI, соцсети, VPN-правила и остальной внешний трафик идут через выбранные VPN-группы."
                     : "Весь внешний трафик идёт через VPN. zapret выключен. Подходит для простого режима или временного обхода проблем Smart."}
                 </p>
                 <label className="selectField">
@@ -1736,7 +2115,7 @@ function renderSettingsPage({
             </section>
           ) : null}
 
-          {settingsSection === "tun" ? (
+          {settingsSection === "advanced" ? (
             <section className="settingsPanels">
               <Panel title="TUN">
                 <ToggleRow label="Enabled" checked={settings.tun.enabled} disabled={settingsBusy} onChange={(checked) => updateTun({ enabled: checked })} />
@@ -1776,7 +2155,7 @@ function renderSettingsPage({
             </section>
           ) : null}
 
-          {settingsSection === "zapret" ? (
+          {settingsSection === "advanced" ? (
             <section className="settingsPanels">
               <Panel title="zapret">
                 <ToggleRow label="Smart bypass" checked={settings.zapret.enabled} disabled={settingsBusy || settings.core.route_mode === "smart"} onChange={(checked) => updateZapret({ enabled: checked })} />
@@ -2372,6 +2751,172 @@ function formatComponentUpdate(component: ComponentUpdate) {
   return component.current_version;
 }
 
+function getConnectionProgress({
+  attempt,
+  now,
+  routeMode,
+  status,
+  connected,
+  fallbackActive,
+  lastError,
+}: {
+  attempt: ConnectionAttempt | null;
+  now: number;
+  routeMode: AppSettings["core"]["route_mode"];
+  status: AgentState["connection"]["status"];
+  connected: boolean;
+  fallbackActive: boolean;
+  lastError: string | null;
+}): ConnectionProgressModel | null {
+  if (lastError || status === "error") {
+    return null;
+  }
+
+  if (attempt?.action === "disconnect" || status === "stopping") {
+    return progressFromSteps(
+      ["Stopping runtime", "Cleaning route state", "Disconnected"],
+      connected ? timedProgressIndex(attempt, now, 3) : 2,
+    );
+  }
+
+  if (attempt?.action !== "connect" && status !== "starting") {
+    return null;
+  }
+
+  const steps =
+    routeMode === "smart"
+      ? ["Preparing policy", "Starting zapret", "Starting Mihomo", "Verifying connection", fallbackActive ? "VPN Only fallback" : "Connected"]
+      : ["Preparing policy", "Starting Mihomo", "Verifying connection", "Connected"];
+  const activeIndex = connected ? steps.length - 1 : timedProgressIndex(attempt, now, steps.length);
+  return progressFromSteps(steps, activeIndex);
+}
+
+function timedProgressIndex(attempt: ConnectionAttempt | null, now: number, stepCount: number) {
+  const elapsed = attempt ? Math.max(now - attempt.startedAt, 0) : 0;
+  return Math.min(Math.floor(elapsed / 1200), Math.max(stepCount - 2, 0));
+}
+
+function progressFromSteps(steps: string[], activeIndex: number): ConnectionProgressModel {
+  const normalizedIndex = Math.min(Math.max(activeIndex, 0), steps.length - 1);
+  return {
+    label: steps[normalizedIndex],
+    steps: steps.map((label, index) => ({
+      label,
+      state: index < normalizedIndex ? "done" : index === normalizedIndex ? "active" : "pending",
+    })),
+  };
+}
+
+function getHomeRouteSummary(routeMode: AppSettings["core"]["route_mode"], fallbackActive: boolean) {
+  if (routeMode === "vpn_only" || fallbackActive) {
+    return [
+      { label: "Video", value: fallbackActive ? "VPN fallback" : "VPN", good: true },
+      { label: "AI/social", value: "VPN", good: true },
+      { label: "RU", value: "VPN", good: true },
+    ];
+  }
+
+  return [
+    { label: "Video", value: "DIRECT + zapret", good: true },
+    { label: "AI/social", value: "VPN", good: true },
+    { label: "RU", value: "DIRECT", good: true },
+  ];
+}
+
+function getRuntimeComponentStatus(components: ComponentUpdate[], readiness: RuntimeReadinessResponse | null): {
+  status: "ready" | "pending" | "blocked";
+  detail: string;
+} {
+  if (readiness) {
+    if (readiness.components_ready) {
+      return {
+        status: "ready",
+        detail: readiness.needs_zapret
+          ? "Mihomo and zapret assets are present for Smart mode."
+          : "Mihomo is present. zapret is not required for VPN Only.",
+      };
+    }
+    return {
+      status: "blocked",
+      detail: readiness.message,
+    };
+  }
+
+  if (components.length === 0) {
+    return {
+      status: "pending",
+      detail: "Runtime assets are not checked yet. Prepare will download or repair Mihomo and zapret assets.",
+    };
+  }
+
+  const missing = components.filter((component) => component.current_version.toLowerCase().startsWith("missing"));
+  if (missing.length > 0) {
+    return {
+      status: "blocked",
+      detail: `Missing ${missing.map((component) => component.name).join(", ")}. Prepare runtime before connecting.`,
+    };
+  }
+
+  const failed = components.filter((component) => component.error);
+  if (failed.length > 0) {
+    return {
+      status: "pending",
+      detail: `${failed.length} component check warning. Prepare can repair local runtime assets.`,
+    };
+  }
+
+  const updates = components.filter((component) => component.update_available);
+  if (updates.length > 0) {
+    return {
+      status: "pending",
+      detail: `${updates.length} runtime update available. Current assets can run, Prepare updates them.`,
+    };
+  }
+
+  return {
+    status: "ready",
+    detail: "Mihomo, zapret, and route lists are present.",
+  };
+}
+
+function formatRuntimeComponentStatus(components: ComponentUpdate[], readiness: RuntimeReadinessResponse | null) {
+  const status = getRuntimeComponentStatus(components, readiness);
+  if (status.status === "ready") {
+    return "Ready";
+  }
+  if (status.status === "blocked") {
+    return "Needs prepare";
+  }
+  return components.length ? "Update available" : "Not checked";
+}
+
+function parseStartupTimeline(message: string | null): Array<{ name: string; value: number }> {
+  if (!message?.includes("Startup timeline:")) {
+    return [];
+  }
+
+  return [...message.matchAll(/([a-z_]+_ms)=(\d+)/g)].map((match) => ({
+    name: match[1],
+    value: Number(match[2]),
+  }));
+}
+
+function formatTimelineKey(name: string) {
+  return name
+    .replace(/_ms$/, "")
+    .split("_")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function conciseError(message: string) {
+  const firstSentence = message.split(/[.!?]\s/)[0]?.trim();
+  if (!firstSentence) {
+    return "Connection failed.";
+  }
+  return firstSentence.length > 96 ? `${firstSentence.slice(0, 93)}...` : firstSentence;
+}
 
 function getQuota(state: AgentState) {
   const { upload_bytes, download_bytes, total_bytes, expire_at } = state.subscription.user_info;
