@@ -6,6 +6,7 @@ import {
   Check,
   CheckCircle2,
   CirclePause,
+  Copy,
   Download,
   ExternalLink,
   Gauge,
@@ -14,6 +15,7 @@ import {
   ListTree,
   PanelLeftClose,
   PanelLeftOpen,
+  Plus,
   Power,
   RefreshCw,
   Router,
@@ -28,6 +30,24 @@ import {
 } from "lucide-react";
 import { CSSProperties, FormEvent, useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
+import {
+  buildLocalOverridePatch,
+  formatLocalOverrideKind,
+  localOverrideExists,
+  localOverridePlaceholder,
+  localOverrideTargetKindsForRoute,
+  previewLocalOverride,
+} from "./localOverrides";
+import type { LocalOverrideRoute, LocalOverrideTargetKind } from "./localOverrides";
+import {
+  countPolicySources,
+  formatPolicyRuleForCopy,
+  policyPathOptions,
+  policyPathTone,
+  policyRuleSearchText,
+  suppressedRuleSearchText,
+} from "./policyView";
+import type { PolicyPathFilter } from "./policyView";
 import { AppNotification, NotificationCenter, NotificationTone } from "./ui/NotificationCenter";
 import {
   AgentState,
@@ -36,6 +56,11 @@ import {
   ComponentUpdate,
   ConnectionPath,
   ConnectionsSnapshot,
+  BackupHistory,
+  GameProfilesCatalog,
+  OperatorSnapshot,
+  ResourceCatalog,
+  PolicyRuleView,
   PolicySummaryResponse,
   ProxyCatalog,
   ProxyGroupView,
@@ -45,12 +70,14 @@ import {
   SubscriptionProfilesState,
   TrackedConnection,
   ZapretServiceStatus,
+  ZapretHealthReport,
   addSubscriptionProfile,
   checkComponentUpdates,
   clearClosedConnections,
   closeAllConnections,
   closeConnection,
   getConnectionsSnapshot,
+  getOperatorSnapshot,
   getPolicySummary,
   getProxyCatalog,
   getRuntimeReadiness,
@@ -60,18 +87,31 @@ import {
   getAgentServiceStatus,
   getZapretServiceStatus,
   installAgentService,
+  exportBackupBundle,
+  exportSupportBundle,
+  importLocalProfileFromText,
+  importLocalProfileFromPath,
+  importProfileDeepLink,
+  openOperatorDirectory,
+  pickExecutablePath,
+  refreshAllSubscriptionProfiles,
   removeAgentService,
   removeSubscriptionProfile,
   refreshSubscription,
   restartConnection,
   runDiagnostics,
   resetSettings,
+  restoreBackupBundleFromPath,
+  rollbackOperatorResource,
+  runZapretHealthChecks,
   saveSettings,
   selectProxy,
   selectSubscriptionProfile,
   setSubscription,
   startConnection,
   stopConnection,
+  updateAllOperatorResources,
+  updateOperatorResource,
   updateRuntimeComponents,
 } from "./services/agentClient";
 import { AppUpdateStatus, checkAppUpdate, installAppUpdate } from "./services/updateClient";
@@ -79,8 +119,17 @@ import { AppUpdateStatus, checkAppUpdate, installAppUpdate } from "./services/up
 type AppView = "overview" | "connections" | "servers" | "policy" | "settings";
 type ConnectionTab = "active" | "closed";
 type ConnectionPathFilter = "all" | ConnectionPath;
-type SettingsSection = "basic" | "advanced" | "updates";
+type ConnectionGroupMode = "flows" | "processes";
+type SettingsSection = "basic" | "advanced" | "operator" | "updates";
 type ConnectionAttempt = { action: "connect" | "disconnect"; startedAt: number };
+type ServerNodeSort = "profile" | "name" | "latency" | "alive" | "selected";
+type LocalOverrideSummaryItem = {
+  id?: string;
+  enabled?: boolean;
+  route: string;
+  kind: string;
+  value: string;
+};
 
 const emptyState: AgentState = {
   installed: false,
@@ -140,10 +189,26 @@ const defaultSettings: AppSettings = {
     strict_route: true,
     auto_route: true,
     auto_detect_interface: true,
+    mtu: 1500,
+    dns_hijack: ["any:53", "tcp://any:53"],
+    excluded_routes: [],
   },
   dns: {
     mode: "fake-ip",
     preset: "cloudflare_google",
+    fake_ip_range: "198.18.0.1/16",
+    fake_ip_filter: ["+.lan", "+.local", "localhost.ptlogin2.qq.com"],
+    nameserver_policy: [],
+  },
+  sniffer: {
+    enabled: true,
+    http: true,
+    tls: true,
+    quic: true,
+    force_domains: [],
+    skip_domains: [],
+    skip_src_cidrs: [],
+    skip_dst_cidrs: [],
   },
   zapret: {
     enabled: true,
@@ -158,6 +223,11 @@ const defaultSettings: AppSettings = {
     fallback_to_vpn_on_failed_probe: true,
   },
   routing_policy: {
+    local_overrides_enabled: true,
+    local_overrides: {
+      version: 1,
+      rules: [],
+    },
     force_vpn_domains: [],
     force_vpn_cidrs: [],
     force_zapret_domains: [],
@@ -218,6 +288,14 @@ const connectionPathOptions: Array<[ConnectionPathFilter, string]> = [
   ["unknown", "Unknown"],
 ];
 
+const serverNodeSortOptions: Array<[ServerNodeSort, string]> = [
+  ["profile", "Profile order"],
+  ["selected", "Selected first"],
+  ["latency", "Lowest latency"],
+  ["alive", "Alive first"],
+  ["name", "Name"],
+];
+
 export function App() {
   const [state, setState] = useState<AgentState>(emptyState);
   const [view, setView] = useState<AppView>("overview");
@@ -237,22 +315,54 @@ export function App() {
   const [connections, setConnections] = useState<ConnectionsSnapshot | null>(null);
   const [connectionTab, setConnectionTab] = useState<ConnectionTab>("active");
   const [connectionPathFilter, setConnectionPathFilter] = useState<ConnectionPathFilter>("all");
+  const [connectionGroupMode, setConnectionGroupMode] = useState<ConnectionGroupMode>("flows");
+  const [connectionSearch, setConnectionSearch] = useState("");
   const [connectionsBusy, setConnectionsBusy] = useState(false);
   const [catalog, setCatalog] = useState<ProxyCatalog | null>(null);
   const [lastCatalogError, setLastCatalogError] = useState<string | null>(null);
   const [selectedGroup, setSelectedGroup] = useState<string | null>(null);
+  const [serverSearch, setServerSearch] = useState("");
+  const [serverNodeSort, setServerNodeSort] = useState<ServerNodeSort>("profile");
   const [catalogBusy, setCatalogBusy] = useState(false);
   const [runtimeDiagnostics, setRuntimeDiagnostics] = useState<RuntimeDiagnosticsReport | null>(null);
   const [runtimeReadiness, setRuntimeReadiness] = useState<RuntimeReadinessResponse | null>(null);
   const [diagnosticBusy, setDiagnosticBusy] = useState(false);
   const [policySummary, setPolicySummary] = useState<PolicySummaryResponse | null>(null);
+  const [policySearch, setPolicySearch] = useState("");
+  const [policyPathFilter, setPolicyPathFilter] = useState<PolicyPathFilter>("all");
+  const [policySourceFilter, setPolicySourceFilter] = useState("all");
   const [policyBusy, setPolicyBusy] = useState(false);
+  const [operatorSnapshot, setOperatorSnapshot] = useState<OperatorSnapshot | null>(null);
+  const [operatorBusy, setOperatorBusy] = useState(false);
+  const [operatorLogPaused, setOperatorLogPaused] = useState(false);
+  const [operatorLogAutoScroll, setOperatorLogAutoScroll] = useState(true);
+  const [operatorLogViewCleared, setOperatorLogViewCleared] = useState(false);
+  const [operatorLogSourceFilter, setOperatorLogSourceFilter] = useState("all");
+  const [operatorLogLevelFilter, setOperatorLogLevelFilter] = useState("all");
+  const [operatorCustomDomain, setOperatorCustomDomain] = useState("");
+  const [operatorHealthHistory, setOperatorHealthHistory] = useState<ZapretHealthReport[]>([]);
+  const [operatorProfileName, setOperatorProfileName] = useState("");
+  const [operatorProfilePath, setOperatorProfilePath] = useState("");
+  const [operatorProfileText, setOperatorProfileText] = useState("");
+  const [operatorDeepLink, setOperatorDeepLink] = useState("");
+  const [operatorBackupPath, setOperatorBackupPath] = useState("");
+  const [manualGameProfile, setManualGameProfile] = useState({
+    title: "",
+    executable: "",
+    domains: "",
+    cidrs: "",
+    tcpPorts: "",
+    udpPorts: "",
+  });
   const [agentService, setAgentService] = useState<AgentServiceStatus | null>(null);
   const [agentServiceBusy, setAgentServiceBusy] = useState(false);
   const [zapretService, setZapretService] = useState<ZapretServiceStatus | null>(null);
   const [zapretServiceBusy, setZapretServiceBusy] = useState(false);
   const [settings, setSettings] = useState<AppSettings>(defaultSettings);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("basic");
+  const [localOverrideRoute, setLocalOverrideRoute] = useState<LocalOverrideRoute>("direct");
+  const [localOverrideKind, setLocalOverrideKind] = useState<LocalOverrideTargetKind>("process");
+  const [localOverrideValue, setLocalOverrideValue] = useState("");
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [settingsRestartRequired, setSettingsRestartRequired] = useState(false);
   const [lastConnectionsError, setLastConnectionsError] = useState<string | null>(null);
@@ -358,6 +468,14 @@ export function App() {
   }, [connectionAttempt]);
 
   useEffect(() => {
+    if (!connectionAttempt || state.connection.status === "starting" || state.connection.status === "stopping") {
+      return;
+    }
+    const timer = window.setTimeout(() => setConnectionAttempt(null), 700);
+    return () => window.clearTimeout(timer);
+  }, [connectionAttempt, state.connection.status]);
+
+  useEffect(() => {
     if (!state.connection.connected || !settings.diagnostics.runtime_checks_after_connect) {
       return;
     }
@@ -370,13 +488,14 @@ export function App() {
   }, [state.subscription.url]);
 
   useEffect(() => {
-    if (view !== "connections") {
+    const shouldPollConnections = view === "connections" || (view === "overview" && state.connection.connected);
+    if (!shouldPollConnections) {
       return;
     }
     void refreshConnections(false);
     const timer = window.setInterval(() => void refreshConnections(false), 2500);
     return () => window.clearInterval(timer);
-  }, [view]);
+  }, [state.connection.connected, view]);
 
   useEffect(() => {
     if (view === "servers") {
@@ -385,7 +504,35 @@ export function App() {
     if (view === "policy") {
       void refreshPolicySummary(false);
     }
-  }, [view]);
+    if (view === "settings" && settingsSection === "operator") {
+      void refreshOperatorSnapshot(false);
+    }
+  }, [view, settingsSection]);
+
+  useEffect(() => {
+    if (
+      view !== "settings" ||
+      settingsSection !== "operator" ||
+      !operatorLogAutoScroll ||
+      operatorLogPaused ||
+      operatorLogViewCleared
+    ) {
+      return;
+    }
+    const viewer = document.getElementById("operator-log-viewer");
+    if (viewer) {
+      viewer.scrollTop = viewer.scrollHeight;
+    }
+  }, [
+    operatorLogAutoScroll,
+    operatorLogLevelFilter,
+    operatorLogPaused,
+    operatorLogSourceFilter,
+    operatorLogViewCleared,
+    operatorSnapshot,
+    settingsSection,
+    view,
+  ]);
 
   useEffect(() => {
     if (!catalog?.groups.length) {
@@ -440,6 +587,28 @@ export function App() {
 
   const routeSummary = getHomeRouteSummary(settings.core.route_mode, smartFallbackActive);
   const startupTimeline = parseStartupTimeline(state.diagnostics.message);
+  const currentNode = state.connection.selected_proxy ?? "Автовыбор провайдера";
+  const heroTitle = isConnected
+    ? "Вы защищены"
+    : state.connection.status === "starting"
+      ? "Подключаем защиту"
+      : state.connection.status === "stopping"
+        ? "Отключаем защиту"
+        : "Готово к подключению";
+  const heroSubtitle = isConnected
+    ? `${currentNode} активен. Маршруты применены через ${formatRouteMode(state.connection.route_mode)}.`
+    : hasSubscription
+      ? "Профиль готов. Подключите VPN, чтобы применить Smart-маршрутизацию и локальные правила."
+      : "Добавьте подписку, чтобы BadVpn подготовил профиль Mihomo.";
+  const heroModeLabel = smartFallbackActive ? "VPN Only fallback" : formatRouteMode(state.connection.route_mode || settings.core.route_mode);
+  const overrideCount = countLocalRoutingOverrides(settings.routing_policy);
+  const activeSmartPresets = [
+    { label: "YouTube / Discord", enabled: settings.routing_policy.smart_presets.youtube_discord_zapret },
+    { label: "Игры", enabled: settings.routing_policy.smart_presets.games_zapret },
+    { label: "AI через VPN", enabled: settings.routing_policy.smart_presets.ai_vpn },
+    { label: "Соцсети через VPN", enabled: settings.routing_policy.smart_presets.social_vpn },
+  ].filter((preset) => preset.enabled);
+  const activeConnectionCount = connections?.active.length ?? 0;
 
   async function runAction(action: () => Promise<AgentState>, showBusy = true) {
     if (showBusy) {
@@ -564,7 +733,6 @@ export function App() {
       setShowConnectionDetails(true);
     } finally {
       setBusy(false);
-      window.setTimeout(() => setConnectionAttempt(null), 700);
     }
   }
 
@@ -885,6 +1053,15 @@ export function App() {
     }
   }
 
+  async function handleCopyText(label: string, text: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      pushNotification({ tone: "success", title: "Copied", message: `${label} copied to clipboard.` });
+    } catch (error) {
+      notifyFromError(`Copy ${label} failed`, error);
+    }
+  }
+
   async function refreshConnections(showBusy = true) {
     if (showBusy) {
       setConnectionsBusy(true);
@@ -920,6 +1097,27 @@ export function App() {
     }
   }
 
+  async function handleCloseConnections(ids: string[]) {
+    if (ids.length === 0) {
+      return;
+    }
+    setConnectionsBusy(true);
+    try {
+      let snapshot: ConnectionsSnapshot | null = null;
+      for (const id of ids) {
+        snapshot = await closeConnection(id);
+      }
+      if (snapshot) {
+        setConnections(snapshot);
+      }
+      pushNotification({ tone: "success", title: "Connections closed", message: `${ids.length} Mihomo flows were closed.` });
+    } catch (error) {
+      notifyFromError("Close process flows failed", error);
+    } finally {
+      setConnectionsBusy(false);
+    }
+  }
+
   async function handleCloseAllConnections() {
     setConnectionsBusy(true);
     try {
@@ -939,6 +1137,44 @@ export function App() {
     } catch (error) {
       notifyFromError("Clear history failed", error);
     }
+  }
+
+  function handleCreateOverrideFromConnection(connection: TrackedConnection) {
+    const route = connection.path === "vpn" ? "vpn" : connection.path === "zapret" ? "zapret" : "direct";
+    const process = connection.process?.trim();
+    const target = process || connection.host || connection.destination;
+    setLocalOverrideRoute(route);
+    setLocalOverrideKind(process ? "process" : "domain");
+    setLocalOverrideValue(target);
+    setSettingsSection("advanced");
+    setView("settings");
+    pushNotification({
+      tone: "info",
+      title: "Override draft ready",
+      message: process ? `${process} is prefilled as a process override.` : `${target} is prefilled as a domain override.`,
+    });
+  }
+
+  function handleCreateOverrideFromPolicyRule(rule: PolicyRuleView) {
+    const draft = localOverrideDraftFromPolicyRule(rule);
+    if (!draft) {
+      pushNotification({
+        tone: "warning",
+        title: "Override not supported",
+        message: `${rule.target_kind} cannot be converted to a local override yet.`,
+      });
+      return;
+    }
+    setLocalOverrideRoute(draft.route);
+    setLocalOverrideKind(draft.kind);
+    setLocalOverrideValue(draft.value);
+    setSettingsSection("advanced");
+    setView("settings");
+    pushNotification({
+      tone: "info",
+      title: "Override draft ready",
+      message: `${draft.value} is prefilled from the policy rule.`,
+    });
   }
 
   async function refreshCatalog(showBusy = true) {
@@ -979,6 +1215,196 @@ export function App() {
     }
   }
 
+  async function refreshOperatorSnapshot(showBusy = true) {
+    if (operatorLogPaused && operatorSnapshot) {
+      return;
+    }
+    if (showBusy) {
+      setOperatorBusy(true);
+    }
+    try {
+      setOperatorSnapshot(await getOperatorSnapshot());
+      setOperatorLogViewCleared(false);
+    } catch (error) {
+      notifyFromError("Operator snapshot failed", error);
+    } finally {
+      if (showBusy) {
+        setOperatorBusy(false);
+      }
+    }
+  }
+
+  async function handlePickExecutable() {
+    try {
+      const path = await pickExecutablePath();
+      if (!path) {
+        return;
+      }
+      if (settingsSection === "operator") {
+        setManualGameProfile((current) => ({ ...current, executable: path }));
+      } else {
+        setLocalOverrideKind("process");
+        setLocalOverrideValue(path);
+      }
+    } catch (error) {
+      notifyFromError("Executable picker failed", error);
+    }
+  }
+
+  async function handleRunZapretChecks() {
+    setOperatorBusy(true);
+    try {
+      const report = await runZapretHealthChecks(operatorCustomDomain.trim() || undefined);
+      setOperatorSnapshot((current) => current ? { ...current, health: report } : current);
+      setOperatorHealthHistory((current) => [report, ...current].slice(0, 5));
+      pushNotification({ tone: "success", title: "Checks finished", message: `${report.checks.length} route checks updated.` });
+    } catch (error) {
+      notifyFromError("Zapret checks failed", error);
+    } finally {
+      setOperatorBusy(false);
+    }
+  }
+
+  async function handleResourceUpdate(id: string) {
+    setOperatorBusy(true);
+    try {
+      const result = await updateOperatorResource(id);
+      setOperatorSnapshot((current) => current ? { ...current, resources: result.resources } : current);
+      pushNotification({ tone: "success", title: "Resource updated", message: result.message });
+    } catch (error) {
+      notifyFromError("Resource update failed", error);
+    } finally {
+      setOperatorBusy(false);
+    }
+  }
+
+  async function handleResourceUpdateAll() {
+    setOperatorBusy(true);
+    try {
+      const result = await updateAllOperatorResources();
+      setOperatorSnapshot((current) => current ? { ...current, resources: result.resources } : current);
+      pushNotification({ tone: "success", title: "Resources updated", message: result.message || "Safe resources updated." });
+    } catch (error) {
+      notifyFromError("Resource update failed", error);
+    } finally {
+      setOperatorBusy(false);
+    }
+  }
+
+  async function handleResourceRollback(id: string) {
+    setOperatorBusy(true);
+    try {
+      const result = await rollbackOperatorResource(id);
+      setOperatorSnapshot((current) => current ? { ...current, resources: result.resources } : current);
+      pushNotification({ tone: "success", title: "Resource restored", message: result.message });
+    } catch (error) {
+      notifyFromError("Resource rollback failed", error);
+    } finally {
+      setOperatorBusy(false);
+    }
+  }
+
+  async function handleImportLocalProfile(mode: "path" | "text" | "link") {
+    setOperatorBusy(true);
+    try {
+      const result =
+        mode === "path"
+          ? await importLocalProfileFromPath(operatorProfilePath, operatorProfileName || undefined)
+          : mode === "text"
+            ? await importLocalProfileFromText(operatorProfileName || "Local profile", operatorProfileText)
+            : await importProfileDeepLink(operatorDeepLink);
+      setSubscriptionProfiles(result.profiles);
+      setState(result.state);
+      pushNotification({ tone: "success", title: "Profile imported", message: result.message });
+      await refreshOperatorSnapshot(false);
+    } catch (error) {
+      notifyFromError("Profile import failed", error);
+    } finally {
+      setOperatorBusy(false);
+    }
+  }
+
+  async function handleRefreshAllProfiles() {
+    setProfilesBusy(true);
+    try {
+      const result = await refreshAllSubscriptionProfiles();
+      setSubscriptionProfiles(result.profiles);
+      setState(result.state);
+      pushNotification({ tone: "success", title: "Profiles refreshed", message: result.message });
+    } catch (error) {
+      notifyFromError("Refresh all failed", error);
+    } finally {
+      setProfilesBusy(false);
+    }
+  }
+
+  function handleDroppedProfile(file: File) {
+    setOperatorProfileName((current) => current || file.name.replace(/\.(ya?ml|json|txt)$/i, ""));
+    file.text()
+      .then(setOperatorProfileText)
+      .catch((error) => notifyFromError("Dropped file read failed", error));
+  }
+
+  function handleAddManualGameProfile() {
+    const processName = normalizeProcessName(manualGameProfile.executable);
+    if (!processName) {
+      pushNotification({ tone: "warning", title: "Executable required", message: "Pick or enter a .exe before saving the game profile." });
+      return;
+    }
+    const now = Date.now().toString(36);
+    const nextProfile = {
+      id: `manual-${processName.toLocaleLowerCase().replace(/[^a-z0-9]+/g, "-")}-${now}`,
+      title: manualGameProfile.title.trim() || processName,
+      process_names: [processName],
+      domains: textToList(manualGameProfile.domains),
+      cidrs: textToList(manualGameProfile.cidrs),
+      tcp_ports: textToList(manualGameProfile.tcpPorts),
+      udp_ports: textToList(manualGameProfile.udpPorts),
+      filter_mode: settings.zapret.game_filter_mode,
+      risk_level: "manual",
+      detected: false,
+      enabled: true,
+    };
+    updateSettings({
+      ...settings,
+      zapret: {
+        ...settings.zapret,
+        game_bypass_mode: "manual",
+        learned_game_profiles: [...settings.zapret.learned_game_profiles, nextProfile],
+      },
+    });
+    setManualGameProfile({ title: "", executable: "", domains: "", cidrs: "", tcpPorts: "", udpPorts: "" });
+  }
+
+  async function handleBackupAction(action: "export" | "support" | "restore") {
+    setOperatorBusy(true);
+    try {
+      const result =
+        action === "export"
+          ? await exportBackupBundle()
+          : action === "support"
+            ? await exportSupportBundle()
+            : await restoreBackupBundleFromPath(operatorBackupPath);
+      setOperatorSnapshot((current) => current ? { ...current, backups: result.history } : current);
+      pushNotification({ tone: "success", title: "Backup", message: result.message });
+      if (action === "restore") {
+        await loadSettings();
+      }
+    } catch (error) {
+      notifyFromError("Backup action failed", error);
+    } finally {
+      setOperatorBusy(false);
+    }
+  }
+
+  async function handleOpenDirectory(kind: "app_data" | "runtime" | "logs" | "backups") {
+    try {
+      await openOperatorDirectory(kind);
+    } catch (error) {
+      notifyFromError("Open directory failed", error);
+    }
+  }
+
   async function handleSelectProxy(group: string, proxy: string) {
     setCatalogBusy(true);
     try {
@@ -1002,8 +1428,14 @@ export function App() {
           setConnectionTab,
           connectionPathFilter,
           setConnectionPathFilter,
+          connectionGroupMode,
+          setConnectionGroupMode,
+          connectionSearch,
+          setConnectionSearch,
           refresh: () => void refreshConnections(),
           closeOne: (id) => void handleCloseConnection(id),
+          closeMany: (ids) => void handleCloseConnections(ids),
+          createOverride: handleCreateOverrideFromConnection,
           closeAll: () => void handleCloseAllConnections(),
           clearClosed: () => void handleClearClosedConnections(),
           busy: connectionsBusy,
@@ -1013,6 +1445,10 @@ export function App() {
           catalog,
           selectedGroup,
           setSelectedGroup,
+          serverSearch,
+          setServerSearch,
+          serverNodeSort,
+          setServerNodeSort,
           refresh: () => void refreshCatalog(),
           select: (group, proxy) => void handleSelectProxy(group, proxy),
           busy: catalogBusy,
@@ -1020,6 +1456,14 @@ export function App() {
       case "policy":
         return renderPolicyPage({
           policySummary,
+          policySearch,
+          setPolicySearch,
+          policyPathFilter,
+          setPolicyPathFilter,
+          policySourceFilter,
+          setPolicySourceFilter,
+          copyText: (label, text) => void handleCopyText(label, text),
+          createOverride: handleCreateOverrideFromPolicyRule,
           refresh: () => void refreshPolicySummary(),
           busy: policyBusy,
         });
@@ -1033,11 +1477,32 @@ export function App() {
           componentUpdates,
           runtimeDiagnostics,
           runtimeReadiness,
+          operatorSnapshot,
+          operatorBusy,
+          operatorLogPaused,
+          operatorLogAutoScroll,
+          operatorLogViewCleared,
+          operatorLogSourceFilter,
+          operatorLogLevelFilter,
+          operatorCustomDomain,
+          operatorHealthHistory,
+          operatorProfileName,
+          operatorProfilePath,
+          operatorProfileText,
+          operatorDeepLink,
+          operatorBackupPath,
+          manualGameProfile,
           subscriptionProfiles,
           profileUrl,
           agentService,
           zapretService,
           settingsRestartRequired,
+          localOverrideRoute,
+          setLocalOverrideRoute,
+          localOverrideKind,
+          setLocalOverrideKind,
+          localOverrideValue,
+          setLocalOverrideValue,
           updateBusy,
           diagnosticBusy,
           profilesBusy,
@@ -1046,6 +1511,18 @@ export function App() {
           settingsBusy,
           busy,
           setSettingsSection,
+          setOperatorLogPaused,
+          setOperatorLogAutoScroll,
+          clearOperatorLogView: () => setOperatorLogViewCleared(true),
+          setOperatorLogSourceFilter,
+          setOperatorLogLevelFilter,
+          setOperatorCustomDomain,
+          setOperatorProfileName,
+          setOperatorProfilePath,
+          setOperatorProfileText,
+          setOperatorDeepLink,
+          setOperatorBackupPath,
+          setManualGameProfile,
           updateSettings,
           resetSettings: () => void handleResetSettings(),
           applySettingsRestart: () => void handleApplySettingsRestart(),
@@ -1053,16 +1530,30 @@ export function App() {
           checkUpdates: () => void handleCheckUpdates(),
           installUpdate: () => void handleInstallAppUpdate(),
           updateRuntime: () => void handleRuntimeUpdate(),
+          refreshOperatorSnapshot: () => void refreshOperatorSnapshot(),
+          pickExecutable: () => void handlePickExecutable(),
+          runZapretChecks: () => void handleRunZapretChecks(),
+          updateResource: (id) => void handleResourceUpdate(id),
+          updateAllResources: () => void handleResourceUpdateAll(),
+          rollbackResource: (id) => void handleResourceRollback(id),
+          importLocalProfile: (mode) => void handleImportLocalProfile(mode),
+          refreshAllProfiles: () => void handleRefreshAllProfiles(),
+          droppedProfile: handleDroppedProfile,
+          addManualGameProfile: handleAddManualGameProfile,
+          backupAction: (action) => void handleBackupAction(action),
+          openDirectory: (kind) => void handleOpenDirectory(kind),
           setProfileUrl,
           addSubscriptionProfile: () => void handleAddSubscriptionProfile(),
           selectSubscriptionProfile: (id) => void handleSelectSubscriptionProfile(id),
           removeSubscriptionProfile: (id) => void handleRemoveSubscriptionProfile(id),
           runDiagnostics: () => void handleRunDiagnostics(),
+          copyText: (label, text) => void handleCopyText(label, text),
           refreshAgentService: () => void refreshAgentService(),
           installAgentService: () => void handleInstallAgentService(),
           removeAgentService: () => void handleRemoveAgentService(),
           refreshZapretService: () => void refreshZapretService(),
           openServers: () => setView("servers"),
+          policySummary,
         });
       default:
         return renderOverview();
@@ -1071,7 +1562,7 @@ export function App() {
 
   function renderOverview() {
     return (
-      <div className={isOnboarding ? "workspace setupMode" : "workspace"}>
+      <div className={isOnboarding ? "workspace setupMode" : "workspace dashboardWorkspace"}>
         {isOnboarding ? (
           <section className="setupPane">
             <div className="setupHeader">
@@ -1159,7 +1650,7 @@ export function App() {
             </div>
           </section>
         ) : (
-          <section className="connectionPane">
+          <section className="connectionPane dashboardPane">
             {state.subscription.announce ? (
               <div className="announceLine">
                 <Bell size={16} aria-hidden="true" />
@@ -1172,26 +1663,55 @@ export function App() {
               </div>
             ) : null}
 
-            <div className="connectCenter">
-              <div className="modeLine">
-                <span className="modeText">{formatRouteMode(state.connection.route_mode)}</span>
-                {smartFallbackActive ? <span className="fallbackBadge">Fallback</span> : null}
+            <div className="heroLayout">
+              <div className="heroMain">
+                <div className="heroStatusLine">
+                  <span className={isConnected ? "statusDot online" : isRuntimeTransitioning ? "statusDot pending" : "statusDot"} />
+                  <span>{heroModeLabel}</span>
+                  {smartFallbackActive ? <span className="fallbackBadge">Fallback</span> : null}
+                </div>
+                <div className="heroCopy">
+                  <h1>{heroTitle}</h1>
+                  <p>{heroSubtitle}</p>
+                </div>
+                <div className="heroStats">
+                  <div className="statPill">
+                    <span>Профиль</span>
+                    <strong>{state.subscription.profile_title ?? "Subscription"}</strong>
+                  </div>
+                  <div className="statPill">
+                    <span>Узел</span>
+                    <strong>{currentNode}</strong>
+                  </div>
+                  <div className="statPill">
+                    <span>Остаток</span>
+                    <strong>{quota.trafficLeft}</strong>
+                  </div>
+                </div>
               </div>
-              <button
-                className={isConnected ? "connectButton connected" : isRuntimeTransitioning ? "connectButton pending" : "connectButton"}
-                type="button"
-                onClick={() => void handlePrimaryConnectionAction()}
-                disabled={busy || isRuntimeTransitioning}
-                aria-label={isConnected ? "Disconnect" : "Connect"}
-              >
-                {isRuntimeTransitioning ? <RefreshCw size={46} /> : isConnected ? <CirclePause size={48} /> : <Power size={48} />}
-              </button>
-              <strong>{statusLabel}</strong>
+
+              <div className="powerPanel">
+                <span className="powerPanelLabel">VPN</span>
+                <button
+                  className={isConnected ? "connectButton connected" : isRuntimeTransitioning ? "connectButton pending" : "connectButton"}
+                  type="button"
+                  onClick={() => void handlePrimaryConnectionAction()}
+                  disabled={busy || isRuntimeTransitioning}
+                  aria-label={isConnected ? "Disconnect" : "Connect"}
+                >
+                  {isRuntimeTransitioning ? <RefreshCw size={46} /> : isConnected ? <CirclePause size={48} /> : <Power size={48} />}
+                </button>
+                <strong>{statusLabel}</strong>
+                <span>{isConnected ? "Сессия активна" : hasSubscription ? "Нажмите для старта" : "Нужна подписка"}</span>
+              </div>
+            </div>
+
+            <div className="homeAlertStack">
               <ConnectionProgressView progress={connectionProgress} />
               {smartFallbackActive ? (
                 <div className="connectionNotice warning">
                   <AlertTriangle size={16} aria-hidden="true" />
-                  <span>Smart fallback: VPN Only is active because zapret is not ready.</span>
+                  <span>Smart fallback: VPN Only активен, потому что zapret сейчас не готов.</span>
                   <button type="button" onClick={() => setView("policy")}>
                     Details
                   </button>
@@ -1209,26 +1729,90 @@ export function App() {
                   </button>
                 </div>
               ) : null}
-              <div className="homeRouteSummary">
-                {routeSummary.map((item) => (
-                  <div key={item.label} className="homeRouteItem">
-                    <span>{item.label}</span>
-                    <strong>{item.value}</strong>
-                  </div>
-                ))}
-              </div>
             </div>
 
-            <div className="meterGrid">
-              <Metric icon={<Upload size={15} />} label="Up" value={formatBytes(state.metrics.upload_bytes)} />
-              <Metric icon={<Download size={15} />} label="Down" value={formatBytes(state.metrics.download_bytes)} />
-              <Metric icon={<Wifi size={15} />} label="Traffic left" value={quota.trafficLeft} />
-              <Metric icon={<Shield size={15} />} label="Expires" value={quota.expires} />
+            <div className="dashboardGrid">
+              <section className="dashboardCard currentNodeCard">
+                <div className="cardTitleRow">
+                  <span>Текущий узел</span>
+                  <Server size={17} aria-hidden="true" />
+                </div>
+                <strong>{currentNode}</strong>
+                <p>{state.subscription.node_count ? `${state.subscription.node_count} узлов в подписке` : "Узлы появятся после импорта профиля."}</p>
+                <button className="subtleButton" type="button" onClick={() => setView("servers")} disabled={!hasSubscription}>
+                  <ListTree size={15} aria-hidden="true" />
+                  Выбрать узел
+                </button>
+              </section>
+
+              <section className="dashboardCard trafficCard">
+                <div className="cardTitleRow">
+                  <span>Трафик</span>
+                  <Wifi size={17} aria-hidden="true" />
+                </div>
+                <div className="trafficSplit">
+                  <Metric icon={<Upload size={15} />} label="Up" value={formatBytes(state.metrics.upload_bytes)} />
+                  <Metric icon={<Download size={15} />} label="Down" value={formatBytes(state.metrics.download_bytes)} />
+                </div>
+                <button className="statusActionRow" type="button" onClick={() => setView("connections")} disabled={!state.connection.connected}>
+                  <span>Active flows</span>
+                  <strong>{state.connection.connected ? String(activeConnectionCount) : "0"}</strong>
+                </button>
+                <StatusRow label="Expires" value={quota.expires} />
+              </section>
+
+              <section className="dashboardCard routeMatrixCard">
+                <div className="cardTitleRow">
+                  <span>Активные правила</span>
+                  <Router size={17} aria-hidden="true" />
+                </div>
+                <div className="homeRouteSummary">
+                  {routeSummary.map((item) => (
+                    <div key={item.label} className="homeRouteItem">
+                      <span>{item.label}</span>
+                      <strong>{item.value}</strong>
+                    </div>
+                  ))}
+                </div>
+                <div className="ruleChips">
+                  <span>{policySummary?.rule_count ?? "—"} rules</span>
+                  <span>{overrideCount} local overrides</span>
+                </div>
+                <div className="balanceStrip">
+                  <span className={state.diagnostics.mihomo_healthy || state.running ? "ok" : "idle"}>Mihomo</span>
+                  <span className={smartFallbackActive ? "warn" : state.diagnostics.zapret_healthy ? "ok" : "idle"}>zapret</span>
+                  <strong>{smartFallbackActive ? "VPN Only fallback" : heroModeLabel}</strong>
+                </div>
+              </section>
+
+              <section className="dashboardCard quickActionsCard">
+                <div className="cardTitleRow">
+                  <span>Быстрые действия</span>
+                  <Zap size={17} aria-hidden="true" />
+                </div>
+                <div className="quickActionGrid">
+                  <button className="subtleButton" type="button" onClick={() => void handleRefreshSubscription()} disabled={busy || !hasSubscription}>
+                    <RefreshCw size={15} aria-hidden="true" />
+                    Обновить
+                  </button>
+                  <button className="subtleButton" type="button" onClick={() => setView("policy")}>
+                    <BookOpen size={15} aria-hidden="true" />
+                    Policy
+                  </button>
+                  <button className="subtleButton" type="button" onClick={() => setView("settings")}>
+                    <Settings size={15} aria-hidden="true" />
+                    Settings
+                  </button>
+                </div>
+                <div className="presetList">
+                  {activeSmartPresets.length ? activeSmartPresets.map((preset) => <span key={preset.label}>{preset.label}</span>) : <span>Пресеты выключены</span>}
+                </div>
+              </section>
             </div>
           </section>
         )}
 
-        <aside className="inspector">
+        <aside className="inspector dashboardInspector">
           <Panel title="Runtime">
             <StatusRow label="Mihomo" value={state.running ? "Owned process" : "Stopped"} good={state.running} />
             <StatusRow
@@ -1311,7 +1895,13 @@ export function App() {
             <Settings size={19} aria-hidden="true" />
           </RailButton>
         </nav>
-        <span className={isConnected ? "railLed on" : "railLed"} />
+        <div className="railStatusCard" title={statusLabel}>
+          <span className={isConnected ? "railLed on" : "railLed"} />
+          <div>
+            <strong>{statusLabel}</strong>
+            <span>{heroModeLabel}</span>
+          </div>
+        </div>
       </aside>
 
       <section className="appPane">
@@ -1441,8 +2031,14 @@ function renderConnectionsPage({
   setConnectionTab,
   connectionPathFilter,
   setConnectionPathFilter,
+  connectionGroupMode,
+  setConnectionGroupMode,
+  connectionSearch,
+  setConnectionSearch,
   refresh,
   closeOne,
+  closeMany,
+  createOverride,
   closeAll,
   clearClosed,
   busy,
@@ -1452,8 +2048,14 @@ function renderConnectionsPage({
   setConnectionTab: (tab: ConnectionTab) => void;
   connectionPathFilter: ConnectionPathFilter;
   setConnectionPathFilter: (filter: ConnectionPathFilter) => void;
+  connectionGroupMode: ConnectionGroupMode;
+  setConnectionGroupMode: (mode: ConnectionGroupMode) => void;
+  connectionSearch: string;
+  setConnectionSearch: (value: string) => void;
   refresh: () => void;
   closeOne: (id: string) => void;
+  closeMany: (ids: string[]) => void;
+  createOverride: (connection: TrackedConnection) => void;
   closeAll: () => void;
   clearClosed: () => void;
   busy: boolean;
@@ -1465,7 +2067,15 @@ function renderConnectionsPage({
     path,
     path === "all" ? rows.length : rows.filter((connection) => connection.path === path).length,
   ] as const);
-  const visibleRows = connectionPathFilter === "all" ? rows : rows.filter((connection) => connection.path === connectionPathFilter);
+  const connectionQuery = connectionSearch.trim().toLocaleLowerCase();
+  const visibleRows = rows.filter((connection) => {
+    return (
+      (connectionPathFilter === "all" || connection.path === connectionPathFilter) &&
+      (!connectionQuery || connectionMatchesSearch(connection, connectionQuery))
+    );
+  });
+  const processGroups = groupConnectionsByProcess(visibleRows);
+  const visibleActiveIds = visibleRows.filter((connection) => connection.state === "active").map((connection) => connection.id);
 
   return (
     <div className="workspace pageWorkspace">
@@ -1501,6 +2111,16 @@ function renderConnectionsPage({
         </div>
 
         <div className="connectionToolbar">
+          <label className="searchField connectionSearchField">
+            <span>Search</span>
+            <input
+              type="search"
+              value={connectionSearch}
+              placeholder="Host, process, rule, chain"
+              spellCheck={false}
+              onChange={(event) => setConnectionSearch(event.currentTarget.value)}
+            />
+          </label>
           <div
             className="segmented fluidSegmented connectionTabs"
             style={{ "--segment-count": 2, "--segment-index": connectionTab === "active" ? 0 : 1 } as CSSProperties}
@@ -1529,16 +2149,46 @@ function renderConnectionsPage({
               );
             })}
           </div>
+          {connectionTab === "active" && connectionPathFilter !== "all" && visibleActiveIds.length > 0 ? (
+            <button className="subtleButton danger" type="button" onClick={() => closeMany(visibleActiveIds)} disabled={busy}>
+              <X size={15} aria-hidden="true" />
+              Close filtered
+            </button>
+          ) : null}
+          <div
+            className="segmented compactSegmented"
+            style={{ "--segment-count": 2, "--segment-index": connectionGroupMode === "flows" ? 0 : 1 } as CSSProperties}
+          >
+            <button className={connectionGroupMode === "flows" ? "active" : ""} type="button" onClick={() => setConnectionGroupMode("flows")}>
+              Flows
+            </button>
+            <button
+              className={connectionGroupMode === "processes" ? "active" : ""}
+              type="button"
+              onClick={() => setConnectionGroupMode("processes")}
+            >
+              Processes
+            </button>
+          </div>
         </div>
 
         <div className="connectionList">
           {rows.length === 0 ? (
             <EmptyList icon={<Activity size={24} />} title="No connections" text="Start the VPN and open an app to see live routes here." />
           ) : visibleRows.length === 0 ? (
-            <EmptyList icon={<SlidersHorizontal size={24} />} title="No matching connections" text="Change the route filter to show hidden flows." />
+            <EmptyList icon={<SlidersHorizontal size={24} />} title="No matching connections" text="Change search or route filter to show hidden flows." />
+          ) : connectionGroupMode === "processes" ? (
+            processGroups.map((group) => (
+              <ConnectionProcessGroup key={group.key} group={group} closeOne={closeOne} closeMany={closeMany} createOverride={createOverride} />
+            ))
           ) : (
             visibleRows.map((connection) => (
-              <ConnectionRow key={`${connection.state}-${connection.id}-${connection.closed_at ?? "open"}`} connection={connection} closeOne={closeOne} />
+              <ConnectionRow
+                key={`${connection.state}-${connection.id}-${connection.closed_at ?? "open"}`}
+                connection={connection}
+                closeOne={closeOne}
+                createOverride={createOverride}
+              />
             ))
           )}
         </div>
@@ -1551,6 +2201,10 @@ function renderServersPage({
   catalog,
   selectedGroup,
   setSelectedGroup,
+  serverSearch,
+  setServerSearch,
+  serverNodeSort,
+  setServerNodeSort,
   refresh,
   select,
   busy,
@@ -1558,12 +2212,26 @@ function renderServersPage({
   catalog: ProxyCatalog | null;
   selectedGroup: string | null;
   setSelectedGroup: (group: string) => void;
+  serverSearch: string;
+  setServerSearch: (value: string) => void;
+  serverNodeSort: ServerNodeSort;
+  setServerNodeSort: (value: ServerNodeSort) => void;
   refresh: () => void;
   select: (group: string, proxy: string) => void;
   busy: boolean;
 }) {
   const groups = catalog?.groups ?? [];
-  const activeGroup = groups.find((group) => group.name === selectedGroup) ?? groups[0] ?? null;
+  const query = serverSearch.trim().toLocaleLowerCase();
+  const filteredGroups = query ? groups.filter((group) => proxyGroupMatchesSearch(group, query)) : groups;
+  const activeGroup = filteredGroups.find((group) => group.name === selectedGroup) ?? filteredGroups[0] ?? null;
+  const activeGroupMatchesQuery = activeGroup ? proxyGroupText(activeGroup).includes(query) : false;
+  const visibleNodes = activeGroup
+    ? sortProxyNodes(
+        activeGroup.nodes.filter((node) => !query || activeGroupMatchesQuery || proxyNodeMatchesSearch(node, query)),
+        serverNodeSort,
+        activeGroup.selected,
+      )
+    : [];
 
   return (
     <div className="workspace pageWorkspace">
@@ -1579,12 +2247,36 @@ function renderServersPage({
           </button>
         </div>
 
+        <div className="serverToolbar">
+          <label className="searchField">
+            <span>Search</span>
+            <input
+              value={serverSearch}
+              onChange={(event) => setServerSearch(event.currentTarget.value)}
+              placeholder="Group, node, host..."
+              spellCheck={false}
+            />
+          </label>
+          <label className="selectField compactField">
+            <span>Sort nodes</span>
+            <select value={serverNodeSort} onChange={(event) => setServerNodeSort(event.currentTarget.value as ServerNodeSort)}>
+              {serverNodeSortOptions.map(([value, label]) => (
+                <option key={value} value={value}>
+                  {label}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+
         {groups.length === 0 ? (
           <EmptyList icon={<Server size={24} />} title="No server groups" text="Import a valid subscription to view Mihomo groups." />
+        ) : filteredGroups.length === 0 ? (
+          <EmptyList icon={<SlidersHorizontal size={24} />} title="No matching servers" text="Clear search to show all proxy groups and nodes." />
         ) : (
           <div className="serverGrid">
             <div className="groupList">
-              {groups.map((group) => (
+              {filteredGroups.map((group) => (
                 <GroupButton key={group.name} group={group} active={activeGroup?.name === group.name} onClick={() => setSelectedGroup(group.name)} />
               ))}
             </div>
@@ -1592,13 +2284,19 @@ function renderServersPage({
               <div className="nodeHeader">
                 <div>
                   <strong>{activeGroup?.name}</strong>
-                  <span>{activeGroup?.group_type} group</span>
+                  <span>
+                    {activeGroup?.group_type} group · {visibleNodes.length}/{activeGroup?.nodes.length ?? 0} nodes
+                  </span>
                 </div>
                 <span>{activeGroup?.selected ? `Selected: ${activeGroup.selected}` : "No runtime selection"}</span>
               </div>
-              {activeGroup?.nodes.map((node) => (
-                <NodeRow key={node.name} group={activeGroup.name} node={node} busy={busy} select={select} />
-              ))}
+              {activeGroup && visibleNodes.length > 0 ? (
+                visibleNodes.map((node) => (
+                  <NodeRow key={node.name} group={activeGroup.name} node={node} busy={busy} select={select} />
+                ))
+              ) : (
+                <EmptyList icon={<Server size={22} />} title="No matching nodes" text="Change search or sorting to inspect this group." />
+              )}
             </div>
           </div>
         )}
@@ -1609,15 +2307,61 @@ function renderServersPage({
 
 function renderPolicyPage({
   policySummary,
+  policySearch,
+  setPolicySearch,
+  policyPathFilter,
+  setPolicyPathFilter,
+  policySourceFilter,
+  setPolicySourceFilter,
+  copyText,
+  createOverride,
   refresh,
   busy,
 }: {
   policySummary: PolicySummaryResponse | null;
+  policySearch: string;
+  setPolicySearch: (value: string) => void;
+  policyPathFilter: PolicyPathFilter;
+  setPolicyPathFilter: (filter: PolicyPathFilter) => void;
+  policySourceFilter: string;
+  setPolicySourceFilter: (source: string) => void;
+  copyText: (label: string, text: string) => void;
+  createOverride: (rule: PolicyRuleView) => void;
   refresh: () => void;
   busy: boolean;
 }) {
   const policy = policySummary;
   const notAvailable = !policy || !policy.available;
+  const policyQuery = policySearch.trim().toLocaleLowerCase();
+  const pathCounts = policyPathOptions.map(([path]) => [
+    path,
+    !policy
+      ? 0
+      : path === "all"
+        ? policy.policy_rules.length
+        : policy.policy_rules.filter((rule) => policyPathTone(rule.path) === path).length,
+  ] as const);
+  const sourceCounts = policy ? countPolicySources(policy.policy_rules, compareText, formatRouteMode) : [];
+  const filteredPolicyRules = policy
+    ? policy.policy_rules.filter((rule) => {
+        const tone = policyPathTone(rule.path) as PolicyPathFilter;
+        return (
+          (policyPathFilter === "all" || tone === policyPathFilter) &&
+          (policySourceFilter === "all" || rule.source === policySourceFilter) &&
+          (!policyQuery || policyRuleSearchText(rule).includes(policyQuery))
+        );
+      })
+    : [];
+  const filteredMihomoRules = policy
+    ? policyQuery
+      ? policy.mihomo_rules.filter((rule) => rule.toLocaleLowerCase().includes(policyQuery))
+      : policy.mihomo_rules
+    : [];
+  const filteredSuppressedRules = policy
+    ? policyQuery
+      ? policy.suppressed_rules.filter((rule) => suppressedRuleSearchText(rule).includes(policyQuery))
+      : policy.suppressed_rules
+    : [];
 
   return (
     <div className="workspace pageWorkspace">
@@ -1677,80 +2421,181 @@ function renderPolicyPage({
             </div>
 
             {policy.policy_rules.length > 0 ? (
-              <div className="policySection">
-                <h2>Policy rules <span className="policyCount">{policy.policy_rules.length}</span></h2>
-                <div className="policyTableWrap">
-                  <table className="policyTable" id="policy-rules-table">
-                    <thead>
-                      <tr>
-                        <th>Target</th>
-                        <th>Value</th>
-                        <th>Path</th>
-                        <th>Source</th>
-                        <th>Mihomo rule</th>
-                        <th>zapret</th>
-                        <th>DNS</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {policy.policy_rules.map((rule, index) => (
-                        <tr key={index} className={policyPathTone(rule.path)}>
-                          <td className="mono">{rule.target_kind}</td>
-                          <td className="mono wrap">{rule.target_value}</td>
-                          <td>
-                            <span className={`policyPathBadge ${policyPathTone(rule.path)}`}>
-                              {rule.path}
-                            </span>
-                          </td>
-                          <td>{rule.source}</td>
-                          <td className="mono wrap">{rule.mihomo_rule}</td>
-                          <td>{rule.zapret_effect}</td>
-                          <td>{rule.dns_effect}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
+              <div className="policyToolbar">
+                <label className="searchField">
+                  <span>Search rules</span>
+                  <input
+                    type="search"
+                    value={policySearch}
+                    placeholder="Domain, CIDR, process, source, generated rule"
+                    spellCheck={false}
+                    onChange={(event) => setPolicySearch(event.currentTarget.value)}
+                  />
+                </label>
+                <label className="compactField">
+                  <span>Source</span>
+                  <select value={policySourceFilter} onChange={(event) => setPolicySourceFilter(event.currentTarget.value)}>
+                    <option value="all">All sources ({policy.policy_rules.length})</option>
+                    {sourceCounts.map(([source, count]) => (
+                      <option key={source} value={source}>
+                        {formatRouteMode(source)} ({count})
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <div className="pathFilter policyPathFilter" aria-label="Policy path filter">
+                  {policyPathOptions.map(([path, label]) => {
+                    const count = pathCounts.find(([countPath]) => countPath === path)?.[1] ?? 0;
+                    return (
+                      <button
+                        key={path}
+                        className={policyPathFilter === path ? `active ${path}` : path}
+                        type="button"
+                        onClick={() => setPolicyPathFilter(path)}
+                        title={`Show ${label} policy rules`}
+                      >
+                        {label}
+                        <span>{count}</span>
+                      </button>
+                    );
+                  })}
                 </div>
+              </div>
+            ) : null}
+
+            {policy.policy_rules.length > 0 ? (
+              <div className="policyQuickStats">
+                {pathCounts
+                  .filter(([path, count]) => path !== "all" && count > 0)
+                  .map(([path, count]) => (
+                    <span key={path} className={path}>
+                      {formatRouteMode(path)} {count}
+                    </span>
+                  ))}
+                {sourceCounts.map(([source, count]) => (
+                  <span key={source}>
+                    {formatRouteMode(source)} {count}
+                  </span>
+                ))}
+              </div>
+            ) : null}
+
+            {policy.policy_rules.length > 0 ? (
+              <div className="policySection">
+                <h2>
+                  Policy rules <span className="policyCount">{filteredPolicyRules.length}</span>
+                  <span className="policyCount muted">{policy.policy_rules.length} total</span>
+                </h2>
+                {filteredPolicyRules.length === 0 ? (
+                  <EmptyList icon={<SlidersHorizontal size={24} />} title="No matching policy rules" text="Change search or path filter to show hidden rules." />
+                ) : (
+                  <div className="policyTableWrap">
+                    <table className="policyTable" id="policy-rules-table">
+                      <thead>
+                        <tr>
+                          <th>Target</th>
+                          <th>Value</th>
+                          <th>Path</th>
+                          <th>Source</th>
+                          <th>Mihomo rule</th>
+                          <th>zapret</th>
+                          <th>DNS</th>
+                          <th>Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {filteredPolicyRules.map((rule, index) => (
+                          <tr key={`${rule.priority}-${rule.target_kind}-${rule.target_value}-${index}`} className={policyPathTone(rule.path)}>
+                            <td className="mono">{rule.target_kind}</td>
+                            <td className="mono wrap">{rule.target_value}</td>
+                            <td>
+                              <span className={`policyPathBadge ${policyPathTone(rule.path)}`}>
+                                {rule.path}
+                              </span>
+                            </td>
+                            <td>{rule.source}</td>
+                            <td className="mono wrap">{rule.mihomo_rule}</td>
+                            <td>{rule.zapret_effect}</td>
+                            <td>{rule.dns_effect}</td>
+                            <td className="policyActions">
+                              <button className="iconSmall" type="button" onClick={() => copyText("Policy rule", formatPolicyRuleForCopy(rule))} title="Copy policy rule details">
+                                <Copy size={13} aria-hidden="true" />
+                              </button>
+                              {localOverrideDraftFromPolicyRule(rule) ? (
+                                <button className="iconSmall" type="button" onClick={() => createOverride(rule)} title="Create local override from this policy rule">
+                                  <Plus size={13} aria-hidden="true" />
+                                </button>
+                              ) : null}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
               </div>
             ) : null}
 
             {policy.suppressed_rules.length > 0 ? (
               <div className="policySection">
-                <h2>Suppressed rules <span className="policyCount">{policy.suppressed_rules.length}</span></h2>
-                <div className="policyTableWrap">
-                  <table className="policyTable" id="policy-suppressed-table">
-                    <thead>
-                      <tr>
-                        <th>Original rule</th>
-                        <th>Chosen rule</th>
-                        <th>Reason</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {policy.suppressed_rules.map((rule, index) => (
-                        <tr key={index}>
-                          <td className="mono wrap">{rule.original_rule}</td>
-                          <td className="mono wrap">{rule.chosen_rule}</td>
-                          <td>{rule.reason}</td>
+                <h2>
+                  Suppressed rules <span className="policyCount">{filteredSuppressedRules.length}</span>
+                  <span className="policyCount muted">{policy.suppressed_rules.length} total</span>
+                </h2>
+                {filteredSuppressedRules.length === 0 ? (
+                  <EmptyList icon={<SlidersHorizontal size={24} />} title="No matching suppressed rules" text="Clear search to inspect all suppressed provider rules." />
+                ) : (
+                  <div className="policyTableWrap">
+                    <table className="policyTable" id="policy-suppressed-table">
+                      <thead>
+                        <tr>
+                          <th>Original rule</th>
+                          <th>Chosen rule</th>
+                          <th>Reason</th>
+                          <th>Copy</th>
                         </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
+                      </thead>
+                      <tbody>
+                        {filteredSuppressedRules.map((rule, index) => (
+                          <tr key={`${rule.original_rule}-${index}`}>
+                            <td className="mono wrap">{rule.original_rule}</td>
+                            <td className="mono wrap">{rule.chosen_rule}</td>
+                            <td>{rule.reason}</td>
+                            <td>
+                              <button className="iconSmall" type="button" onClick={() => copyText("Suppressed rule", rule.chosen_rule)} title="Copy chosen rule">
+                                <Copy size={13} aria-hidden="true" />
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
               </div>
             ) : null}
 
             {policy.mihomo_rules.length > 0 ? (
               <div className="policySection">
-                <h2>Mihomo rules <span className="policyCount">{policy.mihomo_rules.length}</span></h2>
-                <div className="policyRuleList" id="policy-mihomo-rules">
-                  {policy.mihomo_rules.map((rule, index) => (
-                    <div key={index} className="policyRuleLine">
-                      <span className="policyRuleIndex">{index + 1}</span>
-                      <code>{rule}</code>
-                    </div>
-                  ))}
-                </div>
+                <h2>
+                  Mihomo rules <span className="policyCount">{filteredMihomoRules.length}</span>
+                  <span className="policyCount muted">{policy.mihomo_rules.length} total</span>
+                </h2>
+                {filteredMihomoRules.length === 0 ? (
+                  <EmptyList icon={<SlidersHorizontal size={24} />} title="No matching Mihomo rules" text="Clear search to show the generated rules." />
+                ) : (
+                  <div className="policyRuleList" id="policy-mihomo-rules">
+                    {filteredMihomoRules.map((rule, index) => (
+                      <div key={`${rule}-${index}`} className="policyRuleLine">
+                        <span className="policyRuleIndex">{index + 1}</span>
+                        <code>{rule}</code>
+                        <button className="iconSmall" type="button" onClick={() => copyText("Mihomo rule", rule)} title="Copy Mihomo rule">
+                          <Copy size={13} aria-hidden="true" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             ) : null}
 
@@ -1888,13 +2733,6 @@ function renderPolicyPage({
   );
 }
 
-function policyPathTone(path: string): string {
-  if (path.startsWith("VpnProxy")) return "vpn";
-  if (path === "ZapretDirect") return "zapret";
-  if (path === "Reject") return "reject";
-  return "direct";
-}
-
 function renderSettingsPage({
   state,
   hasSubscription,
@@ -1904,11 +2742,32 @@ function renderSettingsPage({
   componentUpdates,
   runtimeDiagnostics,
   runtimeReadiness,
+  operatorSnapshot,
+  operatorBusy,
+  operatorLogPaused,
+  operatorLogAutoScroll,
+  operatorLogViewCleared,
+  operatorLogSourceFilter,
+  operatorLogLevelFilter,
+  operatorCustomDomain,
+  operatorHealthHistory,
+  operatorProfileName,
+  operatorProfilePath,
+  operatorProfileText,
+  operatorDeepLink,
+  operatorBackupPath,
+  manualGameProfile,
   subscriptionProfiles,
   profileUrl,
   agentService,
   zapretService,
   settingsRestartRequired,
+  localOverrideRoute,
+  setLocalOverrideRoute,
+  localOverrideKind,
+  setLocalOverrideKind,
+  localOverrideValue,
+  setLocalOverrideValue,
   updateBusy,
   diagnosticBusy,
   profilesBusy,
@@ -1917,6 +2776,18 @@ function renderSettingsPage({
   settingsBusy,
   busy,
   setSettingsSection,
+  setOperatorLogPaused,
+  setOperatorLogAutoScroll,
+  clearOperatorLogView,
+  setOperatorLogSourceFilter,
+  setOperatorLogLevelFilter,
+  setOperatorCustomDomain,
+  setOperatorProfileName,
+  setOperatorProfilePath,
+  setOperatorProfileText,
+  setOperatorDeepLink,
+  setOperatorBackupPath,
+  setManualGameProfile,
   updateSettings,
   resetSettings,
   applySettingsRestart,
@@ -1924,16 +2795,30 @@ function renderSettingsPage({
   checkUpdates,
   installUpdate,
   updateRuntime,
+  refreshOperatorSnapshot,
+  pickExecutable,
+  runZapretChecks,
+  updateResource,
+  updateAllResources,
+  rollbackResource,
+  importLocalProfile,
+  refreshAllProfiles,
+  droppedProfile,
+  addManualGameProfile,
+  backupAction,
+  openDirectory,
   setProfileUrl,
   addSubscriptionProfile,
   selectSubscriptionProfile,
   removeSubscriptionProfile,
   runDiagnostics,
+  copyText,
   refreshAgentService,
   installAgentService,
   removeAgentService,
   refreshZapretService,
   openServers,
+  policySummary,
 }: {
   state: AgentState;
   hasSubscription: boolean;
@@ -1943,11 +2828,39 @@ function renderSettingsPage({
   componentUpdates: ComponentUpdate[];
   runtimeDiagnostics: RuntimeDiagnosticsReport | null;
   runtimeReadiness: RuntimeReadinessResponse | null;
+  operatorSnapshot: OperatorSnapshot | null;
+  operatorBusy: boolean;
+  operatorLogPaused: boolean;
+  operatorLogAutoScroll: boolean;
+  operatorLogViewCleared: boolean;
+  operatorLogSourceFilter: string;
+  operatorLogLevelFilter: string;
+  operatorCustomDomain: string;
+  operatorHealthHistory: ZapretHealthReport[];
+  operatorProfileName: string;
+  operatorProfilePath: string;
+  operatorProfileText: string;
+  operatorDeepLink: string;
+  operatorBackupPath: string;
+  manualGameProfile: {
+    title: string;
+    executable: string;
+    domains: string;
+    cidrs: string;
+    tcpPorts: string;
+    udpPorts: string;
+  };
   subscriptionProfiles: SubscriptionProfilesState;
   profileUrl: string;
   agentService: AgentServiceStatus | null;
   zapretService: ZapretServiceStatus | null;
   settingsRestartRequired: boolean;
+  localOverrideRoute: LocalOverrideRoute;
+  setLocalOverrideRoute: (route: LocalOverrideRoute) => void;
+  localOverrideKind: LocalOverrideTargetKind;
+  setLocalOverrideKind: (kind: LocalOverrideTargetKind) => void;
+  localOverrideValue: string;
+  setLocalOverrideValue: (value: string) => void;
   updateBusy: boolean;
   diagnosticBusy: boolean;
   profilesBusy: boolean;
@@ -1956,6 +2869,25 @@ function renderSettingsPage({
   settingsBusy: boolean;
   busy: boolean;
   setSettingsSection: (section: SettingsSection) => void;
+  setOperatorLogPaused: (paused: boolean) => void;
+  setOperatorLogAutoScroll: (enabled: boolean) => void;
+  clearOperatorLogView: () => void;
+  setOperatorLogSourceFilter: (source: string) => void;
+  setOperatorLogLevelFilter: (level: string) => void;
+  setOperatorCustomDomain: (value: string) => void;
+  setOperatorProfileName: (value: string) => void;
+  setOperatorProfilePath: (value: string) => void;
+  setOperatorProfileText: (value: string) => void;
+  setOperatorDeepLink: (value: string) => void;
+  setOperatorBackupPath: (value: string) => void;
+  setManualGameProfile: (value: {
+    title: string;
+    executable: string;
+    domains: string;
+    cidrs: string;
+    tcpPorts: string;
+    udpPorts: string;
+  }) => void;
   updateSettings: (settings: AppSettings) => void;
   resetSettings: () => void;
   applySettingsRestart: () => void;
@@ -1963,16 +2895,30 @@ function renderSettingsPage({
   checkUpdates: () => void;
   installUpdate: () => void;
   updateRuntime: () => void;
+  refreshOperatorSnapshot: () => void;
+  pickExecutable: () => void;
+  runZapretChecks: () => void;
+  updateResource: (id: string) => void;
+  updateAllResources: () => void;
+  rollbackResource: (id: string) => void;
+  importLocalProfile: (mode: "path" | "text" | "link") => void;
+  refreshAllProfiles: () => void;
+  droppedProfile: (file: File) => void;
+  addManualGameProfile: () => void;
+  backupAction: (action: "export" | "support" | "restore") => void;
+  openDirectory: (kind: "app_data" | "runtime" | "logs" | "backups") => void;
   setProfileUrl: (value: string) => void;
   addSubscriptionProfile: () => void;
   selectSubscriptionProfile: (id: string) => void;
   removeSubscriptionProfile: (id: string) => void;
   runDiagnostics: () => void;
+  copyText: (label: string, text: string) => void;
   refreshAgentService: () => void;
   installAgentService: () => void;
   removeAgentService: () => void;
   refreshZapretService: () => void;
   openServers: () => void;
+  policySummary: PolicySummaryResponse | null;
 }) {
   const updateCore = (patch: Partial<AppSettings["core"]>) =>
     updateSettings({ ...settings, core: { ...settings.core, ...patch } });
@@ -1980,6 +2926,8 @@ function renderSettingsPage({
     updateSettings({ ...settings, tun: { ...settings.tun, ...patch } });
   const updateDns = (patch: Partial<AppSettings["dns"]>) =>
     updateSettings({ ...settings, dns: { ...settings.dns, ...patch } });
+  const updateSniffer = (patch: Partial<AppSettings["sniffer"]>) =>
+    updateSettings({ ...settings, sniffer: { ...settings.sniffer, ...patch } });
   const updateZapret = (patch: Partial<AppSettings["zapret"]>) =>
     updateSettings({ ...settings, zapret: { ...settings.zapret, ...patch } });
   const updateRoutingPolicy = (patch: Partial<AppSettings["routing_policy"]>) =>
@@ -1992,6 +2940,53 @@ function renderSettingsPage({
     updateSettings({ ...settings, updates: { ...settings.updates, ...patch } });
   const updateDiagnostics = (patch: Partial<AppSettings["diagnostics"]>) =>
     updateSettings({ ...settings, diagnostics: { ...settings.diagnostics, ...patch } });
+  const toggleLearnedGameProfile = (id: string, enabled: boolean) =>
+    updateZapret({
+      learned_game_profiles: settings.zapret.learned_game_profiles.map((profile) =>
+        profile.id === id ? { ...profile, enabled } : profile
+      ),
+    });
+  const localOverrideKinds = localOverrideTargetKindsForRoute(localOverrideRoute);
+  const localOverridePreview = previewLocalOverride(localOverrideRoute, localOverrideKind, localOverrideValue);
+  const localOverrideAllowed = localOverrideKinds.includes(localOverrideKind);
+  const localOverrideDuplicate = localOverrideExists(settings.routing_policy, localOverrideRoute, localOverrideKind, localOverrideValue);
+  const addLocalOverride = () => {
+    const patch = buildLocalOverridePatch(settings.routing_policy, localOverrideRoute, localOverrideKind, localOverrideValue);
+    if (!patch) {
+      return;
+    }
+    updateRoutingPolicy(patch);
+    setLocalOverrideValue("");
+  };
+  const toggleLocalOverrideRule = (id: string, enabled: boolean) => {
+    const rule = settings.routing_policy.local_overrides.rules.find((item) => item.id === id);
+    const patch: Partial<AppSettings["routing_policy"]> = {
+      local_overrides: {
+        version: settings.routing_policy.local_overrides.version,
+        rules: settings.routing_policy.local_overrides.rules.map((rule) =>
+          rule.id === id ? { ...rule, enabled, updated_at: Math.floor(Date.now() / 1000) } : rule,
+        ),
+      },
+    };
+    if (rule && !enabled) {
+      Object.assign(patch, removeLegacyOverrideValue(settings.routing_policy, rule.path, rule.target_kind, rule.process_name ?? rule.value));
+    }
+    updateRoutingPolicy(patch);
+  };
+  const deleteLocalOverrideRule = (id: string) => {
+    const rule = settings.routing_policy.local_overrides.rules.find((item) => item.id === id);
+    const nextRules = settings.routing_policy.local_overrides.rules.filter((item) => item.id !== id);
+    const patch: Partial<AppSettings["routing_policy"]> = {
+      local_overrides: {
+        version: settings.routing_policy.local_overrides.version,
+        rules: nextRules,
+      },
+    };
+    if (rule) {
+      Object.assign(patch, removeLegacyOverrideValue(settings.routing_policy, rule.path, rule.target_kind, rule.process_name ?? rule.value));
+    }
+    updateRoutingPolicy(patch);
+  };
 
   return (
     <div className="workspace pageWorkspace">
@@ -1999,6 +2994,7 @@ function renderSettingsPage({
         <div className="settingsSide">
           <SettingsTab active={settingsSection === "basic"} icon={<SlidersHorizontal size={16} />} label="Basic" onClick={() => setSettingsSection("basic")} />
           <SettingsTab active={settingsSection === "advanced"} icon={<Router size={16} />} label="Advanced" onClick={() => setSettingsSection("advanced")} />
+          <SettingsTab active={settingsSection === "operator"} icon={<ListTree size={16} />} label="Operator" onClick={() => setSettingsSection("operator")} />
           <SettingsTab active={settingsSection === "updates"} icon={<RefreshCw size={16} />} label="Updates" onClick={() => setSettingsSection("updates")} />
         </div>
 
@@ -2130,6 +3126,9 @@ function renderSettingsPage({
                 <ToggleRow label="Strict route" checked={settings.tun.strict_route} disabled={settingsBusy || !settings.tun.enabled} onChange={(checked) => updateTun({ strict_route: checked })} />
                 <ToggleRow label="Auto route" checked={settings.tun.auto_route} disabled={settingsBusy || !settings.tun.enabled} onChange={(checked) => updateTun({ auto_route: checked })} />
                 <ToggleRow label="Auto interface" checked={settings.tun.auto_detect_interface} disabled={settingsBusy || !settings.tun.enabled} onChange={(checked) => updateTun({ auto_detect_interface: checked })} />
+                <NumberField label="MTU" value={settings.tun.mtu} disabled={settingsBusy || !settings.tun.enabled} onChange={(value) => updateTun({ mtu: value })} />
+                <TextAreaField label="DNS hijack" value={listToText(settings.tun.dns_hijack)} disabled={settingsBusy || !settings.tun.enabled} onChange={(value) => updateTun({ dns_hijack: textToList(value) })} />
+                <TextAreaField label="Excluded routes" value={listToText(settings.tun.excluded_routes)} disabled={settingsBusy || !settings.tun.enabled} onChange={(value) => updateTun({ excluded_routes: textToList(value) })} />
               </Panel>
               <Panel title="DNS">
                 <SegmentedControl
@@ -2151,6 +3150,28 @@ function renderSettingsPage({
                     <option value="quad9">Quad9</option>
                   </select>
                 </label>
+                <label className="inputField">
+                  <span>Fake-IP range</span>
+                  <input value={settings.dns.fake_ip_range} disabled={settingsBusy || settings.dns.mode !== "fake-ip"} onChange={(event) => updateDns({ fake_ip_range: event.currentTarget.value })} />
+                </label>
+                <TextAreaField label="Fake-IP filter" value={listToText(settings.dns.fake_ip_filter)} disabled={settingsBusy || settings.dns.mode !== "fake-ip"} onChange={(value) => updateDns({ fake_ip_filter: textToList(value) })} />
+                <TextAreaField
+                  label="Nameserver policy"
+                  value={nameserverPolicyToText(settings.dns.nameserver_policy)}
+                  disabled={settingsBusy}
+                  onChange={(value) => updateDns({ nameserver_policy: textToNameserverPolicy(value) })}
+                />
+                <p className="diagnosticText">Nameserver policy format: one line per rule, `+.example.com = https://1.1.1.1/dns-query, https://8.8.8.8/dns-query`.</p>
+              </Panel>
+              <Panel title="Sniffer">
+                <ToggleRow label="Enabled" checked={settings.sniffer.enabled} disabled={settingsBusy} onChange={(checked) => updateSniffer({ enabled: checked })} />
+                <ToggleRow label="HTTP" checked={settings.sniffer.http} disabled={settingsBusy || !settings.sniffer.enabled} onChange={(checked) => updateSniffer({ http: checked })} />
+                <ToggleRow label="TLS" checked={settings.sniffer.tls} disabled={settingsBusy || !settings.sniffer.enabled} onChange={(checked) => updateSniffer({ tls: checked })} />
+                <ToggleRow label="QUIC" checked={settings.sniffer.quic} disabled={settingsBusy || !settings.sniffer.enabled} onChange={(checked) => updateSniffer({ quic: checked })} />
+                <TextAreaField label="Force domains" value={listToText(settings.sniffer.force_domains)} disabled={settingsBusy || !settings.sniffer.enabled} onChange={(value) => updateSniffer({ force_domains: textToList(value) })} />
+                <TextAreaField label="Skip domains" value={listToText(settings.sniffer.skip_domains)} disabled={settingsBusy || !settings.sniffer.enabled} onChange={(value) => updateSniffer({ skip_domains: textToList(value) })} />
+                <TextAreaField label="Skip source CIDRs" value={listToText(settings.sniffer.skip_src_cidrs)} disabled={settingsBusy || !settings.sniffer.enabled} onChange={(value) => updateSniffer({ skip_src_cidrs: textToList(value) })} />
+                <TextAreaField label="Skip destination CIDRs" value={listToText(settings.sniffer.skip_dst_cidrs)} disabled={settingsBusy || !settings.sniffer.enabled} onChange={(value) => updateSniffer({ skip_dst_cidrs: textToList(value) })} />
               </Panel>
             </section>
           ) : null}
@@ -2231,24 +3252,199 @@ function renderSettingsPage({
                 />
               </Panel>
               <Panel title="Overrides">
+                <div className="overrideComposer">
+                  <p className="diagnosticText">
+                    Local overrides are stored in BadVpn settings and are applied after each subscription refresh. Executable paths are normalized to process names because Mihomo enforces `PROCESS-NAME`.
+                  </p>
+                  <ToggleRow
+                    label="Enable local overrides"
+                    checked={settings.routing_policy.local_overrides_enabled}
+                    disabled={settingsBusy}
+                    onChange={(checked) => updateRoutingPolicy({ local_overrides_enabled: checked })}
+                  />
+                  {!settings.routing_policy.local_overrides_enabled ? (
+                    <div className="inlineNotice warning">
+                      Local rules stay saved but are ignored until this switch is enabled again.
+                    </div>
+                  ) : null}
+                  <div className="overrideGrid">
+                    <label className="selectField">
+                      <span>Route</span>
+                      <select
+                        value={localOverrideRoute}
+                        disabled={settingsBusy || !settings.routing_policy.local_overrides_enabled}
+                        onChange={(event) => {
+                          const nextRoute = event.currentTarget.value as LocalOverrideRoute;
+                          setLocalOverrideRoute(nextRoute);
+                          const nextKinds = localOverrideTargetKindsForRoute(nextRoute);
+                          if (!nextKinds.includes(localOverrideKind)) {
+                            setLocalOverrideKind(nextKinds[0]);
+                          }
+                        }}
+                      >
+                        <option value="direct">DIRECT</option>
+                        <option value="zapret">zapret</option>
+                        <option value="vpn">VPN</option>
+                      </select>
+                    </label>
+                    <label className="selectField">
+                      <span>Target</span>
+                      <select
+                        value={localOverrideKind}
+                        disabled={settingsBusy || !settings.routing_policy.local_overrides_enabled}
+                        onChange={(event) => setLocalOverrideKind(event.currentTarget.value as LocalOverrideTargetKind)}
+                      >
+                        {localOverrideKinds.map((kind) => (
+                          <option key={kind} value={kind}>{formatLocalOverrideKind(kind)}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="inputField overrideValueField">
+                      <span>{formatLocalOverrideKind(localOverrideKind)}</span>
+                      <input
+                        type="text"
+                        value={localOverrideValue}
+                        disabled={settingsBusy || !settings.routing_policy.local_overrides_enabled || !localOverrideAllowed}
+                        placeholder={localOverridePlaceholder(localOverrideKind)}
+                        spellCheck={false}
+                        onChange={(event) => setLocalOverrideValue(event.currentTarget.value)}
+                      />
+                    </label>
+                    <button
+                      className="subtleButton"
+                      type="button"
+                      onClick={pickExecutable}
+                      disabled={settingsBusy || !settings.routing_policy.local_overrides_enabled}
+                      title="Pick a Windows executable"
+                    >
+                      <Upload size={15} aria-hidden="true" />
+                      .exe
+                    </button>
+                    <button
+                      className="primarySmall"
+                      type="button"
+                      onClick={addLocalOverride}
+                      disabled={settingsBusy || !settings.routing_policy.local_overrides_enabled || !localOverridePreview.normalized || !localOverrideAllowed || localOverrideDuplicate}
+                    >
+                      {localOverrideDuplicate ? "Exists" : "Add"}
+                    </button>
+                  </div>
+                  {localOverridePreview.normalized ? (
+                    <div className={localOverrideDuplicate ? "overridePreview duplicate" : "overridePreview"}>
+                      <span>Preview</span>
+                      <code>{localOverridePreview.preview}</code>
+                      {localOverrideDuplicate ? <strong>Already saved</strong> : null}
+                    </div>
+                  ) : null}
+                  {localOverrideKind === "process" ? (
+                    <div className="inlineNotice">
+                      Paste `C:\Games\App\Game.exe` or `Game.exe`; BadVpn stores `Game.exe` so refreshes from the provider cannot overwrite the rule.
+                    </div>
+                  ) : null}
+                  <div className="overrideSummary">
+                    <span>VPN {settings.routing_policy.force_vpn_domains.length + settings.routing_policy.force_vpn_cidrs.length}</span>
+                    <span>
+                      zapret{" "}
+                      {settings.routing_policy.force_zapret_domains.length +
+                        settings.routing_policy.force_zapret_cidrs.length +
+                        settings.routing_policy.force_zapret_processes.length +
+                        settings.routing_policy.force_zapret_tcp_ports.length +
+                        settings.routing_policy.force_zapret_udp_ports.length}
+                    </span>
+                    <span>
+                      DIRECT{" "}
+                      {settings.routing_policy.force_direct_domains.length +
+                        settings.routing_policy.force_direct_cidrs.length +
+                        settings.routing_policy.force_direct_processes.length}
+                    </span>
+                  </div>
+                  <div className="overrideList">
+                    {localOverrideSummaryItems(settings.routing_policy).map((item) => {
+                      const conflict = localOverrideConflictLabel(item, policySummary);
+                      return (
+                        <div key={item.id ?? `${item.route}-${item.kind}-${item.value}`} className={conflict ? `overrideRule ${item.route} conflict` : `overrideRule ${item.route}`}>
+                          <label>
+                            <input
+                              type="checkbox"
+                              checked={item.enabled ?? true}
+                              disabled={settingsBusy || !item.id}
+                              onChange={(event) => item.id ? toggleLocalOverrideRule(item.id, event.currentTarget.checked) : null}
+                            />
+                            <span>{item.route.toUpperCase()} / {item.kind}: {item.value}</span>
+                          </label>
+                          {conflict ? <em>{conflict}</em> : null}
+                          {item.id ? (
+                            <button className="iconSmall" type="button" onClick={() => deleteLocalOverrideRule(item.id!)} disabled={settingsBusy} title="Remove local override">
+                              <X size={13} aria-hidden="true" />
+                            </button>
+                          ) : null}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
                 <TextAreaField
                   label="Force VPN"
                   value={listToText(settings.routing_policy.force_vpn_domains)}
-                  disabled={settingsBusy}
+                  disabled={settingsBusy || !settings.routing_policy.local_overrides_enabled}
                   onChange={(value) => updateRoutingPolicy({ force_vpn_domains: textToList(value) })}
                 />
                 <TextAreaField
                   label="Force Zapret"
                   value={listToText(settings.routing_policy.force_zapret_domains)}
-                  disabled={settingsBusy || settings.core.route_mode !== "smart"}
+                  disabled={settingsBusy || !settings.routing_policy.local_overrides_enabled || settings.core.route_mode !== "smart"}
                   onChange={(value) => updateRoutingPolicy({ force_zapret_domains: textToList(value) })}
                 />
                 <TextAreaField
                   label="Force DIRECT"
                   value={listToText(settings.routing_policy.force_direct_domains)}
-                  disabled={settingsBusy}
+                  disabled={settingsBusy || !settings.routing_policy.local_overrides_enabled}
                   onChange={(value) => updateRoutingPolicy({ force_direct_domains: textToList(value) })}
                 />
+                <div className="advancedOverrideGrid">
+                  <TextAreaField
+                    label="Force VPN CIDRs"
+                    value={listToText(settings.routing_policy.force_vpn_cidrs)}
+                    disabled={settingsBusy || !settings.routing_policy.local_overrides_enabled}
+                    onChange={(value) => updateRoutingPolicy({ force_vpn_cidrs: textToList(value) })}
+                  />
+                  <TextAreaField
+                    label="Force Zapret CIDRs"
+                    value={listToText(settings.routing_policy.force_zapret_cidrs)}
+                    disabled={settingsBusy || !settings.routing_policy.local_overrides_enabled || settings.core.route_mode !== "smart"}
+                    onChange={(value) => updateRoutingPolicy({ force_zapret_cidrs: textToList(value) })}
+                  />
+                  <TextAreaField
+                    label="Force Zapret processes"
+                    value={listToText(settings.routing_policy.force_zapret_processes)}
+                    disabled={settingsBusy || !settings.routing_policy.local_overrides_enabled || settings.core.route_mode !== "smart"}
+                    onChange={(value) => updateRoutingPolicy({ force_zapret_processes: textToList(value) })}
+                  />
+                  <TextAreaField
+                    label="Force Zapret TCP ports"
+                    value={listToText(settings.routing_policy.force_zapret_tcp_ports)}
+                    disabled={settingsBusy || !settings.routing_policy.local_overrides_enabled || settings.core.route_mode !== "smart"}
+                    onChange={(value) => updateRoutingPolicy({ force_zapret_tcp_ports: textToList(value) })}
+                  />
+                  <TextAreaField
+                    label="Force Zapret UDP ports"
+                    value={listToText(settings.routing_policy.force_zapret_udp_ports)}
+                    disabled={settingsBusy || !settings.routing_policy.local_overrides_enabled || settings.core.route_mode !== "smart"}
+                    onChange={(value) => updateRoutingPolicy({ force_zapret_udp_ports: textToList(value) })}
+                  />
+                  <TextAreaField
+                    label="Force DIRECT CIDRs"
+                    value={listToText(settings.routing_policy.force_direct_cidrs)}
+                    disabled={settingsBusy || !settings.routing_policy.local_overrides_enabled}
+                    onChange={(value) => updateRoutingPolicy({ force_direct_cidrs: textToList(value) })}
+                  />
+                  <TextAreaField
+                    label="Force DIRECT processes"
+                    value={listToText(settings.routing_policy.force_direct_processes)}
+                    disabled={settingsBusy || !settings.routing_policy.local_overrides_enabled}
+                    onChange={(value) => updateRoutingPolicy({ force_direct_processes: textToList(value) })}
+                  />
+                </div>
               </Panel>
               <Panel title="Legacy zapret service">
                 <StatusRow label="Name" value={zapretService?.service_name ?? "BadVpnZapret"} />
@@ -2270,6 +3466,53 @@ function renderSettingsPage({
               </Panel>
             </section>
           ) : null}
+
+          {settingsSection === "operator"
+            ? renderOperatorTools({
+                snapshot: operatorSnapshot,
+                busy: operatorBusy,
+                logPaused: operatorLogPaused,
+                setLogPaused: setOperatorLogPaused,
+                logAutoScroll: operatorLogAutoScroll,
+                setLogAutoScroll: setOperatorLogAutoScroll,
+                logViewCleared: operatorLogViewCleared,
+                clearLogView: clearOperatorLogView,
+                logSourceFilter: operatorLogSourceFilter,
+                setLogSourceFilter: setOperatorLogSourceFilter,
+                logLevelFilter: operatorLogLevelFilter,
+                setLogLevelFilter: setOperatorLogLevelFilter,
+                customDomain: operatorCustomDomain,
+                setCustomDomain: setOperatorCustomDomain,
+                healthHistory: operatorHealthHistory,
+                profileName: operatorProfileName,
+                setProfileName: setOperatorProfileName,
+                profilePath: operatorProfilePath,
+                setProfilePath: setOperatorProfilePath,
+                profileText: operatorProfileText,
+                setProfileText: setOperatorProfileText,
+                deepLink: operatorDeepLink,
+                setDeepLink: setOperatorDeepLink,
+                backupPath: operatorBackupPath,
+                setBackupPath: setOperatorBackupPath,
+                manualGameProfile,
+                setManualGameProfile,
+                learnedGameProfileIds: settings.zapret.learned_game_profiles.map((profile) => profile.id),
+                toggleGameProfile: toggleLearnedGameProfile,
+                refresh: refreshOperatorSnapshot,
+                pickExecutable,
+                runZapretChecks,
+                updateResource,
+                updateAllResources,
+                rollbackResource,
+                importLocalProfile,
+                refreshAllProfiles,
+                droppedProfile,
+                addManualGameProfile,
+                backupAction,
+                openDirectory,
+                copyText,
+              })
+            : null}
 
           {settingsSection === "updates" ? (
             <section className="settingsPanels">
@@ -2374,6 +3617,26 @@ function renderSettingsPage({
                   <Activity size={15} aria-hidden="true" />
                   Run checks
                 </button>
+                <button
+                  className="subtleButton"
+                  type="button"
+                  onClick={() =>
+                    copyText(
+                      "Support summary",
+                      buildSupportSummary({
+                        state,
+                        settings,
+                        runtimeReadiness,
+                        runtimeDiagnostics,
+                        componentUpdates,
+                        policySummary,
+                      }),
+                    )
+                  }
+                >
+                  <Copy size={15} aria-hidden="true" />
+                  Copy summary
+                </button>
                 {runtimeDiagnostics ? (
                   <div className="diagnosticList">
                     {runtimeDiagnostics.checks.map((check) => (
@@ -2412,6 +3675,406 @@ function SettingsTab({
       <span>{label}</span>
     </button>
   );
+}
+
+function renderOperatorTools({
+  snapshot,
+  busy,
+  logPaused,
+  setLogPaused,
+  logAutoScroll,
+  setLogAutoScroll,
+  logViewCleared,
+  clearLogView,
+  logSourceFilter,
+  setLogSourceFilter,
+  logLevelFilter,
+  setLogLevelFilter,
+  customDomain,
+  setCustomDomain,
+  healthHistory,
+  profileName,
+  setProfileName,
+  profilePath,
+  setProfilePath,
+  profileText,
+  setProfileText,
+  deepLink,
+  setDeepLink,
+  backupPath,
+  setBackupPath,
+  manualGameProfile,
+  setManualGameProfile,
+  learnedGameProfileIds,
+  toggleGameProfile,
+  refresh,
+  pickExecutable,
+  runZapretChecks,
+  updateResource,
+  updateAllResources,
+  rollbackResource,
+  importLocalProfile,
+  refreshAllProfiles,
+  droppedProfile,
+  addManualGameProfile,
+  backupAction,
+  openDirectory,
+  copyText,
+}: {
+  snapshot: OperatorSnapshot | null;
+  busy: boolean;
+  logPaused: boolean;
+  setLogPaused: (paused: boolean) => void;
+  logAutoScroll: boolean;
+  setLogAutoScroll: (enabled: boolean) => void;
+  logViewCleared: boolean;
+  clearLogView: () => void;
+  logSourceFilter: string;
+  setLogSourceFilter: (source: string) => void;
+  logLevelFilter: string;
+  setLogLevelFilter: (level: string) => void;
+  customDomain: string;
+  setCustomDomain: (value: string) => void;
+  healthHistory: ZapretHealthReport[];
+  profileName: string;
+  setProfileName: (value: string) => void;
+  profilePath: string;
+  setProfilePath: (value: string) => void;
+  profileText: string;
+  setProfileText: (value: string) => void;
+  deepLink: string;
+  setDeepLink: (value: string) => void;
+  backupPath: string;
+  setBackupPath: (value: string) => void;
+  manualGameProfile: {
+    title: string;
+    executable: string;
+    domains: string;
+    cidrs: string;
+    tcpPorts: string;
+    udpPorts: string;
+  };
+  setManualGameProfile: (value: {
+    title: string;
+    executable: string;
+    domains: string;
+    cidrs: string;
+    tcpPorts: string;
+    udpPorts: string;
+  }) => void;
+  learnedGameProfileIds: string[];
+  toggleGameProfile: (id: string, enabled: boolean) => void;
+  refresh: () => void;
+  pickExecutable: () => void;
+  runZapretChecks: () => void;
+  updateResource: (id: string) => void;
+  updateAllResources: () => void;
+  rollbackResource: (id: string) => void;
+  importLocalProfile: (mode: "path" | "text" | "link") => void;
+  refreshAllProfiles: () => void;
+  droppedProfile: (file: File) => void;
+  addManualGameProfile: () => void;
+  backupAction: (action: "export" | "support" | "restore") => void;
+  openDirectory: (kind: "app_data" | "runtime" | "logs" | "backups") => void;
+  copyText: (label: string, text: string) => void;
+}) {
+  const logSources = snapshot?.logs.sources ?? [];
+  const logLines = logSources
+    .filter((source) => logSourceFilter === "all" || source.id === logSourceFilter)
+    .flatMap((source) => source.lines)
+    .filter((line) => logLevelFilter === "all" || line.level === logLevelFilter);
+  const visibleLogLines = logViewCleared ? [] : logLines;
+  const resources = snapshot?.resources.resources ?? [];
+  const providerCount = (snapshot?.providers.rule_providers.length ?? 0) + (snapshot?.providers.proxy_providers.length ?? 0);
+  const learnedGameProfiles = new Set(learnedGameProfileIds);
+
+  return (
+    <section className="settingsPanels operatorPanels">
+      <Panel title="Operator snapshot">
+        <StatusRow label="Generated" value={snapshot ? formatTimestamp(snapshot.generated_at) : "Not loaded"} good={Boolean(snapshot)} />
+        <StatusRow label="Providers" value={String(providerCount)} />
+        <StatusRow label="Resources" value={String(resources.length)} />
+        <div className="buttonRow">
+          <button className="subtleButton" type="button" onClick={refresh} disabled={busy}>
+            <RefreshCw size={15} aria-hidden="true" />
+            Refresh
+          </button>
+          <button className="subtleButton" type="button" onClick={() => openDirectory("app_data")}>
+            <ExternalLink size={15} aria-hidden="true" />
+            App data
+          </button>
+          <button className="subtleButton" type="button" onClick={() => openDirectory("logs")}>
+            <ExternalLink size={15} aria-hidden="true" />
+            Logs
+          </button>
+          <button className="subtleButton" type="button" onClick={() => openDirectory("runtime")}>
+            <ExternalLink size={15} aria-hidden="true" />
+            Runtime
+          </button>
+        </div>
+      </Panel>
+
+      <Panel title="Zapret health">
+        <div className="profileAddRow">
+          <input value={customDomain} placeholder="custom.example.com" onChange={(event) => setCustomDomain(event.currentTarget.value)} />
+          <button className="primarySmall" type="button" onClick={runZapretChecks} disabled={busy}>
+            <Activity size={15} aria-hidden="true" />
+            Run checks
+          </button>
+        </div>
+        <div className="diagnosticList">
+          {(snapshot?.health.checks ?? []).map((check) => (
+            <div key={`${check.id}-${check.domain}`} className={`diagnosticItem ${check.status === "ok" ? "ok" : check.status === "idle" ? "warning" : check.status}`}>
+              <strong>{check.label}</strong>
+              <span>{check.domain} | route={check.route_path} | dns={check.dns_result} | probe={check.probe_result} | list={check.zapret_list}</span>
+              <em>{check.recovery_action}</em>
+            </div>
+          ))}
+        </div>
+        {healthHistory.length ? (
+          <div className="backupList">
+            <strong>Recent checks</strong>
+            {healthHistory.map((report) => (
+              <span key={report.checked_at}>
+                {formatTimestamp(report.checked_at)} | {report.checks.filter((check) => check.status === "ok").length}/{report.checks.length} ok
+              </span>
+            ))}
+          </div>
+        ) : null}
+      </Panel>
+
+      <Panel title="Rules and providers">
+        <StatusRow label="Status" value={snapshot?.providers.update_status ?? "Not loaded"} />
+        <StatusRow label="Editing" value={snapshot?.providers.provider_editing ?? "Read-only"} good />
+        <div className="providerGrid">
+          {[...(snapshot?.providers.rule_providers ?? []), ...(snapshot?.providers.proxy_providers ?? [])].map((provider) => (
+            <div key={`${provider.name}-${provider.behavior}`} className={provider.consumed_by_bpn ? "providerItem active" : "providerItem"}>
+              <strong>{provider.name}</strong>
+              <span>{provider.provider_type} / {provider.behavior}</span>
+              <span>{provider.url_redacted ?? provider.path ?? "local"}</span>
+              <em>{provider.consumed_by_bpn ? "BPN overlay source" : "provider source"}</em>
+            </div>
+          ))}
+        </div>
+      </Panel>
+
+      <Panel title="Resources">
+        <div className="buttonRow">
+          <button className="subtleButton" type="button" onClick={updateAllResources} disabled={busy}>
+            <Download size={15} aria-hidden="true" />
+            Update safe lists
+          </button>
+        </div>
+        <div className="resourceList">
+          {resources.map((resource) => (
+            <div key={resource.id} className={resource.installed ? "resourceItem ok" : "resourceItem warning"}>
+              <div>
+                <strong>{resource.label}</strong>
+                <span>{resource.kind} | {resource.version ?? "missing"}</span>
+                <code>{resource.path}</code>
+                <em>{resource.verification_status}</em>
+              </div>
+              <div className="resourceActions">
+                <button className="subtleButton" type="button" onClick={() => updateResource(resource.id)} disabled={busy || !resource.update_supported}>
+                  Update
+                </button>
+                <button className="subtleButton" type="button" onClick={() => rollbackResource(resource.id)} disabled={busy || !resource.rollback_available}>
+                  Rollback
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </Panel>
+
+      <Panel title="Live logs">
+        <div className="policyToolbar compactToolbar">
+          <label className="selectField">
+            <span>Source</span>
+            <select value={logSourceFilter} onChange={(event) => setLogSourceFilter(event.currentTarget.value)}>
+              <option value="all">All sources</option>
+              {logSources.map((source) => <option key={source.id} value={source.id}>{source.label}</option>)}
+            </select>
+          </label>
+          <label className="selectField">
+            <span>Level</span>
+            <select value={logLevelFilter} onChange={(event) => setLogLevelFilter(event.currentTarget.value)}>
+              <option value="all">All levels</option>
+              <option value="error">Error</option>
+              <option value="warning">Warning</option>
+              <option value="info">Info</option>
+              <option value="debug">Debug</option>
+            </select>
+          </label>
+          <ToggleRow label="Pause" checked={logPaused} onChange={setLogPaused} />
+          <ToggleRow label="Auto-scroll" checked={logAutoScroll} onChange={setLogAutoScroll} />
+          <button className="subtleButton" type="button" onClick={clearLogView} disabled={!visibleLogLines.length}>
+            Clear view
+          </button>
+          <button className="subtleButton" type="button" onClick={() => copyText("Redacted logs", visibleLogLines.map((line) => line.text).join("\n"))} disabled={!visibleLogLines.length}>
+            <Copy size={15} aria-hidden="true" />
+            Copy
+          </button>
+        </div>
+        <pre id="operator-log-viewer" className="logViewer">{visibleLogLines.length ? visibleLogLines.map((line) => `[${line.source}:${line.level}] ${line.text}`).join("\n") : "No redacted log lines loaded."}</pre>
+      </Panel>
+
+      <Panel title="Runtime config">
+        <div className="runtimeConfigGrid">
+          {[snapshot?.config.source_profile, snapshot?.config.runtime_yaml, snapshot?.config.diff].filter(Boolean).map((artifact) => (
+            <div key={artifact!.label} className="runtimeArtifact">
+              <div className="artifactHeader">
+                <strong>{artifact!.label}</strong>
+                <button className="iconSmall" type="button" onClick={() => copyText(artifact!.label, artifact!.text)} title="Copy redacted text">
+                  <Copy size={13} aria-hidden="true" />
+                </button>
+              </div>
+              <span>{artifact!.line_count} lines | read-only | redacted</span>
+              {artifact!.error ? <em>{artifact!.error}</em> : null}
+              {artifact!.label.includes("diff") ? (
+                <pre>{renderRuntimeDiffLines(artifact!.text)}</pre>
+              ) : (
+                <pre>{artifact!.text || "No content."}</pre>
+              )}
+            </div>
+          ))}
+        </div>
+      </Panel>
+
+      <Panel title="Game and app bypass">
+        <StatusRow label="Known" value={String(snapshot?.game_profiles.known.length ?? 0)} />
+        <StatusRow label="Detected" value={String(snapshot?.game_profiles.detected.length ?? 0)} />
+        <StatusRow label="Learned" value={String(snapshot?.game_profiles.learned.length ?? 0)} />
+        <div className="gameProfileList">
+          {[...(snapshot?.game_profiles.detected ?? []), ...(snapshot?.game_profiles.known ?? []), ...(snapshot?.game_profiles.learned ?? [])].slice(0, 10).map((profile) => (
+            <div key={`${profile.id}-${profile.detected}`} className={profile.detected ? "gameProfile detected" : "gameProfile"}>
+              <strong>{profile.title}</strong>
+              <span>{profile.process_names.join(", ") || "No process"} | {profile.filter_mode} | risk={profile.risk_level} | {profile.enabled === false ? "disabled" : "enabled"}</span>
+              <em>{[...profile.domains, ...profile.cidrs, ...profile.tcp_ports, ...profile.udp_ports].slice(0, 6).join(", ") || "Process-only route"}</em>
+              {learnedGameProfiles.has(profile.id) ? (
+                <ToggleRow label="Enabled" checked={profile.enabled !== false} onChange={(checked) => toggleGameProfile(profile.id, checked)} />
+              ) : null}
+            </div>
+          ))}
+        </div>
+        <div className="profileAddRow">
+          <input value={manualGameProfile.title} placeholder="Profile name" onChange={(event) => setManualGameProfile({ ...manualGameProfile, title: event.currentTarget.value })} />
+          <input value={manualGameProfile.executable} placeholder="C:\\Games\\Game.exe" onChange={(event) => setManualGameProfile({ ...manualGameProfile, executable: event.currentTarget.value })} />
+          <button className="subtleButton" type="button" onClick={pickExecutable}>
+            <Upload size={15} aria-hidden="true" />
+            .exe
+          </button>
+        </div>
+        <div className="advancedOverrideGrid">
+          <TextAreaField label="Domains" value={manualGameProfile.domains} onChange={(value) => setManualGameProfile({ ...manualGameProfile, domains: value })} />
+          <TextAreaField label="CIDRs" value={manualGameProfile.cidrs} onChange={(value) => setManualGameProfile({ ...manualGameProfile, cidrs: value })} />
+          <TextAreaField label="TCP ports" value={manualGameProfile.tcpPorts} onChange={(value) => setManualGameProfile({ ...manualGameProfile, tcpPorts: value })} />
+          <TextAreaField label="UDP ports" value={manualGameProfile.udpPorts} onChange={(value) => setManualGameProfile({ ...manualGameProfile, udpPorts: value })} />
+        </div>
+        <button className="primarySmall" type="button" onClick={addManualGameProfile} disabled={busy || !manualGameProfile.executable.trim()}>
+          <Plus size={15} aria-hidden="true" />
+          Save manual profile
+        </button>
+      </Panel>
+
+      <Panel title="Profile import">
+        <div
+          className="dropZone"
+          onDragOver={(event) => event.preventDefault()}
+          onDrop={(event) => {
+            event.preventDefault();
+            const file = event.dataTransfer.files.item(0);
+            if (file) droppedProfile(file);
+          }}
+        >
+          Drop YAML, JSON, or TXT profile here
+        </div>
+        <div className="profileAddRow">
+          <input value={profileName} placeholder="Display name" onChange={(event) => setProfileName(event.currentTarget.value)} />
+          <input value={profilePath} placeholder="C:\\path\\profile.yaml" onChange={(event) => setProfilePath(event.currentTarget.value)} />
+          <button className="subtleButton" type="button" onClick={() => importLocalProfile("path")} disabled={busy || !profilePath.trim()}>
+            Import path
+          </button>
+        </div>
+        <TextAreaField label="Profile body" value={profileText} onChange={setProfileText} />
+        <button className="subtleButton" type="button" onClick={() => importLocalProfile("text")} disabled={busy || !profileText.trim()}>
+          Import text
+        </button>
+        <div className="profileAddRow">
+          <input value={deepLink} placeholder="bpn://import?url=..." onChange={(event) => setDeepLink(event.currentTarget.value)} />
+          <button className="subtleButton" type="button" onClick={() => importLocalProfile("link")} disabled={busy || !deepLink.trim()}>
+            Import link
+          </button>
+          <button className="subtleButton" type="button" onClick={refreshAllProfiles} disabled={busy}>
+            Refresh all
+          </button>
+        </div>
+      </Panel>
+
+      <Panel title="Backup and support">
+        <div className="bundleCategories">
+          <span>Backup: settings, selected proxies, local overrides, game profiles, profile metadata</span>
+          <span>Support: redacted logs, policy/runtime summary, resources, health checks, directories</span>
+        </div>
+        <div className="buttonRow">
+          <button className="subtleButton" type="button" onClick={() => backupAction("export")} disabled={busy}>
+            <Download size={15} aria-hidden="true" />
+            Backup
+          </button>
+          <button className="subtleButton" type="button" onClick={() => backupAction("support")} disabled={busy}>
+            <LifeBuoy size={15} aria-hidden="true" />
+            Support bundle
+          </button>
+          <button className="subtleButton" type="button" onClick={() => openDirectory("backups")}>
+            <ExternalLink size={15} aria-hidden="true" />
+            Backup dir
+          </button>
+        </div>
+        <div className="profileAddRow">
+          <input value={backupPath} placeholder="C:\\path\\badvpn-backup.json" onChange={(event) => setBackupPath(event.currentTarget.value)} />
+          <button className="subtleButton" type="button" onClick={() => backupAction("restore")} disabled={busy || !backupPath.trim()}>
+            Restore
+          </button>
+        </div>
+        <div className="backupList">
+          {renderBackupFiles("Backups", snapshot?.backups.backups ?? [])}
+          {renderBackupFiles("Support bundles", snapshot?.backups.support_bundles ?? [])}
+        </div>
+      </Panel>
+    </section>
+  );
+}
+
+function renderBackupFiles(title: string, files: BackupHistory["backups"]) {
+  return (
+    <div className="backupGroup">
+      <strong>{title}</strong>
+      {files.length ? files.slice(0, 5).map((file) => (
+        <span key={file.path}>{file.name} {file.modified_at ? formatTimestamp(file.modified_at) : ""}</span>
+      )) : <span>None</span>}
+    </div>
+  );
+}
+
+function renderRuntimeDiffLines(text: string) {
+  if (!text.trim()) {
+    return "No content.";
+  }
+  return text.split("\n").map((line, index) => {
+    const className = line.startsWith("+ ")
+      ? "diffLine added"
+      : line.startsWith("- ")
+        ? "diffLine removed"
+        : line.startsWith("#")
+          ? "diffLine heading"
+          : "diffLine";
+    return (
+      <span key={`${index}-${line.slice(0, 12)}`} className={className}>
+        {line || " "}
+        {"\n"}
+      </span>
+    );
+  });
 }
 
 function ToggleRow({
@@ -2532,8 +4195,133 @@ function TextAreaField({
   );
 }
 
-function ConnectionRow({ connection, closeOne }: { connection: TrackedConnection; closeOne: (id: string) => void }) {
+interface ConnectionProcessGroupView {
+  key: string;
+  label: string;
+  rows: TrackedConnection[];
+  uploadBytes: number;
+  downloadBytes: number;
+  activeCount: number;
+  paths: Array<[ConnectionPath, number]>;
+}
+
+function groupConnectionsByProcess(rows: TrackedConnection[]): ConnectionProcessGroupView[] {
+  const groups = new Map<string, ConnectionProcessGroupView>();
+  for (const connection of rows) {
+    const label = getConnectionProcessLabel(connection);
+    const key = label.toLocaleLowerCase();
+    const existing = groups.get(key);
+    if (existing) {
+      existing.rows.push(connection);
+      existing.uploadBytes += connection.upload_bytes;
+      existing.downloadBytes += connection.download_bytes;
+      existing.activeCount += connection.state === "active" ? 1 : 0;
+      continue;
+    }
+
+    groups.set(key, {
+      key,
+      label,
+      rows: [connection],
+      uploadBytes: connection.upload_bytes,
+      downloadBytes: connection.download_bytes,
+      activeCount: connection.state === "active" ? 1 : 0,
+      paths: [],
+    });
+  }
+
+  return Array.from(groups.values())
+    .map((group) => ({
+      ...group,
+      paths: connectionPathOptions
+        .filter(([path]) => path !== "all")
+        .map(([path]) => [path, group.rows.filter((connection) => connection.path === path).length] as [ConnectionPath, number])
+        .filter(([, count]) => count > 0),
+    }))
+    .sort((left, right) => right.rows.length - left.rows.length || compareText(left.label, right.label));
+}
+
+function getConnectionProcessLabel(connection: TrackedConnection) {
+  return connection.process?.trim() || "Unknown process";
+}
+
+function connectionMatchesSearch(connection: TrackedConnection, query: string) {
+  return [
+    connection.host,
+    connection.destination,
+    connection.network,
+    connection.connection_type,
+    connection.process ?? "",
+    connection.rule ?? "",
+    connection.rule_payload ?? "",
+    connection.path,
+    connection.path_label,
+    connection.path_note,
+    connection.chains.join(" "),
+  ]
+    .join(" ")
+    .toLocaleLowerCase()
+    .includes(query);
+}
+
+function ConnectionProcessGroup({
+  group,
+  closeOne,
+  closeMany,
+  createOverride,
+}: {
+  group: ConnectionProcessGroupView;
+  closeOne: (id: string) => void;
+  closeMany: (ids: string[]) => void;
+  createOverride: (connection: TrackedConnection) => void;
+}) {
+  const activeIds = group.rows.filter((connection) => connection.state === "active").map((connection) => connection.id);
+  return (
+    <section className="connectionProcessGroup">
+      <div className="connectionProcessHeader">
+        <div>
+          <strong>{group.label}</strong>
+          <span>
+            {group.rows.length} flows{group.activeCount ? ` / ${group.activeCount} active` : ""} / {formatBytes(group.uploadBytes)} up /{" "}
+            {formatBytes(group.downloadBytes)} down
+          </span>
+        </div>
+        <div className="processPathCounts">
+          {group.paths.map(([path, count]) => (
+            <PathBadge key={path} path={path} label={`${formatPathLabel(path)} ${count}`} />
+          ))}
+          {activeIds.length ? (
+            <button className="iconSmall danger" type="button" onClick={() => closeMany(activeIds)} title="Close active flows in this process">
+              <X size={14} aria-hidden="true" />
+            </button>
+          ) : null}
+        </div>
+      </div>
+      <div className="connectionProcessRows">
+        {group.rows.map((connection) => (
+          <ConnectionRow
+            key={`${connection.state}-${connection.id}-${connection.closed_at ?? "open"}`}
+            connection={connection}
+            closeOne={closeOne}
+            createOverride={createOverride}
+          />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function ConnectionRow({
+  connection,
+  closeOne,
+  createOverride,
+}: {
+  connection: TrackedConnection;
+  closeOne: (id: string) => void;
+  createOverride: (connection: TrackedConnection) => void;
+}) {
   const isActive = connection.state === "active";
+  const processLabel = getConnectionProcessLabel(connection);
   return (
     <div className="connectionRow">
       <div className="connectionMain">
@@ -2541,6 +4329,7 @@ function ConnectionRow({ connection, closeOne }: { connection: TrackedConnection
         <div>
           <strong>{connection.host || connection.destination}</strong>
           <span>{connection.destination}</span>
+          <span className="connectionProcessLine">{processLabel}</span>
         </div>
       </div>
       <div className="connectionMeta">
@@ -2551,8 +4340,35 @@ function ConnectionRow({ connection, closeOne }: { connection: TrackedConnection
       <div className="chainLine" title={connection.path_note}>
         {connection.chains.length ? connection.chains.join("  >  ") : connection.path_note}
       </div>
-      <div className="connectionTail">
+      <div className="connectionTraceLine">
         <span>{connection.rule ?? "rule unknown"}{connection.rule_payload ? ` / ${connection.rule_payload}` : ""}</span>
+        <strong>{connection.path_note}</strong>
+      </div>
+      <details className="connectionDetails">
+        <summary>Details</summary>
+        <div className="connectionDetailsGrid">
+          <DetailItem label="Flow ID" value={connection.id} />
+          <DetailItem label="State" value={connection.state} />
+          <DetailItem label="Host" value={connection.host || "unknown"} />
+          <DetailItem label="Destination" value={connection.destination} />
+          <DetailItem label="Process" value={processLabel} />
+          <DetailItem label="Process path" value={connection.process_path ?? "not exposed"} />
+          <DetailItem label="Network" value={`${connection.network} / ${connection.connection_type}`} />
+          <DetailItem label="Route" value={`${connection.path_label} / ${connection.path_note}`} />
+          <DetailItem label="Rule source" value={connection.rule_source ?? "unknown"} />
+          <DetailItem label="Rule" value={connection.rule ?? "unknown"} />
+          <DetailItem label="Payload" value={connection.rule_payload ?? "none"} />
+          <DetailItem label="Chain" value={connection.chains.length ? connection.chains.join(" > ") : "none"} />
+          <DetailItem label="Traffic" value={`${formatBytes(connection.upload_bytes)} up / ${formatBytes(connection.download_bytes)} down`} />
+          <DetailItem label="Started" value={formatConnectionTime(connection.started_at)} />
+          <DetailItem label="Closed" value={connection.closed_at ? formatTimestamp(connection.closed_at) : "not closed"} />
+        </div>
+      </details>
+      <div className="connectionTail">
+        <span>{isActive ? "Active" : "Closed"}</span>
+        <button className="iconSmall" type="button" onClick={() => createOverride(connection)} title="Create local override from this connection">
+          <Plus size={14} aria-hidden="true" />
+        </button>
         {isActive ? (
           <button className="iconSmall danger" type="button" onClick={() => closeOne(connection.id)} title="Close connection">
             <X size={14} aria-hidden="true" />
@@ -2561,6 +4377,15 @@ function ConnectionRow({ connection, closeOne }: { connection: TrackedConnection
           <span>{connection.closed_at ? formatTimestamp(connection.closed_at) : "Closed"}</span>
         )}
       </div>
+    </div>
+  );
+}
+
+function DetailItem({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="detailItem">
+      <span>{label}</span>
+      <strong>{value}</strong>
     </div>
   );
 }
@@ -2582,7 +4407,7 @@ function NodeRow({ group, node, busy, select }: { group: string; node: ProxyNode
         <span>{node.proxy_type ?? "proxy"}{node.server ? ` / ${node.server}` : ""}</span>
       </div>
       <div className="nodeMeta">
-        <span>{node.delay_ms ? `${node.delay_ms} ms` : "No ping"}</span>
+        <span>{node.delay_ms !== null ? `${node.delay_ms} ms` : "No ping"}</span>
         {node.alive === false ? <span className="bad">Down</span> : null}
         {node.selected ? (
           <span className="selectedMark"><Check size={14} /> Selected</span>
@@ -2626,6 +4451,16 @@ function StatusBadge({ connected, pending, status }: { connected: boolean; pendi
 
 function PathBadge({ path, label }: { path: string; label: string }) {
   return <span className={`pathBadge ${path}`}>{label}</span>;
+}
+
+function formatPathLabel(path: ConnectionPath) {
+  if (path === "vpn") {
+    return "VPN";
+  }
+  if (path === "direct") {
+    return "DIRECT";
+  }
+  return formatRouteMode(path);
 }
 
 function Panel({ title, children }: { title: string; children: ReactNode }) {
@@ -2689,9 +4524,32 @@ function listToText(values: string[]) {
 
 function textToList(value: string) {
   return value
-    .split(/\r?\n/)
+    .split(/\r?\n|,/)
     .map((line) => line.trim())
     .filter(Boolean);
+}
+
+function nameserverPolicyToText(values: AppSettings["dns"]["nameserver_policy"]) {
+  return values.map((rule) => `${rule.pattern} = ${rule.nameservers.join(", ")}`).join("\n");
+}
+
+function textToNameserverPolicy(value: string): AppSettings["dns"]["nameserver_policy"] {
+  return value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [pattern, nameservers = ""] = line.split("=");
+      return {
+        pattern: pattern.trim(),
+        nameservers: textToList(nameservers),
+      };
+    })
+    .filter((rule) => rule.pattern && rule.nameservers.length > 0);
+}
+
+function normalizeProcessName(value: string) {
+  return value.trim().replace(/^["']|["']$/g, "").split(/[\\/]/).filter(Boolean).pop()?.trim() ?? "";
 }
 
 function formatRefreshInterval(hours: number | null) {
@@ -2717,6 +4575,17 @@ function formatBytes(bytes: number) {
 
 function formatTimestamp(seconds: number) {
   return new Date(seconds * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function formatConnectionTime(value: string | null) {
+  if (!value) {
+    return "unknown";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
 function formatAppUpdateStatus(status: AppUpdateStatus) {
@@ -2823,6 +4692,171 @@ function getHomeRouteSummary(routeMode: AppSettings["core"]["route_mode"], fallb
   ];
 }
 
+function buildSupportSummary({
+  state,
+  settings,
+  runtimeReadiness,
+  runtimeDiagnostics,
+  componentUpdates,
+  policySummary,
+}: {
+  state: AgentState;
+  settings: AppSettings;
+  runtimeReadiness: RuntimeReadinessResponse | null;
+  runtimeDiagnostics: RuntimeDiagnosticsReport | null;
+  componentUpdates: ComponentUpdate[];
+  policySummary: PolicySummaryResponse | null;
+}) {
+  const sourceCounts = new Map<string, number>();
+  for (const rule of policySummary?.policy_rules ?? []) {
+    sourceCounts.set(rule.source, (sourceCounts.get(rule.source) ?? 0) + 1);
+  }
+  const sourceSummary = [...sourceCounts.entries()]
+    .sort((left, right) => right[1] - left[1] || compareText(left[0], right[0]))
+    .map(([source, count]) => `${formatRouteMode(source)}=${count}`)
+    .join(", ");
+  const activePresets = Object.entries(settings.routing_policy.smart_presets)
+    .filter(([, enabled]) => enabled)
+    .map(([name]) => formatRouteMode(name))
+    .join(", ");
+  const componentSummary = componentUpdates.length
+    ? componentUpdates.map((component) => `${component.name}:${component.current_version}${component.update_available ? "->update" : ""}${component.error ? ":error" : ""}`).join(", ")
+    : "not checked";
+  const diagnosticSummary = runtimeDiagnostics
+    ? runtimeDiagnostics.checks.map((check) => `${check.label}:${check.status}`).join(", ")
+    : "not run";
+
+  return [
+    "BadVpn support summary",
+    `generated_local=${new Date().toLocaleString()}`,
+    "privacy=redacted: no subscription URL, controller secret or local credential values included",
+    "",
+    `[state] phase=${state.phase}; connected=${state.connection.connected}; status=${state.connection.status}; route=${formatRouteMode(state.connection.route_mode)}; selected_profile=${state.connection.selected_profile ?? "none"}; selected_proxy=${state.connection.selected_proxy ?? "auto"}`,
+    `[subscription] valid=${state.subscription.is_valid ?? "unknown"}; format=${formatRouteMode(state.subscription.format)}; nodes=${state.subscription.node_count}; title=${state.subscription.profile_title ?? "none"}`,
+    `[traffic] upload=${formatBytes(state.metrics.upload_bytes)}; download=${formatBytes(state.metrics.download_bytes)}`,
+    `[settings] route_mode=${formatRouteMode(settings.core.route_mode)}; tun=${settings.tun.enabled}; dns=${settings.dns.mode}; zapret=${settings.zapret.enabled}; strategy=${settings.zapret.strategy}`,
+    `[local_overrides] enabled=${settings.routing_policy.local_overrides_enabled}; total=${countLocalRoutingOverrides(settings.routing_policy)}; vpn=${settings.routing_policy.force_vpn_domains.length + settings.routing_policy.force_vpn_cidrs.length}; zapret=${settings.routing_policy.force_zapret_domains.length + settings.routing_policy.force_zapret_cidrs.length + settings.routing_policy.force_zapret_processes.length + settings.routing_policy.force_zapret_tcp_ports.length + settings.routing_policy.force_zapret_udp_ports.length}; direct=${settings.routing_policy.force_direct_domains.length + settings.routing_policy.force_direct_cidrs.length + settings.routing_policy.force_direct_processes.length}`,
+    `[smart_presets] active=${activePresets || "none"}; coverage=${settings.routing_policy.coverage}`,
+    `[readiness] ready=${runtimeReadiness?.ready ?? "unknown"}; components=${runtimeReadiness?.components_ready ?? "unknown"}; mihomo=${runtimeReadiness?.mihomo_ready ?? "unknown"}; zapret=${runtimeReadiness?.zapret_ready ?? "unknown"}; message=${runtimeReadiness?.message ?? "not checked"}`,
+    `[components] ${componentSummary}`,
+    `[diagnostics] mihomo=${runtimeDiagnostics?.mihomo_healthy ?? state.diagnostics.mihomo_healthy}; zapret=${runtimeDiagnostics?.zapret_healthy ?? state.diagnostics.zapret_healthy}; checks=${diagnosticSummary}; last_error=${state.last_error ?? "none"}`,
+    `[policy] available=${policySummary?.available ?? false}; mode=${policySummary ? formatRouteMode(policySummary.mode) : "unknown"}; rules=${policySummary?.rule_count ?? 0}; suppressed=${policySummary?.suppressed_count ?? 0}; warnings=${policySummary?.warnings_count ?? 0}; zapret_domains=${policySummary?.zapret_domain_count ?? 0}; sources=${sourceSummary || "unknown"}`,
+  ].join("\n");
+}
+
+function countLocalRoutingOverrides(policy: AppSettings["routing_policy"]) {
+  return [
+    policy.force_vpn_domains,
+    policy.force_vpn_cidrs,
+    policy.force_zapret_domains,
+    policy.force_zapret_cidrs,
+    policy.force_zapret_processes,
+    policy.force_zapret_tcp_ports,
+    policy.force_zapret_udp_ports,
+    policy.force_direct_domains,
+    policy.force_direct_cidrs,
+    policy.force_direct_processes,
+  ].reduce((total, values) => total + values.length, 0);
+}
+
+function localOverrideSummaryItems(policy: AppSettings["routing_policy"]): LocalOverrideSummaryItem[] {
+  const typed = (policy.local_overrides?.rules ?? []).map((rule) => ({
+    id: rule.id,
+    enabled: rule.enabled,
+    route: rule.path,
+    kind: rule.target_kind === "app" ? "process" : rule.target_kind.replace("_port", ""),
+    value: rule.process_name ?? rule.value,
+  }));
+  const legacy = [
+    ...policy.force_vpn_domains.map((value) => ({ route: "vpn", kind: "domain", value })),
+    ...policy.force_vpn_cidrs.map((value) => ({ route: "vpn", kind: "cidr", value })),
+    ...policy.force_zapret_domains.map((value) => ({ route: "zapret", kind: "domain", value })),
+    ...policy.force_zapret_cidrs.map((value) => ({ route: "zapret", kind: "cidr", value })),
+    ...policy.force_zapret_processes.map((value) => ({ route: "zapret", kind: "process", value })),
+    ...policy.force_zapret_tcp_ports.map((value) => ({ route: "zapret", kind: "tcp", value })),
+    ...policy.force_zapret_udp_ports.map((value) => ({ route: "zapret", kind: "udp", value })),
+    ...policy.force_direct_domains.map((value) => ({ route: "direct", kind: "domain", value })),
+    ...policy.force_direct_cidrs.map((value) => ({ route: "direct", kind: "cidr", value })),
+    ...policy.force_direct_processes.map((value) => ({ route: "direct", kind: "process", value })),
+  ].filter((item) => !typed.some((rule) => rule.route === item.route && rule.kind === item.kind && rule.value.toLocaleLowerCase() === item.value.toLocaleLowerCase()));
+  return [...typed, ...legacy].slice(0, 24);
+}
+
+function localOverrideConflictLabel(
+  item: ReturnType<typeof localOverrideSummaryItems>[number],
+  policySummary: PolicySummaryResponse | null,
+) {
+  if (!policySummary?.available) {
+    return null;
+  }
+  const value = item.value.toLocaleLowerCase();
+  const overlappingSources = policySummary.policy_rules
+    .filter((rule) => rule.source !== "LocalUserOverride" && rule.target_value.toLocaleLowerCase() === value)
+    .map((rule) => formatRouteMode(rule.source));
+  if (overlappingSources.length > 0) {
+    return `overlap: ${[...new Set(overlappingSources)].join(", ")}`;
+  }
+  const suppressed = policySummary.suppressed_rules.some((rule) =>
+    `${rule.original_rule} ${rule.chosen_rule}`.toLocaleLowerCase().includes(value),
+  );
+  return suppressed ? "suppressed provider rule" : null;
+}
+
+function removeLegacyOverrideValue(
+  policy: AppSettings["routing_policy"],
+  route: string,
+  kind: string,
+  value: string,
+): Partial<AppSettings["routing_policy"]> {
+  const remove = (values: string[]) => values.filter((item) => item.toLocaleLowerCase() !== value.toLocaleLowerCase());
+  if (route === "vpn" && kind === "domain") return { force_vpn_domains: remove(policy.force_vpn_domains) };
+  if (route === "vpn" && kind === "cidr") return { force_vpn_cidrs: remove(policy.force_vpn_cidrs) };
+  if (route === "zapret" && kind === "domain") return { force_zapret_domains: remove(policy.force_zapret_domains) };
+  if (route === "zapret" && kind === "cidr") return { force_zapret_cidrs: remove(policy.force_zapret_cidrs) };
+  if (route === "zapret" && (kind === "process" || kind === "app")) return { force_zapret_processes: remove(policy.force_zapret_processes) };
+  if (route === "zapret" && kind === "tcp_port") return { force_zapret_tcp_ports: remove(policy.force_zapret_tcp_ports) };
+  if (route === "zapret" && kind === "udp_port") return { force_zapret_udp_ports: remove(policy.force_zapret_udp_ports) };
+  if (route === "direct" && kind === "domain") return { force_direct_domains: remove(policy.force_direct_domains) };
+  if (route === "direct" && kind === "cidr") return { force_direct_cidrs: remove(policy.force_direct_cidrs) };
+  if (route === "direct" && (kind === "process" || kind === "app")) return { force_direct_processes: remove(policy.force_direct_processes) };
+  return {};
+}
+
+function localOverrideDraftFromPolicyRule(rule: PolicyRuleView): {
+  route: LocalOverrideRoute;
+  kind: LocalOverrideTargetKind;
+  value: string;
+} | null {
+  const targetKind = rule.target_kind.toLocaleLowerCase();
+  const route = policyPathToLocalOverrideRoute(rule.path);
+  if (targetKind === "tcpport" || targetKind === "tcp_port") {
+    return { route: "zapret", kind: "tcp_port", value: rule.target_value };
+  }
+  if (targetKind === "udpport" || targetKind === "udp_port") {
+    return { route: "zapret", kind: "udp_port", value: rule.target_value };
+  }
+  if (targetKind.includes("processname")) {
+    return route === "vpn" ? null : { route, kind: "process", value: rule.target_value };
+  }
+  if (targetKind.includes("cidr") || targetKind.includes("ipsuffix")) {
+    return { route, kind: "cidr", value: rule.target_value };
+  }
+  if (targetKind.includes("domain")) {
+    return { route, kind: "domain", value: rule.target_value };
+  }
+  return null;
+}
+
+function policyPathToLocalOverrideRoute(path: string): LocalOverrideRoute {
+  if (path.includes("VpnProxy")) {
+    return "vpn";
+  }
+  if (path.includes("ZapretDirect")) {
+    return "zapret";
+  }
+  return "direct";
+}
+
 function getRuntimeComponentStatus(components: ComponentUpdate[], readiness: RuntimeReadinessResponse | null): {
   status: "ready" | "pending" | "blocked";
   detail: string;
@@ -2877,6 +4911,71 @@ function getRuntimeComponentStatus(components: ComponentUpdate[], readiness: Run
     status: "ready",
     detail: "Mihomo, zapret, and route lists are present.",
   };
+}
+
+function proxyGroupMatchesSearch(group: ProxyGroupView, query: string) {
+  return proxyGroupText(group).includes(query) || group.nodes.some((node) => proxyNodeMatchesSearch(node, query));
+}
+
+function proxyGroupText(group: ProxyGroupView) {
+  return [group.name, group.group_type, group.selected ?? ""].join(" ").toLocaleLowerCase();
+}
+
+function proxyNodeMatchesSearch(node: ProxyNodeView, query: string) {
+  return [node.name, node.proxy_type ?? "", node.server ?? "", node.alive === false ? "down" : node.alive === true ? "alive" : ""]
+    .join(" ")
+    .toLocaleLowerCase()
+    .includes(query);
+}
+
+function sortProxyNodes(nodes: ProxyNodeView[], sort: ServerNodeSort, selected: string | null) {
+  const indexed = nodes.map((node, index) => ({ node, index }));
+  indexed.sort((left, right) => {
+    switch (sort) {
+      case "name":
+        return compareText(left.node.name, right.node.name) || left.index - right.index;
+      case "latency":
+        return compareLatency(left.node.delay_ms, right.node.delay_ms) || compareText(left.node.name, right.node.name) || left.index - right.index;
+      case "alive":
+        return compareAlive(left.node.alive, right.node.alive) || compareText(left.node.name, right.node.name) || left.index - right.index;
+      case "selected":
+        return compareSelected(left.node, right.node, selected) || left.index - right.index;
+      default:
+        return left.index - right.index;
+    }
+  });
+  return indexed.map((item) => item.node);
+}
+
+function compareText(left: string, right: string) {
+  return left.localeCompare(right, undefined, { sensitivity: "base", numeric: true });
+}
+
+function compareLatency(left: number | null, right: number | null) {
+  if (left === right) {
+    return 0;
+  }
+  if (left === null) {
+    return 1;
+  }
+  if (right === null) {
+    return -1;
+  }
+  return left - right;
+}
+
+function compareAlive(left: boolean | null, right: boolean | null) {
+  const rank = (value: boolean | null) => (value === true ? 0 : value === null ? 1 : 2);
+  return rank(left) - rank(right);
+}
+
+function compareSelected(left: ProxyNodeView, right: ProxyNodeView, selected: string | null) {
+  const isLeftSelected = left.selected || left.name === selected;
+  const isRightSelected = right.selected || right.name === selected;
+  if (isLeftSelected === isRightSelected) {
+    return compareText(left.name, right.name);
+  }
+  return isLeftSelected ? -1 : 1;
 }
 
 function formatRuntimeComponentStatus(components: ComponentUpdate[], readiness: RuntimeReadinessResponse | null) {

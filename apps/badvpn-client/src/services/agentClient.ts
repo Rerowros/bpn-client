@@ -1,5 +1,21 @@
 import { invoke } from "@tauri-apps/api/core";
 
+type InvokeArgs = Record<string, unknown>;
+
+function invokeCommand<T>(command: string, args?: InvokeArgs): Promise<T> {
+  if (hasTauriRuntime()) {
+    return invoke<T>(command, args);
+  }
+  if (import.meta.env.DEV) {
+    return import("./agentMock").then(({ mockInvoke }) => mockInvoke(command, args) as T);
+  }
+  return invoke<T>(command, args);
+}
+
+function hasTauriRuntime() {
+  return typeof window !== "undefined" && Boolean((window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__);
+}
+
 export type AppPhase =
   | "init"
   | "onboarding"
@@ -135,10 +151,26 @@ export interface AppSettings {
     strict_route: boolean;
     auto_route: boolean;
     auto_detect_interface: boolean;
+    mtu: number;
+    dns_hijack: string[];
+    excluded_routes: string[];
   };
   dns: {
     mode: DnsMode;
     preset: DnsPreset;
+    fake_ip_range: string;
+    fake_ip_filter: string[];
+    nameserver_policy: NameServerPolicySetting[];
+  };
+  sniffer: {
+    enabled: boolean;
+    http: boolean;
+    tls: boolean;
+    quic: boolean;
+    force_domains: string[];
+    skip_domains: string[];
+    skip_src_cidrs: string[];
+    skip_dst_cidrs: string[];
   };
   zapret: {
     enabled: boolean;
@@ -153,6 +185,8 @@ export interface AppSettings {
     fallback_to_vpn_on_failed_probe: boolean;
   };
   routing_policy: {
+    local_overrides_enabled: boolean;
+    local_overrides: LocalOverridesSettings;
     force_vpn_domains: string[];
     force_vpn_cidrs: string[];
     force_zapret_domains: string[];
@@ -179,6 +213,36 @@ export interface AppSettings {
     runtime_checks_after_connect: boolean;
     discord_youtube_probes: boolean;
   };
+}
+
+export interface NameServerPolicySetting {
+  pattern: string;
+  nameservers: string[];
+}
+
+export interface LocalOverridesSettings {
+  version: number;
+  rules: LocalOverrideRule[];
+}
+
+export type LocalOverridePath = "direct" | "vpn" | "zapret";
+export type LocalOverrideRuleTargetKind = "domain" | "cidr" | "process" | "app" | "tcp_port" | "udp_port";
+export type LocalOverrideSource = "user" | "migrated_force_list" | "learned_game" | "preset";
+
+export interface LocalOverrideRule {
+  id: string;
+  enabled: boolean;
+  title: string;
+  path: LocalOverridePath;
+  target_kind: LocalOverrideRuleTargetKind;
+  value: string;
+  executable_path: string | null;
+  process_name: string | null;
+  source: LocalOverrideSource;
+  created_at: number;
+  updated_at: number;
+  last_applied_at: number | null;
+  last_policy_trace_id: string | null;
 }
 
 export interface RuntimeSettings {
@@ -233,6 +297,7 @@ export interface RuntimeGameProfile {
   filter_mode: GameFilterMode | string;
   risk_level: string;
   detected: boolean;
+  enabled: boolean;
 }
 
 export interface ConnectRequest {
@@ -366,8 +431,10 @@ export interface TrackedConnection {
   network: string;
   connection_type: string;
   process: string | null;
+  process_path: string | null;
   rule: string | null;
   rule_payload: string | null;
+  rule_source: string | null;
   chains: string[];
   upload_bytes: number;
   download_bytes: number;
@@ -412,119 +479,119 @@ export interface ProxyNodeView {
 }
 
 export function getStatus(): Promise<AgentState> {
-  return invoke<AgentState>("status");
+  return invokeCommand<AgentState>("status");
 }
 
 export function startConnection(): Promise<AgentState> {
-  return invoke<AgentState>("start");
+  return invokeCommand<AgentState>("start");
 }
 
 export function stopConnection(): Promise<AgentState> {
-  return invoke<AgentState>("stop");
+  return invokeCommand<AgentState>("stop");
 }
 
 export function restartConnection(): Promise<AgentState> {
-  return invoke<AgentState>("restart");
+  return invokeCommand<AgentState>("restart");
 }
 
 export function setSubscription(url: string): Promise<AgentState> {
-  return invoke<AgentState>("set_subscription", { url });
+  return invokeCommand<AgentState>("set_subscription", { url });
 }
 
 export function refreshSubscription(): Promise<AgentState> {
-  return invoke<AgentState>("refresh_subscription");
+  return invokeCommand<AgentState>("refresh_subscription");
 }
 
 export function getSubscriptionProfiles(): Promise<SubscriptionProfilesState> {
-  return invoke<SubscriptionProfilesState>("subscription_profiles");
+  return invokeCommand<SubscriptionProfilesState>("subscription_profiles");
 }
 
 export function addSubscriptionProfile(url: string, name?: string): Promise<SubscriptionProfilesApplyResult> {
-  return invoke<SubscriptionProfilesApplyResult>("add_subscription_profile", { url, name: name ?? null });
+  return invokeCommand<SubscriptionProfilesApplyResult>("add_subscription_profile", { url, name: name ?? null });
 }
 
 export function selectSubscriptionProfile(id: string): Promise<SubscriptionProfilesApplyResult> {
-  return invoke<SubscriptionProfilesApplyResult>("select_subscription_profile", { id });
+  return invokeCommand<SubscriptionProfilesApplyResult>("select_subscription_profile", { id });
 }
 
 export function removeSubscriptionProfile(id: string): Promise<SubscriptionProfilesApplyResult> {
-  return invoke<SubscriptionProfilesApplyResult>("remove_subscription_profile", { id });
+  return invokeCommand<SubscriptionProfilesApplyResult>("remove_subscription_profile", { id });
 }
 
 export function checkComponentUpdates(): Promise<ComponentUpdateReport> {
-  return invoke<ComponentUpdateReport>("check_component_updates");
+  return invokeCommand<ComponentUpdateReport>("check_component_updates");
 }
 
 export function getRuntimeReadiness(): Promise<RuntimeReadinessResponse> {
-  return invoke<RuntimeReadinessResponse>("runtime_readiness");
+  return invokeCommand<RuntimeReadinessResponse>("runtime_readiness");
 }
 
 export function getSettings(): Promise<AppSettings> {
-  return invoke<AppSettings>("get_settings");
+  return invokeCommand<AppSettings>("get_settings");
 }
 
 export function saveSettings(settings: SettingsPatch): Promise<SettingsApplyResult> {
-  return invoke<SettingsApplyResult>("save_settings", { settings });
+  return invokeCommand<SettingsApplyResult>("save_settings", { settings });
 }
 
 export function resetSettings(): Promise<SettingsApplyResult> {
-  return invoke<SettingsApplyResult>("reset_settings");
+  return invokeCommand<SettingsApplyResult>("reset_settings");
 }
 
 export function getAgentServiceStatus(): Promise<AgentServiceStatus> {
-  return invoke<AgentServiceStatus>("agent_service_status");
+  return invokeCommand<AgentServiceStatus>("agent_service_status");
 }
 
 export function installAgentService(): Promise<AgentServiceStatus> {
-  return invoke<AgentServiceStatus>("install_agent_service");
+  return invokeCommand<AgentServiceStatus>("install_agent_service");
 }
 
 export function removeAgentService(): Promise<AgentServiceStatus> {
-  return invoke<AgentServiceStatus>("remove_agent_service");
+  return invokeCommand<AgentServiceStatus>("remove_agent_service");
 }
 
 export function getZapretProfileState(): Promise<ZapretProfileState> {
-  return invoke<ZapretProfileState>("zapret_profile_state");
+  return invokeCommand<ZapretProfileState>("zapret_profile_state");
 }
 
 export function getZapretServiceStatus(): Promise<ZapretServiceStatus> {
-  return invoke<ZapretServiceStatus>("zapret_service_status");
+  return invokeCommand<ZapretServiceStatus>("zapret_service_status");
 }
 
 export function setZapretProfile(profile: string): Promise<ZapretProfileState> {
-  return invoke<ZapretProfileState>("set_zapret_profile", { profile });
+  return invokeCommand<ZapretProfileState>("set_zapret_profile", { profile });
 }
 
 export function runDiagnostics(): Promise<RuntimeDiagnosticsReport> {
-  return invoke<RuntimeDiagnosticsReport>("run_diagnostics");
+  return invokeCommand<RuntimeDiagnosticsReport>("run_diagnostics");
 }
 
 export function updateRuntimeComponents(): Promise<RuntimeUpdateResult> {
-  return invoke<RuntimeUpdateResult>("update_runtime_components");
+  return invokeCommand<RuntimeUpdateResult>("update_runtime_components");
 }
 
 export function getConnectionsSnapshot(): Promise<ConnectionsSnapshot> {
-  return invoke<ConnectionsSnapshot>("connections_snapshot");
+  return invokeCommand<ConnectionsSnapshot>("connections_snapshot");
 }
 
 export function closeConnection(id: string): Promise<ConnectionsSnapshot> {
-  return invoke<ConnectionsSnapshot>("close_connection", { id });
+  return invokeCommand<ConnectionsSnapshot>("close_connection", { id });
 }
 
 export function closeAllConnections(): Promise<ConnectionsSnapshot> {
-  return invoke<ConnectionsSnapshot>("close_all_connections");
+  return invokeCommand<ConnectionsSnapshot>("close_all_connections");
 }
 
 export function clearClosedConnections(): Promise<ConnectionsSnapshot> {
-  return invoke<ConnectionsSnapshot>("clear_closed_connections");
+  return invokeCommand<ConnectionsSnapshot>("clear_closed_connections");
 }
 
 export function getProxyCatalog(): Promise<ProxyCatalog> {
-  return invoke<ProxyCatalog>("proxy_catalog");
+  return invokeCommand<ProxyCatalog>("proxy_catalog");
 }
 
 export function selectProxy(group: string, proxy: string): Promise<ProxyCatalog> {
-  return invoke<ProxyCatalog>("select_proxy", { group, proxy });
+  return invokeCommand<ProxyCatalog>("select_proxy", { group, proxy });
 }
 
 export interface PolicyRuleView {
@@ -588,5 +655,189 @@ export interface PolicySummaryResponse {
 }
 
 export function getPolicySummary(): Promise<PolicySummaryResponse> {
-  return invoke<PolicySummaryResponse>("policy_summary");
+  return invokeCommand<PolicySummaryResponse>("policy_summary");
+}
+
+export interface OperatorSnapshot {
+  generated_at: number;
+  providers: ProviderCatalog;
+  resources: ResourceCatalog;
+  logs: RuntimeLogSnapshot;
+  config: RuntimeConfigSnapshot;
+  health: ZapretHealthReport;
+  game_profiles: GameProfilesCatalog;
+  backups: BackupHistory;
+}
+
+export interface ProviderCatalog {
+  rule_providers: ProviderView[];
+  proxy_providers: ProviderView[];
+  update_status: string;
+  provider_editing: string;
+}
+
+export interface ProviderView {
+  name: string;
+  provider_type: string;
+  behavior: string;
+  path: string | null;
+  url_redacted: string | null;
+  interval_seconds: number | null;
+  vehicle: string | null;
+  health_check: string | null;
+  consumed_by_bpn: boolean;
+}
+
+export interface ResourceCatalog {
+  resources: OperatorResource[];
+}
+
+export interface OperatorResource {
+  id: string;
+  label: string;
+  kind: string;
+  path: string;
+  installed: boolean;
+  version: string | null;
+  last_modified: number | null;
+  source: string;
+  update_supported: boolean;
+  rollback_available: boolean;
+  verification_status: string;
+}
+
+export interface ResourceActionResult {
+  changed: boolean;
+  message: string;
+  resources: ResourceCatalog;
+}
+
+export interface RuntimeLogSnapshot {
+  sources: RuntimeLogSource[];
+}
+
+export interface RuntimeLogSource {
+  id: string;
+  label: string;
+  path: string;
+  lines: RuntimeLogLine[];
+  error: string | null;
+}
+
+export interface RuntimeLogLine {
+  source: string;
+  level: string;
+  text: string;
+}
+
+export interface RuntimeConfigSnapshot {
+  source_profile: RedactedTextArtifact;
+  runtime_yaml: RedactedTextArtifact;
+  diff: RedactedTextArtifact;
+  read_only: boolean;
+}
+
+export interface RedactedTextArtifact {
+  label: string;
+  path: string | null;
+  text: string;
+  line_count: number;
+  redacted: boolean;
+  error: string | null;
+}
+
+export interface ZapretHealthReport {
+  checked_at: number;
+  checks: ZapretHealthCheck[];
+}
+
+export interface ZapretHealthCheck {
+  id: string;
+  label: string;
+  domain: string;
+  route_path: string;
+  dns_result: string;
+  probe_result: string;
+  zapret_list: string;
+  recovery_action: string;
+  status: string;
+}
+
+export interface GameProfilesCatalog {
+  known: RuntimeGameProfile[];
+  detected: RuntimeGameProfile[];
+  learned: RuntimeGameProfile[];
+}
+
+export interface BackupHistory {
+  backups: BackupFileView[];
+  support_bundles: BackupFileView[];
+}
+
+export interface BackupFileView {
+  name: string;
+  path: string;
+  modified_at: number | null;
+}
+
+export interface BackupActionResult {
+  message: string;
+  path: string | null;
+  history: BackupHistory;
+}
+
+export function getOperatorSnapshot(): Promise<OperatorSnapshot> {
+  return invokeCommand<OperatorSnapshot>("operator_snapshot");
+}
+
+export function pickExecutablePath(): Promise<string | null> {
+  return invokeCommand<string | null>("pick_executable_path");
+}
+
+export function runZapretHealthChecks(customDomain?: string): Promise<ZapretHealthReport> {
+  return invokeCommand<ZapretHealthReport>("run_zapret_health_checks", { customDomain: customDomain ?? null });
+}
+
+export function updateOperatorResource(id: string): Promise<ResourceActionResult> {
+  return invokeCommand<ResourceActionResult>("update_operator_resource", { id });
+}
+
+export function updateAllOperatorResources(): Promise<ResourceActionResult> {
+  return invokeCommand<ResourceActionResult>("update_all_operator_resources");
+}
+
+export function rollbackOperatorResource(id: string): Promise<ResourceActionResult> {
+  return invokeCommand<ResourceActionResult>("rollback_operator_resource", { id });
+}
+
+export function importLocalProfileFromText(name: string, body: string): Promise<SubscriptionProfilesApplyResult> {
+  return invokeCommand<SubscriptionProfilesApplyResult>("import_local_profile_from_text", { name, body });
+}
+
+export function importLocalProfileFromPath(path: string, name?: string): Promise<SubscriptionProfilesApplyResult> {
+  return invokeCommand<SubscriptionProfilesApplyResult>("import_local_profile_from_path", { path, name: name ?? null });
+}
+
+export function importProfileDeepLink(link: string): Promise<SubscriptionProfilesApplyResult> {
+  return invokeCommand<SubscriptionProfilesApplyResult>("import_profile_deep_link", { link });
+}
+
+export function refreshAllSubscriptionProfiles(): Promise<SubscriptionProfilesApplyResult> {
+  return invokeCommand<SubscriptionProfilesApplyResult>("refresh_all_subscription_profiles");
+}
+
+export function exportBackupBundle(): Promise<BackupActionResult> {
+  return invokeCommand<BackupActionResult>("export_backup_bundle");
+}
+
+export function restoreBackupBundleFromPath(path: string): Promise<BackupActionResult> {
+  return invokeCommand<BackupActionResult>("restore_backup_bundle_from_path", { path });
+}
+
+export function exportSupportBundle(): Promise<BackupActionResult> {
+  return invokeCommand<BackupActionResult>("export_support_bundle");
+}
+
+export function openOperatorDirectory(kind: "app_data" | "runtime" | "logs" | "backups"): Promise<string> {
+  return invokeCommand<string>("open_operator_directory", { kind });
 }
