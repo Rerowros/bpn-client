@@ -80,6 +80,25 @@ This document owns manual Windows validation. Keep architecture in `docs/BADVPN_
 [ ] Logs and exported diagnostics redact secrets.
 ```
 
+## Zapret Operator Tools
+
+```text
+[ ] Native `.exe` picker fills a local override with the executable process name.
+[ ] Disabling one local override removes it from generated policy while preserving the rule for re-enable.
+[ ] Deleting one local override removes the typed rule and the legacy force-list value.
+[ ] Subscription refresh and refresh-all preserve local overrides, selected proxies, and learned game profiles.
+[ ] Connections view shows process name/path where Mihomo exposes it and can create an override from a flow.
+[ ] Policy view remains read-only for provider content and shows provider/suppressed-rule trace data.
+[ ] Operator health checks cover YouTube, Discord, OpenAI/ChatGPT, Claude, Gemini, and one custom domain without hanging connect/disconnect.
+[ ] Live logs render only redacted lines for UI, agent, Mihomo, zapret, and resource manager sources.
+[ ] Runtime YAML/source/diff viewers are read-only and redact controller secrets, subscription URLs, tokens, credentials, and username paths in exported bundles.
+[ ] Resource update stages Flowseal/geodata/list files, verifies staged content hash/shape, preserves rollback backup, and can restore the previous file.
+[ ] Manual game/app profile created from `.exe` emits process/domain/CIDR/port preview and can be disabled without deleting evidence.
+[ ] Local file import, drag-and-drop import, and `bpn://` import validate profile content before activation.
+[ ] Backup export includes settings, profile metadata, selected proxies, local overrides, and game profiles without raw subscription URLs.
+[ ] Support bundle includes redacted logs, policy summary, runtime readiness, resource versions, system/status basics, and no secrets.
+```
+
 ## Update, Repair, Rollback, Uninstall
 
 ```text
