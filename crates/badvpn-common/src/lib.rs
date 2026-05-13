@@ -20,10 +20,11 @@ pub use mihomo_config::{
     zapret_user_placeholder_hostlist, GeneratedMihomoConfig, MihomoConfigOptions,
 };
 pub use policy::{
-    compile_policy, AppRouteMode, CompiledPolicy, DnsPolicyRule, ManagedProxyGroup,
-    PolicyCompileInput, PolicyPath, PolicyRule, PolicySource, PolicyTarget, PolicyTargetKind,
-    ProxyGroupInfo, ProxyGroupResolution, ProxyNode, RouteExpectation, RoutingPolicySettings,
-    RuntimeFacts, SmartPresetSettings, SuppressedRule, ZapretCoverage,
+    compile_policy, AppRouteMode, CompiledPolicy, DnsPolicyRule, LocalOverridePath,
+    LocalOverrideRule, LocalOverrideSource, LocalOverrideTargetKind, LocalOverridesSettings,
+    ManagedProxyGroup, PolicyCompileInput, PolicyPath, PolicyRule, PolicySource, PolicyTarget,
+    PolicyTargetKind, ProxyGroupInfo, ProxyGroupResolution, ProxyNode, RouteExpectation,
+    RoutingPolicySettings, RuntimeFacts, SmartPresetSettings, SuppressedRule, ZapretCoverage,
 };
 pub use subscription::{
     decode_header_value, parse_subscription_userinfo, subscription_body_to_text,

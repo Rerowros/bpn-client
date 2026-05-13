@@ -1948,6 +1948,9 @@ fn normalize_game_profiles(profiles: Vec<RuntimeGameProfile>) -> Vec<RuntimeGame
     let mut seen = std::collections::BTreeSet::new();
     let mut normalized = Vec::new();
     for mut profile in profiles {
+        if !profile.enabled {
+            continue;
+        }
         profile.process_names = profile
             .process_names
             .into_iter()
@@ -2063,6 +2066,7 @@ fn ensure_effective_ipset_all_file(
     }
 
     let effective = lists.join("ipset-all.effective.txt");
+    let compiled_ipset = fs::read_to_string(lists.join("zapret_ipset.txt")).unwrap_or_default();
     match settings.ipset_filter.trim().to_ascii_lowercase().as_str() {
         "any" => write_file_atomically(&effective, "")?,
         "loaded" => {
@@ -2072,14 +2076,47 @@ fn ensure_effective_ipset_all_file(
             } else {
                 body
             };
-            write_file_atomically(&effective, &body)?;
+            write_file_atomically(&effective, &merge_ipset_bodies(&body, &compiled_ipset))?;
         }
         _ => write_file_atomically(
             &effective,
-            &badvpn_common::zapret_default_ipset().join("\n"),
+            &merge_ipset_bodies(
+                &badvpn_common::zapret_default_ipset().join("\n"),
+                &compiled_ipset,
+            ),
         )?,
     }
     Ok(effective)
+}
+
+fn merge_ipset_bodies(base_body: &str, compiled_body: &str) -> String {
+    let mut body = base_body.to_string();
+    let mut seen = base_body
+        .lines()
+        .filter_map(normalize_ipset_entry)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    for entry in compiled_body.lines().filter_map(normalize_ipset_entry) {
+        if !seen.insert(entry.clone()) {
+            continue;
+        }
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str(&entry);
+        body.push('\n');
+    }
+
+    body
+}
+
+fn normalize_ipset_entry(line: &str) -> Option<String> {
+    let value = line.trim().to_ascii_lowercase();
+    if value.is_empty() || value.starts_with('#') {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 fn rewrite_ipset_all_args(args: &mut [String], effective_ipset: &Path) {
@@ -3027,6 +3064,31 @@ start "zapret: general (ALT9)" /min "%BIN%winws.exe" --wf-tcp=80,443,%GameFilter
     }
 
     #[test]
+    fn disabled_manual_game_profile_is_preserved_but_not_activated() {
+        let mut request = test_request();
+        request.settings.zapret.game_bypass_mode = "manual".to_string();
+        request.settings.zapret.game_filter_mode = "udp_first".to_string();
+        request.settings.zapret.active_game_profiles = vec![RuntimeGameProfile {
+            id: "disabled-repo".to_string(),
+            title: "Disabled R.E.P.O.".to_string(),
+            process_names: vec!["REPO.exe".to_string()],
+            filter_mode: "udp_first".to_string(),
+            enabled: false,
+            ..RuntimeGameProfile::default()
+        }];
+
+        let plan = apply_game_bypass_to_request(&mut request);
+
+        assert_eq!(request.settings.zapret.game_filter, "off");
+        assert!(request.settings.zapret.active_game_profiles.is_empty());
+        assert!(request.settings.mihomo.zapret_direct_processes.is_empty());
+        assert!(plan
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("found no known or learned game process")));
+    }
+
+    #[test]
     fn smart_writes_zapret_lists_from_compiled_policy() {
         let root = std::env::temp_dir().join(format!("badvpn-policy-lists-test-{}", now_unix()));
         let components = root.join("components");
@@ -3034,6 +3096,8 @@ start "zapret: general (ALT9)" /min "%BIN%winws.exe" --wf-tcp=80,443,%GameFilter
             root: components.clone(),
             appdata_fallback: None,
         };
+        let mut routing = RoutingPolicySettings::default();
+        routing.force_zapret_cidrs = vec!["203.0.113.0/24".to_string()];
         let policy = compile_policy(PolicyCompileInput {
             mode: AppRouteMode::Smart,
             provider_rules: vec![
@@ -3047,7 +3111,7 @@ start "zapret: general (ALT9)" /min "%BIN%winws.exe" --wf-tcp=80,443,%GameFilter
                 proxies: vec!["Germany".to_string()],
             }],
             proxy_count: 1,
-            routing: RoutingPolicySettings::default(),
+            routing,
             runtime_facts: RuntimeFacts::default(),
         })
         .unwrap();
@@ -3075,6 +3139,15 @@ start "zapret: general (ALT9)" /min "%BIN%winws.exe" --wf-tcp=80,443,%GameFilter
         assert_eq!(
             fs::read_to_string(lists.join("ipset-all.txt")).unwrap(),
             "198.51.100.0/24\n"
+        );
+        let settings = RuntimeZapretSettings {
+            ipset_filter: "loaded".to_string(),
+            ..RuntimeZapretSettings::default()
+        };
+        ensure_effective_ipset_all_file(&lists, &settings).unwrap();
+        assert_eq!(
+            fs::read_to_string(lists.join("ipset-all.effective.txt")).unwrap(),
+            "198.51.100.0/24\n203.0.113.0/24\n"
         );
         let _ = fs::remove_dir_all(root);
     }
