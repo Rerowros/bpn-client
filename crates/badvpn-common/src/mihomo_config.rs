@@ -121,8 +121,20 @@ pub struct MihomoConfigOptions {
     pub tun_strict_route: bool,
     pub tun_auto_route: bool,
     pub tun_auto_detect_interface: bool,
+    pub tun_mtu: u16,
+    pub tun_dns_hijack: Vec<String>,
+    pub tun_excluded_routes: Vec<String>,
     pub dns_mode: String,
     pub dns_nameservers: Vec<String>,
+    pub dns_fake_ip_range: String,
+    pub dns_fake_ip_filter: Vec<String>,
+    pub dns_nameserver_policy: BTreeMap<String, Vec<String>>,
+    pub sniffer_enabled: bool,
+    pub sniffer_protocols: Vec<String>,
+    pub sniffer_force_domains: Vec<String>,
+    pub sniffer_skip_domains: Vec<String>,
+    pub sniffer_skip_src_cidrs: Vec<String>,
+    pub sniffer_skip_dst_cidrs: Vec<String>,
     pub zapret_direct_domains: Vec<String>,
     pub zapret_direct_cidrs: Vec<String>,
     pub zapret_direct_processes: Vec<String>,
@@ -146,11 +158,23 @@ impl Default for MihomoConfigOptions {
             tun_strict_route: true,
             tun_auto_route: true,
             tun_auto_detect_interface: true,
+            tun_mtu: 1500,
+            tun_dns_hijack: vec!["any:53".to_string(), "tcp://any:53".to_string()],
+            tun_excluded_routes: Vec::new(),
             dns_mode: "fake-ip".to_string(),
             dns_nameservers: vec![
                 "https://1.1.1.1/dns-query".to_string(),
                 "https://8.8.8.8/dns-query".to_string(),
             ],
+            dns_fake_ip_range: "198.18.0.1/16".to_string(),
+            dns_fake_ip_filter: Vec::new(),
+            dns_nameserver_policy: BTreeMap::new(),
+            sniffer_enabled: true,
+            sniffer_protocols: vec!["HTTP".to_string(), "TLS".to_string(), "QUIC".to_string()],
+            sniffer_force_domains: Vec::new(),
+            sniffer_skip_domains: Vec::new(),
+            sniffer_skip_src_cidrs: Vec::new(),
+            sniffer_skip_dst_cidrs: Vec::new(),
             zapret_direct_domains: Vec::new(),
             zapret_direct_cidrs: Vec::new(),
             zapret_direct_processes: Vec::new(),
@@ -678,6 +702,7 @@ fn overlay_mihomo_config_yaml_with_policy(
     insert_yaml(map, "secret", serde_yaml::Value::String(secret.to_string()));
     insert_yaml(map, "profile", profile_yaml());
     insert_yaml(map, "tun", tun_yaml(options));
+    insert_yaml(map, "sniffer", sniffer_yaml(options));
     insert_yaml(
         map,
         "dns",
@@ -990,17 +1015,90 @@ fn tun_yaml(options: &MihomoConfigOptions) -> serde_yaml::Value {
     insert_yaml(
         &mut map,
         "dns-hijack",
-        serde_yaml::Value::Sequence(vec![
-            serde_yaml::Value::String("any:53".to_string()),
-            serde_yaml::Value::String("tcp://any:53".to_string()),
-        ]),
+        string_sequence(&options.tun_dns_hijack),
     );
-    insert_yaml(&mut map, "mtu", serde_yaml::Value::Number(1500.into()));
+    if !options.tun_excluded_routes.is_empty() {
+        insert_yaml(
+            &mut map,
+            "route-exclude-address",
+            string_sequence(&options.tun_excluded_routes),
+        );
+    }
+    insert_yaml(
+        &mut map,
+        "mtu",
+        serde_yaml::Value::Number(options.tun_mtu.into()),
+    );
     insert_yaml(
         &mut map,
         "udp-timeout",
         serde_yaml::Value::Number(300.into()),
     );
+    serde_yaml::Value::Mapping(map)
+}
+
+fn sniffer_yaml(options: &MihomoConfigOptions) -> serde_yaml::Value {
+    let mut map = serde_yaml::Mapping::new();
+    insert_yaml(
+        &mut map,
+        "enable",
+        serde_yaml::Value::Bool(options.sniffer_enabled),
+    );
+    let mut sniff = serde_yaml::Mapping::new();
+    for protocol in &options.sniffer_protocols {
+        let protocol = protocol.trim().to_ascii_uppercase();
+        if protocol.is_empty() {
+            continue;
+        }
+        let ports = match protocol.as_str() {
+            "HTTP" => vec!["80".to_string(), "8080-8880".to_string()],
+            "TLS" | "QUIC" => vec!["443".to_string(), "8443".to_string()],
+            _ => Vec::new(),
+        };
+        let mut protocol_map = serde_yaml::Mapping::new();
+        insert_yaml(&mut protocol_map, "ports", string_sequence(&ports));
+        if protocol == "HTTP" || protocol == "TLS" {
+            insert_yaml(
+                &mut protocol_map,
+                "override-destination",
+                serde_yaml::Value::Bool(true),
+            );
+        }
+        insert_yaml(
+            &mut sniff,
+            &protocol,
+            serde_yaml::Value::Mapping(protocol_map),
+        );
+    }
+    insert_yaml(&mut map, "sniff", serde_yaml::Value::Mapping(sniff));
+    if !options.sniffer_force_domains.is_empty() {
+        insert_yaml(
+            &mut map,
+            "force-domain",
+            string_sequence(&options.sniffer_force_domains),
+        );
+    }
+    if !options.sniffer_skip_domains.is_empty() {
+        insert_yaml(
+            &mut map,
+            "skip-domain",
+            string_sequence(&options.sniffer_skip_domains),
+        );
+    }
+    if !options.sniffer_skip_src_cidrs.is_empty() {
+        insert_yaml(
+            &mut map,
+            "skip-src-address",
+            string_sequence(&options.sniffer_skip_src_cidrs),
+        );
+    }
+    if !options.sniffer_skip_dst_cidrs.is_empty() {
+        insert_yaml(
+            &mut map,
+            "skip-dst-address",
+            string_sequence(&options.sniffer_skip_dst_cidrs),
+        );
+    }
     serde_yaml::Value::Mapping(map)
 }
 
@@ -1053,12 +1151,14 @@ fn dns_yaml_base(
         insert_yaml(
             &mut map,
             "fake-ip-range",
-            serde_yaml::Value::String("198.18.0.1/16".to_string()),
+            serde_yaml::Value::String(options.dns_fake_ip_range.clone()),
         );
+        let mut fake_ip_filters = fake_ip_filter_domains.to_vec();
+        fake_ip_filters.extend(options.dns_fake_ip_filter.iter().cloned());
         insert_yaml(
             &mut map,
             "fake-ip-filter",
-            fake_ip_filter_sequence(existing, fake_ip_filter_domains),
+            fake_ip_filter_sequence(existing, &fake_ip_filters),
         );
     }
     insert_yaml(&mut map, "respect-rules", serde_yaml::Value::Bool(true));
@@ -1088,6 +1188,13 @@ fn dns_yaml_base(
             nameserver_sequence(&rule.nameservers),
         );
     }
+    for (pattern, nameservers) in &options.dns_nameserver_policy {
+        insert_yaml(
+            &mut nameserver_policy,
+            pattern,
+            nameserver_sequence(nameservers),
+        );
+    }
     if !nameserver_policy.is_empty() {
         insert_yaml(
             &mut map,
@@ -1099,6 +1206,10 @@ fn dns_yaml_base(
 }
 
 fn nameserver_sequence(values: &[String]) -> serde_yaml::Value {
+    string_sequence(values)
+}
+
+fn string_sequence(values: &[String]) -> serde_yaml::Value {
     serde_yaml::Value::Sequence(
         values
             .iter()
@@ -1171,6 +1282,7 @@ fn base_config_yaml(secret: &str, options: &MihomoConfigOptions) -> String {
 
     insert_yaml(&mut map, "profile", profile_yaml());
     insert_yaml(&mut map, "tun", tun_yaml(options));
+    insert_yaml(&mut map, "sniffer", sniffer_yaml(options));
     insert_yaml(&mut map, "dns", dns_yaml(options));
 
     serde_yaml::to_string(&serde_yaml::Value::Mapping(map)).unwrap_or_else(|_| {

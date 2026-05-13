@@ -18,7 +18,7 @@ use reqwest::header::{HeaderMap, ACCEPT, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_yaml::Value as YamlValue;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Cursor, Write};
 use std::net::TcpStream;
@@ -82,9 +82,15 @@ static CLOSED_CONNECTIONS: OnceLock<Mutex<Vec<TrackedConnection>>> = OnceLock::n
 static LAST_LIST_REFRESH_ATTEMPT: OnceLock<Mutex<u64>> = OnceLock::new();
 static LAST_MIHOMO_HEALTHY_AT: OnceLock<Mutex<u64>> = OnceLock::new();
 static LAST_PREVIEW_POLICY: OnceLock<Mutex<Option<CompiledPolicy>>> = OnceLock::new();
+static APP_STARTED_AT: OnceLock<u64> = OnceLock::new();
 
 fn state() -> &'static Mutex<AgentState> {
+    let _ = app_started_at();
     STATE.get_or_init(|| Mutex::new(AgentState::default()))
+}
+
+fn app_started_at() -> u64 {
+    *APP_STARTED_AT.get_or_init(current_unix_timestamp)
 }
 
 fn mihomo_process() -> &'static Mutex<Option<Child>> {
@@ -1346,6 +1352,7 @@ pub async fn remove_subscription_profile(
 ) -> Result<SubscriptionProfilesApplyResult, String> {
     log_event("subscription-profile", "remove requested");
     let mut store = read_persisted_subscription_profiles()?;
+    write_subscription_profiles_backup(&store, "before-remove")?;
     let active_removed = store.active_id.as_deref() == Some(id.as_str());
     let before = store.profiles.len();
     store.profiles.retain(|profile| profile.id != id);
@@ -1446,13 +1453,13 @@ struct PersistedSubscriptionProfile {
     updated_at: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubscriptionProfilesState {
     pub active_id: Option<String>,
     pub profiles: Vec<SubscriptionProfileView>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubscriptionProfileView {
     pub id: String,
     pub name: String,
@@ -1489,8 +1496,10 @@ pub struct TrackedConnection {
     pub network: String,
     pub connection_type: String,
     pub process: Option<String>,
+    pub process_path: Option<String>,
     pub rule: Option<String>,
     pub rule_payload: Option<String>,
+    pub rule_source: Option<String>,
     pub chains: Vec<String>,
     pub upload_bytes: u64,
     pub download_bytes: u64,
@@ -1604,6 +1613,13 @@ struct MihomoMetadata {
     destination_port: serde_json::Value,
     #[serde(default, deserialize_with = "deserialize_lossy_option_string")]
     process: Option<String>,
+    #[serde(
+        default,
+        rename = "processPath",
+        alias = "process_path",
+        deserialize_with = "deserialize_lossy_option_string"
+    )]
+    process_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -2379,6 +2395,1697 @@ pub async fn policy_summary() -> Result<badvpn_common::ipc::PolicySummaryRespons
     Ok(badvpn_common::ipc::PolicySummaryResponse::empty())
 }
 
+#[tauri::command]
+pub async fn operator_snapshot() -> Result<OperatorSnapshot, String> {
+    let policy = policy_summary().await.unwrap_or_else(|_| {
+        let mut empty = badvpn_common::ipc::PolicySummaryResponse::empty();
+        empty.state = "unavailable".to_string();
+        empty
+    });
+    Ok(OperatorSnapshot {
+        generated_at: current_unix_timestamp(),
+        providers: operator_provider_catalog().unwrap_or_else(|error| ProviderCatalog {
+            rule_providers: Vec::new(),
+            proxy_providers: Vec::new(),
+            update_status: format!("Provider read failed: {error}"),
+            provider_editing: "Provider editing is read-only in this implementation slice."
+                .to_string(),
+        }),
+        resources: operator_resource_catalog()?,
+        logs: runtime_log_snapshot(240),
+        config: runtime_config_snapshot()?,
+        health: zapret_health_definitions(&policy),
+        game_profiles: game_profiles_catalog(&load_app_settings()),
+        backups: backup_history_snapshot()?,
+    })
+}
+
+#[tauri::command]
+pub fn pick_executable_path() -> Result<Option<String>, String> {
+    #[cfg(not(windows))]
+    {
+        Ok(None)
+    }
+
+    #[cfg(windows)]
+    {
+        let script = r#"
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.OpenFileDialog
+$dialog.Filter = 'Windows executable (*.exe)|*.exe'
+$dialog.Multiselect = $false
+$dialog.CheckFileExists = $true
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+  [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+  Write-Output $dialog.FileName
+}
+"#;
+        let mut command = Command::new("powershell");
+        command.args(["-NoProfile", "-Sta", "-Command", script]);
+        hide_process_window(&mut command);
+        let output = command
+            .output()
+            .map_err(|error| format!("Failed to open executable picker: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "Executable picker failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if selected.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(selected))
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn run_zapret_health_checks(
+    custom_domain: Option<String>,
+) -> Result<ZapretHealthReport, String> {
+    let policy = policy_summary().await.unwrap_or_else(|_| {
+        let mut empty = badvpn_common::ipc::PolicySummaryResponse::empty();
+        empty.state = "unavailable".to_string();
+        empty
+    });
+    let settings = load_app_settings();
+    let mut checks = zapret_health_definitions(&policy).checks;
+    if let Some(domain) = custom_domain
+        .as_deref()
+        .map(normalize_check_domain)
+        .filter(|value| !value.is_empty())
+    {
+        checks.push(ZapretHealthCheck {
+            id: "custom".to_string(),
+            label: "Custom domain".to_string(),
+            domain,
+            route_path: "unknown".to_string(),
+            dns_result: "pending".to_string(),
+            probe_result: "pending".to_string(),
+            zapret_list: "pending".to_string(),
+            recovery_action: "Compare the route path with the intended local override.".to_string(),
+            status: "warning".to_string(),
+        });
+    }
+
+    let hostlist = read_hostlist_values().unwrap_or_default();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .user_agent("BadVpn/0.1.0 diagnostics")
+        .build()
+        .map_err(|error| format!("Failed to create diagnostics HTTP client: {error}"))?;
+
+    for check in &mut checks {
+        check.route_path = route_path_for_domain(&policy, &check.domain);
+        check.zapret_list = if hostlist_contains_domain(&hostlist, &check.domain) {
+            "present".to_string()
+        } else if check.route_path == "zapret" {
+            "missing".to_string()
+        } else {
+            "not-required".to_string()
+        };
+        check.dns_result = dns_answer_class(&check.domain).await;
+        check.probe_result = safe_https_probe(&client, &check.domain).await;
+        check.status = if check.route_path == "zapret"
+            && settings.core.route_mode == RouteMode::Smart
+            && check.zapret_list == "missing"
+        {
+            "warning".to_string()
+        } else if check.probe_result.starts_with("ok") || check.probe_result == "skipped" {
+            "ok".to_string()
+        } else {
+            "warning".to_string()
+        };
+    }
+
+    Ok(ZapretHealthReport {
+        checked_at: current_unix_timestamp(),
+        checks,
+    })
+}
+
+#[tauri::command]
+pub async fn update_operator_resource(id: String) -> Result<ResourceActionResult, String> {
+    let id = id.trim();
+    if id == "runtime-components" {
+        let result = update_runtime_components().await?;
+        return Ok(ResourceActionResult {
+            changed: result.changed,
+            message: result.messages.join(" "),
+            resources: operator_resource_catalog()?,
+        });
+    }
+    let def = operator_resource_defs()
+        .into_iter()
+        .find(|resource| resource.id == id)
+        .ok_or_else(|| "Unknown resource.".to_string())?;
+    if def.url.is_none() {
+        return Err("This resource is visible but does not have a safe updater yet.".to_string());
+    }
+    update_text_resource(&def).await?;
+    Ok(ResourceActionResult {
+        changed: true,
+        message: format!("{} updated with staged verification and backup.", def.label),
+        resources: operator_resource_catalog()?,
+    })
+}
+
+#[tauri::command]
+pub async fn update_all_operator_resources() -> Result<ResourceActionResult, String> {
+    let mut changed = false;
+    let mut messages = Vec::new();
+    for def in operator_resource_defs()
+        .into_iter()
+        .filter(|resource| resource.url.is_some())
+    {
+        match update_text_resource(&def).await {
+            Ok(()) => {
+                changed = true;
+                messages.push(format!("{} updated", def.label));
+            }
+            Err(error) => messages.push(format!("{} failed: {error}", def.label)),
+        }
+    }
+    Ok(ResourceActionResult {
+        changed,
+        message: messages.join("; "),
+        resources: operator_resource_catalog()?,
+    })
+}
+
+#[tauri::command]
+pub fn rollback_operator_resource(id: String) -> Result<ResourceActionResult, String> {
+    let def = operator_resource_defs()
+        .into_iter()
+        .find(|resource| resource.id == id.trim())
+        .ok_or_else(|| "Unknown resource.".to_string())?;
+    let backup = newest_resource_backup(&def.path)
+        .ok_or_else(|| "No rollback backup is available for this resource.".to_string())?;
+    fs::copy(&backup, &def.path).map_err(|error| {
+        format!(
+            "Failed to restore resource {} from {}: {error}",
+            def.label,
+            backup.display()
+        )
+    })?;
+    Ok(ResourceActionResult {
+        changed: true,
+        message: format!("{} restored from backup.", def.label),
+        resources: operator_resource_catalog()?,
+    })
+}
+
+#[tauri::command]
+pub async fn import_local_profile_from_text(
+    name: String,
+    body: String,
+) -> Result<SubscriptionProfilesApplyResult, String> {
+    import_profile_body(name.trim(), None, &body).await
+}
+
+#[tauri::command]
+pub async fn import_local_profile_from_path(
+    path: String,
+    name: Option<String>,
+) -> Result<SubscriptionProfilesApplyResult, String> {
+    let path = PathBuf::from(path.trim());
+    let body = fs::read_to_string(&path)
+        .map_err(|error| format!("Failed to read local profile {}: {error}", path.display()))?;
+    let display_name = name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            path.file_stem()
+                .and_then(|value| value.to_str())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| "Local profile".to_string());
+    import_profile_body(&display_name, Some(&path), &body).await
+}
+
+#[tauri::command]
+pub async fn import_profile_deep_link(
+    link: String,
+) -> Result<SubscriptionProfilesApplyResult, String> {
+    let parsed = url::Url::parse(link.trim())
+        .map_err(|error| format!("Invalid bpn:// import link: {error}"))?;
+    if parsed.scheme() != "bpn" {
+        return Err("Deep link must use the bpn:// scheme.".to_string());
+    }
+    let pairs = parsed
+        .query_pairs()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect::<BTreeMap<_, _>>();
+    if let Some(url) = pairs.get("url") {
+        let imported = fetch_subscription(url).await?;
+        write_mihomo_config(&imported.body)?;
+        persist_subscription_state_with_body(&imported.subscription, Some(&imported.body))?;
+        let state = apply_active_subscription_state(
+            imported.subscription,
+            Some("Subscription imported from bpn:// link.".to_string()),
+        )?;
+        return Ok(SubscriptionProfilesApplyResult {
+            profiles: build_subscription_profiles_state()?,
+            state,
+            message: "Deep link subscription imported.".to_string(),
+        });
+    }
+    if let Some(data) = pairs.get("data") {
+        let decoded = general_purpose::STANDARD
+            .decode(data)
+            .map_err(|error| format!("Invalid deep link profile payload: {error}"))?;
+        let body = String::from_utf8(decoded)
+            .map_err(|error| format!("Deep link profile payload is not UTF-8: {error}"))?;
+        return import_profile_body(
+            pairs
+                .get("name")
+                .map(String::as_str)
+                .unwrap_or("Deep link profile"),
+            None,
+            &body,
+        )
+        .await;
+    }
+    Err("bpn:// import link must include url= or data=.".to_string())
+}
+
+#[tauri::command]
+pub async fn refresh_all_subscription_profiles() -> Result<SubscriptionProfilesApplyResult, String>
+{
+    let mut store = read_persisted_subscription_profiles()?;
+    let mut refreshed = 0_usize;
+    let mut failed = 0_usize;
+    for profile in &mut store.profiles {
+        let Some(url) = profile.subscription.url.clone() else {
+            failed += 1;
+            continue;
+        };
+        match fetch_subscription(&url).await {
+            Ok(imported) => {
+                profile.subscription = imported.subscription;
+                profile.protected_url = Some(protect_secret(&url)?);
+                profile.protected_body = Some(protect_secret(&imported.body)?);
+                profile.updated_at = current_unix_timestamp();
+                refreshed += 1;
+            }
+            Err(error) => {
+                log_event(
+                    "subscription-profile",
+                    format!(
+                        "refresh-all preserved cached profile id={} after failure: {error}",
+                        profile.id
+                    ),
+                );
+                failed += 1;
+            }
+        }
+    }
+    write_persisted_subscription_profiles(&store)?;
+    if let Some(active_id) = store.active_id.as_deref() {
+        if let Some(active) = store
+            .profiles
+            .iter()
+            .find(|profile| profile.id == active_id)
+        {
+            persist_subscription_state_with_body(
+                &active.subscription,
+                active
+                    .protected_body
+                    .as_deref()
+                    .and_then(|value| unprotect_secret(value).ok())
+                    .as_deref(),
+            )?;
+        }
+    }
+    let state = status().await?;
+    Ok(SubscriptionProfilesApplyResult {
+        profiles: build_subscription_profiles_state()?,
+        state,
+        message: format!("{refreshed} profile(s) refreshed; {failed} preserved from cache."),
+    })
+}
+
+#[tauri::command]
+pub fn export_backup_bundle() -> Result<BackupActionResult, String> {
+    let snapshot = BackupBundle {
+        schema: 1,
+        generated_at: current_unix_timestamp(),
+        settings: load_app_settings(),
+        subscription_profiles: build_subscription_profiles_state()?,
+        proxy_selections: read_proxy_selections().unwrap_or_default(),
+    };
+    let dir = data_dir()?.join("backups");
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("Failed to create backup directory: {error}"))?;
+    let path = dir.join(format!("badvpn-backup-{}.json", snapshot.generated_at));
+    let content = serde_json::to_string_pretty(&snapshot)
+        .map_err(|error| format!("Failed to serialize backup: {error}"))?;
+    fs::write(&path, content)
+        .map_err(|error| format!("Failed to write backup {}: {error}", path.display()))?;
+    Ok(BackupActionResult {
+        message: format!("Backup exported to {}.", redact_path(&path)),
+        path: Some(path.to_string_lossy().to_string()),
+        history: backup_history_snapshot()?,
+    })
+}
+
+#[tauri::command]
+pub fn restore_backup_bundle_from_path(path: String) -> Result<BackupActionResult, String> {
+    let path = PathBuf::from(path.trim());
+    let content = fs::read_to_string(&path)
+        .map_err(|error| format!("Failed to read backup {}: {error}", path.display()))?;
+    let backup = serde_json::from_str::<BackupBundle>(&content)
+        .map_err(|error| format!("Backup schema validation failed: {error}"))?;
+    if backup.schema != 1 {
+        return Err("Unsupported backup schema.".to_string());
+    }
+    write_settings_to_path(&settings_file_path()?, &backup.settings)?;
+    if !backup.proxy_selections.is_empty() {
+        let proxy_path = proxy_selections_file_path()?;
+        if let Some(parent) = proxy_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("Failed to create proxy selection directory: {error}"))?;
+        }
+        fs::write(
+            &proxy_path,
+            serde_json::to_string_pretty(&backup.proxy_selections)
+                .map_err(|error| format!("Failed to serialize proxy selections: {error}"))?,
+        )
+        .map_err(|error| format!("Failed to restore proxy selections: {error}"))?;
+    }
+    Ok(BackupActionResult {
+        message: "Backup settings restored. Reconnect to apply runtime settings.".to_string(),
+        path: Some(path.to_string_lossy().to_string()),
+        history: backup_history_snapshot()?,
+    })
+}
+
+#[tauri::command]
+pub fn export_support_bundle() -> Result<BackupActionResult, String> {
+    let dir = data_dir()?.join("support-bundles");
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("Failed to create support bundle directory: {error}"))?;
+    let path = dir.join(format!("badvpn-support-{}.txt", current_unix_timestamp()));
+    let snapshot = operator_snapshot_blocking()?;
+    let body = redacted_support_bundle_text(&snapshot);
+    fs::write(&path, body)
+        .map_err(|error| format!("Failed to write support bundle {}: {error}", path.display()))?;
+    Ok(BackupActionResult {
+        message: format!("Support bundle exported to {}.", redact_path(&path)),
+        path: Some(path.to_string_lossy().to_string()),
+        history: backup_history_snapshot()?,
+    })
+}
+
+#[tauri::command]
+pub fn open_operator_directory(kind: String) -> Result<String, String> {
+    let path = match kind.trim() {
+        "app_data" => data_dir()?,
+        "runtime" => programdata_dir()?,
+        "logs" => data_dir()?.join("logs"),
+        "backups" => data_dir()?.join("backups"),
+        _ => return Err("Unknown directory kind.".to_string()),
+    };
+    fs::create_dir_all(&path)
+        .map_err(|error| format!("Failed to create directory {}: {error}", path.display()))?;
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("explorer");
+        command.arg(&path);
+        hide_process_window(&mut command);
+        let _ = command
+            .spawn()
+            .map_err(|error| format!("Failed to open directory {}: {error}", path.display()))?;
+    }
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OperatorSnapshot {
+    pub generated_at: u64,
+    pub providers: ProviderCatalog,
+    pub resources: ResourceCatalog,
+    pub logs: RuntimeLogSnapshot,
+    pub config: RuntimeConfigSnapshot,
+    pub health: ZapretHealthReport,
+    pub game_profiles: GameProfilesCatalog,
+    pub backups: BackupHistory,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderCatalog {
+    pub rule_providers: Vec<ProviderView>,
+    pub proxy_providers: Vec<ProviderView>,
+    pub update_status: String,
+    pub provider_editing: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderView {
+    pub name: String,
+    pub provider_type: String,
+    pub behavior: String,
+    pub path: Option<String>,
+    pub url_redacted: Option<String>,
+    pub interval_seconds: Option<u64>,
+    pub vehicle: Option<String>,
+    pub health_check: Option<String>,
+    pub consumed_by_bpn: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResourceCatalog {
+    pub resources: Vec<OperatorResource>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OperatorResource {
+    pub id: String,
+    pub label: String,
+    pub kind: String,
+    pub path: String,
+    pub installed: bool,
+    pub version: Option<String>,
+    pub last_modified: Option<u64>,
+    pub source: String,
+    pub update_supported: bool,
+    pub rollback_available: bool,
+    pub verification_status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResourceActionResult {
+    pub changed: bool,
+    pub message: String,
+    pub resources: ResourceCatalog,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeLogSnapshot {
+    pub sources: Vec<RuntimeLogSource>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeLogSource {
+    pub id: String,
+    pub label: String,
+    pub path: String,
+    pub lines: Vec<RuntimeLogLine>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeLogLine {
+    pub source: String,
+    pub level: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeConfigSnapshot {
+    pub source_profile: RedactedTextArtifact,
+    pub runtime_yaml: RedactedTextArtifact,
+    pub diff: RedactedTextArtifact,
+    pub read_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RedactedTextArtifact {
+    pub label: String,
+    pub path: Option<String>,
+    pub text: String,
+    pub line_count: usize,
+    pub redacted: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ZapretHealthReport {
+    pub checked_at: u64,
+    pub checks: Vec<ZapretHealthCheck>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ZapretHealthCheck {
+    pub id: String,
+    pub label: String,
+    pub domain: String,
+    pub route_path: String,
+    pub dns_result: String,
+    pub probe_result: String,
+    pub zapret_list: String,
+    pub recovery_action: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GameProfilesCatalog {
+    pub known: Vec<RuntimeGameProfile>,
+    pub detected: Vec<RuntimeGameProfile>,
+    pub learned: Vec<RuntimeGameProfile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BackupBundle {
+    schema: u16,
+    generated_at: u64,
+    settings: AppSettings,
+    subscription_profiles: SubscriptionProfilesState,
+    proxy_selections: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BackupHistory {
+    pub backups: Vec<BackupFileView>,
+    pub support_bundles: Vec<BackupFileView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BackupFileView {
+    pub name: String,
+    pub path: String,
+    pub modified_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BackupActionResult {
+    pub message: String,
+    pub path: Option<String>,
+    pub history: BackupHistory,
+}
+
+#[derive(Debug, Clone)]
+struct OperatorResourceDef {
+    id: &'static str,
+    label: &'static str,
+    kind: &'static str,
+    path: PathBuf,
+    source: &'static str,
+    url: Option<&'static str>,
+    min_lines: usize,
+}
+
+fn operator_snapshot_blocking() -> Result<OperatorSnapshot, String> {
+    let policy = last_preview_policy()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .map(|policy| {
+            let mut summary: badvpn_common::ipc::PolicySummaryResponse = (&policy).into();
+            summary.source = "import_preview".to_string();
+            summary
+        })
+        .unwrap_or_else(badvpn_common::ipc::PolicySummaryResponse::empty);
+    Ok(OperatorSnapshot {
+        generated_at: current_unix_timestamp(),
+        providers: operator_provider_catalog().unwrap_or_else(|error| ProviderCatalog {
+            rule_providers: Vec::new(),
+            proxy_providers: Vec::new(),
+            update_status: format!("Provider read failed: {error}"),
+            provider_editing: "Provider editing is read-only in this implementation slice."
+                .to_string(),
+        }),
+        resources: operator_resource_catalog()?,
+        logs: runtime_log_snapshot(240),
+        config: runtime_config_snapshot()?,
+        health: zapret_health_definitions(&policy),
+        game_profiles: game_profiles_catalog(&load_app_settings()),
+        backups: backup_history_snapshot()?,
+    })
+}
+
+fn operator_provider_catalog() -> Result<ProviderCatalog, String> {
+    let path = active_mihomo_config_path()?;
+    let content = fs::read_to_string(&path)
+        .map_err(|error| format!("Failed to read runtime config: {error}"))?;
+    let yaml = serde_yaml::from_str::<YamlValue>(&content)
+        .map_err(|error| format!("Failed to parse runtime config: {error}"))?;
+    let rule_providers = provider_map_to_views(&yaml, "rule-providers");
+    let proxy_providers = provider_map_to_views(&yaml, "proxy-providers");
+    Ok(ProviderCatalog {
+        update_status: if rule_providers.is_empty() && proxy_providers.is_empty() {
+            "No rule-providers or proxy-providers are present in the generated runtime config."
+                .to_string()
+        } else {
+            "Providers are shown read-only; manual provider update waits for validated rollback."
+                .to_string()
+        },
+        provider_editing:
+            "Direct provider content editing is disabled in this implementation slice.".to_string(),
+        rule_providers,
+        proxy_providers,
+    })
+}
+
+fn provider_map_to_views(yaml: &YamlValue, key: &str) -> Vec<ProviderView> {
+    yaml.get(key)
+        .and_then(YamlValue::as_mapping)
+        .map(|map| {
+            map.iter()
+                .filter_map(|(name, value)| {
+                    let name = name.as_str()?.to_string();
+                    let url = value.get("url").and_then(YamlValue::as_str).map(redact_url);
+                    let path = value
+                        .get("path")
+                        .and_then(YamlValue::as_str)
+                        .map(redact_path_string);
+                    let provider_type = value
+                        .get("type")
+                        .and_then(YamlValue::as_str)
+                        .unwrap_or("http")
+                        .to_string();
+                    let behavior = value
+                        .get("behavior")
+                        .and_then(YamlValue::as_str)
+                        .unwrap_or("domain")
+                        .to_string();
+                    let vehicle = value
+                        .get("format")
+                        .and_then(YamlValue::as_str)
+                        .or_else(|| value.get("vehicle").and_then(YamlValue::as_str))
+                        .map(ToOwned::to_owned);
+                    let interval_seconds = value.get("interval").and_then(YamlValue::as_u64);
+                    let health_check = value.get("health-check").map(|health| {
+                        redact_sensitive_text(&serde_yaml::to_string(health).unwrap_or_default())
+                    });
+                    let lower_name = name.to_ascii_lowercase();
+                    let consumed_by_bpn = ["badvpn", "zapret", "discord", "youtube", "google"]
+                        .iter()
+                        .any(|needle| lower_name.contains(needle));
+                    Some(ProviderView {
+                        name,
+                        provider_type,
+                        behavior,
+                        path,
+                        url_redacted: url,
+                        interval_seconds,
+                        vehicle,
+                        health_check,
+                        consumed_by_bpn,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn operator_resource_catalog() -> Result<ResourceCatalog, String> {
+    let mut resources = Vec::new();
+    for def in operator_resource_defs() {
+        let installed = def.path.exists();
+        let metadata = fs::metadata(&def.path).ok();
+        let last_modified = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs());
+        let version = if def.id == "flowseal-version" {
+            fs::read_to_string(&def.path)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        } else if def.id == "runtime-components" {
+            Some(format!(
+                "mihomo={}, zapret={}",
+                local_component_version("mihomo").unwrap_or_else(|| "missing".to_string()),
+                local_component_version("zapret").unwrap_or_else(|| "missing".to_string())
+            ))
+        } else {
+            metadata
+                .as_ref()
+                .map(|metadata| format!("{} bytes", metadata.len()))
+        };
+        let verification_status = if installed {
+            let body = fs::read_to_string(&def.path).unwrap_or_default();
+            format!("content-hash={}", stable_config_hash(&body))
+        } else if def.url.is_some() {
+            "missing; update can stage a checked copy".to_string()
+        } else {
+            "not installed".to_string()
+        };
+        resources.push(OperatorResource {
+            id: def.id.to_string(),
+            label: def.label.to_string(),
+            kind: def.kind.to_string(),
+            path: redact_path(&def.path),
+            installed,
+            version,
+            last_modified,
+            source: def.source.to_string(),
+            update_supported: def.url.is_some() || def.id == "runtime-components",
+            rollback_available: newest_resource_backup(&def.path).is_some(),
+            verification_status,
+        });
+    }
+    Ok(ResourceCatalog { resources })
+}
+
+fn operator_resource_defs() -> Vec<OperatorResourceDef> {
+    let lists = zapret_lists_dir().unwrap_or_else(|_| PathBuf::from("zapret/lists"));
+    let data = data_dir().unwrap_or_else(|_| PathBuf::from("BadVpn"));
+    vec![
+        OperatorResourceDef {
+            id: "runtime-components",
+            label: "Mihomo + zapret binaries",
+            kind: "runtime",
+            path: data.join("components"),
+            source: "BPN component/runtime updater",
+            url: None,
+            min_lines: 0,
+        },
+        OperatorResourceDef {
+            id: "flowseal-version",
+            label: "Flowseal version",
+            kind: "zapret_list",
+            path: lists.join("flowseal-version.txt"),
+            source: FLOWSEAL_VERSION_URL,
+            url: Some(FLOWSEAL_VERSION_URL),
+            min_lines: 1,
+        },
+        OperatorResourceDef {
+            id: "flowseal-general",
+            label: "Flowseal general hostlist",
+            kind: "zapret_list",
+            path: lists.join("list-general.txt"),
+            source: FLOWSEAL_LIST_GENERAL_URL,
+            url: Some(FLOWSEAL_LIST_GENERAL_URL),
+            min_lines: 20,
+        },
+        OperatorResourceDef {
+            id: "flowseal-google",
+            label: "Flowseal Google hostlist",
+            kind: "zapret_list",
+            path: lists.join("list-google.txt"),
+            source: FLOWSEAL_LIST_GOOGLE_URL,
+            url: Some(FLOWSEAL_LIST_GOOGLE_URL),
+            min_lines: 5,
+        },
+        OperatorResourceDef {
+            id: "flowseal-exclude",
+            label: "Flowseal exclude hostlist",
+            kind: "zapret_list",
+            path: lists.join("list-exclude.txt"),
+            source: FLOWSEAL_LIST_EXCLUDE_URL,
+            url: Some(FLOWSEAL_LIST_EXCLUDE_URL),
+            min_lines: 1,
+        },
+        OperatorResourceDef {
+            id: "flowseal-ipset",
+            label: "Flowseal ipset",
+            kind: "zapret_ipset",
+            path: lists.join("ipset-service.txt"),
+            source: FLOWSEAL_IPSET_URL,
+            url: Some(FLOWSEAL_IPSET_URL),
+            min_lines: 5,
+        },
+        OperatorResourceDef {
+            id: "flowseal-ipset-exclude",
+            label: "Flowseal ipset exclude",
+            kind: "zapret_ipset",
+            path: lists.join("ipset-exclude.txt"),
+            source: FLOWSEAL_IPSET_EXCLUDE_URL,
+            url: Some(FLOWSEAL_IPSET_EXCLUDE_URL),
+            min_lines: 1,
+        },
+        OperatorResourceDef {
+            id: "geosite",
+            label: "geosite database",
+            kind: "geodata",
+            path: data.join("components").join("mihomo").join("geosite.dat"),
+            source: "Mihomo geodata path",
+            url: None,
+            min_lines: 0,
+        },
+        OperatorResourceDef {
+            id: "geoip",
+            label: "geoip database",
+            kind: "geodata",
+            path: data.join("components").join("mihomo").join("geoip.dat"),
+            source: "Mihomo geodata path",
+            url: None,
+            min_lines: 0,
+        },
+        OperatorResourceDef {
+            id: "mmdb",
+            label: "Country MMDB",
+            kind: "geodata",
+            path: data.join("components").join("mihomo").join("Country.mmdb"),
+            source: "Mihomo MMDB path",
+            url: None,
+            min_lines: 0,
+        },
+        OperatorResourceDef {
+            id: "asn",
+            label: "ASN database",
+            kind: "geodata",
+            path: data
+                .join("components")
+                .join("mihomo")
+                .join("GeoLite2-ASN.mmdb"),
+            source: "Optional ASN database path",
+            url: None,
+            min_lines: 0,
+        },
+        OperatorResourceDef {
+            id: "bpn-curated",
+            label: "BPN curated rules",
+            kind: "bpn_rules",
+            path: data.join("rules").join("bpn-curated.yaml"),
+            source: "BPN managed rules",
+            url: None,
+            min_lines: 0,
+        },
+    ]
+}
+
+async fn update_text_resource(def: &OperatorResourceDef) -> Result<(), String> {
+    let url = def
+        .url
+        .ok_or_else(|| "Resource has no updater URL.".to_string())?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .user_agent("BadVpn/0.1.0 resource-manager")
+        .build()
+        .map_err(|error| format!("Failed to create resource HTTP client: {error}"))?;
+    let body = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| format!("Failed to download {}: {error}", def.label))?
+        .error_for_status()
+        .map_err(|error| {
+            format!(
+                "Resource endpoint returned an error for {}: {error}",
+                def.label
+            )
+        })?
+        .text()
+        .await
+        .map_err(|error| format!("Failed to read {}: {error}", def.label))?;
+    let line_count = body.lines().filter(|line| !line.trim().is_empty()).count();
+    if line_count < def.min_lines {
+        return Err(format!(
+            "{} failed structural verification: expected at least {} non-empty lines, got {line_count}.",
+            def.label, def.min_lines
+        ));
+    }
+    if let Some(parent) = def.path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create resource directory: {error}"))?;
+    }
+    let staged = def.path.with_extension("next");
+    fs::write(&staged, &body).map_err(|error| format!("Failed to stage {}: {error}", def.label))?;
+    let staged_body = fs::read_to_string(&staged)
+        .map_err(|error| format!("Failed to verify staged {}: {error}", def.label))?;
+    let digest = stable_config_hash(&staged_body);
+    if digest != stable_config_hash(&body) {
+        let _ = fs::remove_file(&staged);
+        return Err(format!("{} staged digest mismatch.", def.label));
+    }
+    if def.path.exists() {
+        let backup = def.path.with_file_name(format!(
+            "{}.backup.{}",
+            def.path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or(def.id),
+            current_unix_timestamp()
+        ));
+        fs::copy(&def.path, &backup).map_err(|error| {
+            format!(
+                "Failed to preserve previous resource {}: {error}",
+                def.path.display()
+            )
+        })?;
+    }
+    fs::copy(&staged, &def.path)
+        .map_err(|error| format!("Failed to activate {}: {error}", def.label))?;
+    let _ = fs::remove_file(&staged);
+    fs::write(def.path.with_extension("hash"), digest)
+        .map_err(|error| format!("Failed to write resource digest: {error}"))?;
+    Ok(())
+}
+
+fn newest_resource_backup(path: &Path) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    let file = path.file_name()?.to_string_lossy().to_string();
+    let mut backups = fs::read_dir(parent)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|candidate| {
+            candidate
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.starts_with(&format!("{file}.backup.")))
+        })
+        .collect::<Vec<_>>();
+    backups.sort();
+    backups.pop()
+}
+
+fn runtime_log_snapshot(max_lines: usize) -> RuntimeLogSnapshot {
+    let sources = vec![
+        ("app", "BPN Client", app_log_path()),
+        (
+            "agent",
+            "badvpn-agent",
+            Ok(programdata_dir()
+                .unwrap_or_else(|_| PathBuf::from("BadVpn"))
+                .join("logs")
+                .join("badvpn-agent.log")),
+        ),
+        (
+            "mihomo",
+            "Mihomo",
+            Ok(data_dir()
+                .unwrap_or_else(|_| PathBuf::from("BadVpn"))
+                .join("logs")
+                .join("mihomo.log")),
+        ),
+        (
+            "zapret",
+            "zapret/winws",
+            Ok(data_dir()
+                .unwrap_or_else(|_| PathBuf::from("BadVpn"))
+                .join("logs")
+                .join("zapret.log")),
+        ),
+    ];
+    RuntimeLogSnapshot {
+        sources: sources
+            .into_iter()
+            .map(|(id, label, path)| match path {
+                Ok(path) => RuntimeLogSource {
+                    id: id.to_string(),
+                    label: label.to_string(),
+                    path: redact_path(&path),
+                    lines: read_redacted_log_lines(id, &path, max_lines).unwrap_or_default(),
+                    error: if path.exists() {
+                        None
+                    } else {
+                        Some("Log file is not present yet.".to_string())
+                    },
+                },
+                Err(error) => RuntimeLogSource {
+                    id: id.to_string(),
+                    label: label.to_string(),
+                    path: String::new(),
+                    lines: Vec::new(),
+                    error: Some(error),
+                },
+            })
+            .collect(),
+    }
+}
+
+fn read_redacted_log_lines(
+    source: &str,
+    path: &Path,
+    max_lines: usize,
+) -> Result<Vec<RuntimeLogLine>, String> {
+    let content = fs::read_to_string(path)
+        .map_err(|error| format!("Failed to read log {}: {error}", path.display()))?;
+    let mut lines = content
+        .lines()
+        .rev()
+        .take(max_lines)
+        .map(|line| {
+            let text = redact_sensitive_text(line);
+            RuntimeLogLine {
+                source: source.to_string(),
+                level: classify_log_level(&text),
+                text,
+            }
+        })
+        .collect::<Vec<_>>();
+    lines.reverse();
+    Ok(lines)
+}
+
+fn classify_log_level(line: &str) -> String {
+    let lower = line.to_ascii_lowercase();
+    if lower.contains(" error") || lower.contains("[error]") || lower.contains("failed") {
+        "error".to_string()
+    } else if lower.contains(" warn") || lower.contains("[warn]") || lower.contains("warning") {
+        "warning".to_string()
+    } else if lower.contains(" debug") || lower.contains("[debug]") {
+        "debug".to_string()
+    } else {
+        "info".to_string()
+    }
+}
+
+fn runtime_config_snapshot() -> Result<RuntimeConfigSnapshot, String> {
+    let source_body =
+        active_persisted_subscription_profile_body().or_else(existing_mihomo_config_profile_body);
+    let source_profile = text_artifact(
+        "Source subscription profile",
+        None,
+        source_body.as_deref(),
+        source_body
+            .is_none()
+            .then_some("No cached source profile body is available."),
+    );
+    let runtime_path = active_mihomo_config_path().ok();
+    let runtime_body = runtime_path
+        .as_ref()
+        .and_then(|path| fs::read_to_string(path).ok());
+    let runtime_yaml = text_artifact(
+        "Generated runtime YAML",
+        runtime_path.as_deref(),
+        runtime_body.as_deref(),
+        runtime_body
+            .is_none()
+            .then_some("Generated runtime YAML is not present yet."),
+    );
+    let diff_text = match (source_body.as_deref(), runtime_body.as_deref()) {
+        (Some(source), Some(runtime)) => simple_redacted_diff(source, runtime),
+        _ => "Diff is available after both source and runtime YAML exist.".to_string(),
+    };
+    Ok(RuntimeConfigSnapshot {
+        source_profile,
+        runtime_yaml,
+        diff: RedactedTextArtifact {
+            label: "Source -> runtime diff".to_string(),
+            path: None,
+            line_count: diff_text.lines().count(),
+            text: diff_text,
+            redacted: true,
+            error: None,
+        },
+        read_only: true,
+    })
+}
+
+fn text_artifact(
+    label: &str,
+    path: Option<&Path>,
+    text: Option<&str>,
+    error: Option<&str>,
+) -> RedactedTextArtifact {
+    let redacted = text.map(redact_sensitive_text).unwrap_or_default();
+    RedactedTextArtifact {
+        label: label.to_string(),
+        path: path.map(redact_path),
+        line_count: redacted.lines().count(),
+        text: redacted,
+        redacted: true,
+        error: error.map(ToOwned::to_owned),
+    }
+}
+
+fn simple_redacted_diff(source: &str, runtime: &str) -> String {
+    let source = redact_sensitive_text(source);
+    let runtime = redact_sensitive_text(runtime);
+    let source_lines = source.lines().collect::<BTreeSet<_>>();
+    let runtime_lines = runtime.lines().collect::<BTreeSet<_>>();
+    let mut out = Vec::new();
+    out.push("# BPN overlay changes".to_string());
+    for line in runtime_lines.difference(&source_lines).take(300) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        out.push(format!("+ {line}"));
+    }
+    out.push("# Provider/source lines not present in runtime".to_string());
+    for line in source_lines.difference(&runtime_lines).take(120) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        out.push(format!("- {line}"));
+    }
+    if out.len() <= 2 {
+        out.push("No line-level differences detected after redaction.".to_string());
+    }
+    out.join("\n")
+}
+
+fn zapret_health_definitions(
+    policy: &badvpn_common::ipc::PolicySummaryResponse,
+) -> ZapretHealthReport {
+    let mut checks = vec![
+        health_definition("youtube", "YouTube", "youtube.com"),
+        health_definition("discord", "Discord voice/CDN", "discord.com"),
+        health_definition("openai", "ChatGPT/OpenAI", "chatgpt.com"),
+        health_definition("claude", "Claude", "claude.ai"),
+        health_definition("gemini", "Gemini", "gemini.google.com"),
+    ];
+    for check in &mut checks {
+        check.route_path = route_path_for_domain(policy, &check.domain);
+        check.zapret_list = "not-checked".to_string();
+        check.dns_result = "not-run".to_string();
+        check.probe_result = "not-run".to_string();
+    }
+    ZapretHealthReport {
+        checked_at: current_unix_timestamp(),
+        checks,
+    }
+}
+
+fn health_definition(id: &str, label: &str, domain: &str) -> ZapretHealthCheck {
+    ZapretHealthCheck {
+        id: id.to_string(),
+        label: label.to_string(),
+        domain: domain.to_string(),
+        route_path: "unknown".to_string(),
+        dns_result: "not-run".to_string(),
+        probe_result: "not-run".to_string(),
+        zapret_list: "not-run".to_string(),
+        recovery_action: "Run diagnostics, refresh Flowseal lists, then reconnect Smart mode."
+            .to_string(),
+        status: "idle".to_string(),
+    }
+}
+
+fn route_path_for_domain(
+    policy: &badvpn_common::ipc::PolicySummaryResponse,
+    domain: &str,
+) -> String {
+    let needle = domain.to_ascii_lowercase();
+    policy
+        .policy_rules
+        .iter()
+        .find(|rule| {
+            let value = rule.target_value.to_ascii_lowercase();
+            needle == value || needle.ends_with(&format!(".{value}"))
+        })
+        .map(|rule| {
+            if rule.path.contains("ZapretDirect") {
+                "zapret"
+            } else if rule.path.contains("VpnProxy") {
+                "vpn"
+            } else if rule.path.contains("DirectSafe") {
+                "direct"
+            } else if rule.path.contains("Reject") {
+                "blocked"
+            } else {
+                "unknown"
+            }
+            .to_string()
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn read_hostlist_values() -> Result<Vec<String>, String> {
+    let mut values = Vec::new();
+    for file in [
+        zapret_lists_dir()?.join("list-general.txt"),
+        zapret_lists_dir()?.join("list-google.txt"),
+        zapret_lists_dir()?.join("zapret_hostlist.txt"),
+    ] {
+        if let Ok(content) = fs::read_to_string(file) {
+            values.extend(
+                content
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                    .map(|line| line.trim_start_matches("+.").to_ascii_lowercase()),
+            );
+        }
+    }
+    Ok(values)
+}
+
+fn hostlist_contains_domain(values: &[String], domain: &str) -> bool {
+    let domain = domain.to_ascii_lowercase();
+    values
+        .iter()
+        .any(|value| domain == *value || domain.ends_with(&format!(".{value}")))
+}
+
+async fn dns_answer_class(domain: &str) -> String {
+    match tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::net::lookup_host((domain, 443)),
+    )
+    .await
+    {
+        Ok(Ok(iter)) => {
+            let addrs = iter.collect::<Vec<_>>();
+            let v4 = addrs.iter().any(|addr| addr.ip().is_ipv4());
+            let v6 = addrs.iter().any(|addr| addr.ip().is_ipv6());
+            match (v4, v6) {
+                (true, true) => "A+AAAA".to_string(),
+                (true, false) => "A".to_string(),
+                (false, true) => "AAAA".to_string(),
+                _ => "empty".to_string(),
+            }
+        }
+        Ok(Err(error)) => format!("dns-error: {error}"),
+        Err(_) => "dns-timeout".to_string(),
+    }
+}
+
+async fn safe_https_probe(client: &reqwest::Client, domain: &str) -> String {
+    let url = format!("https://{domain}/");
+    match tokio::time::timeout(Duration::from_secs(5), client.head(url).send()).await {
+        Ok(Ok(response)) => format!("ok-http-{}", response.status().as_u16()),
+        Ok(Err(error)) if error.is_timeout() => "timeout".to_string(),
+        Ok(Err(error)) if error.is_connect() => "connect-error".to_string(),
+        Ok(Err(error)) => format!("http-error: {error}"),
+        Err(_) => "timeout".to_string(),
+    }
+}
+
+fn normalize_check_domain(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_start_matches("*.")
+        .to_ascii_lowercase()
+}
+
+fn game_profiles_catalog(settings: &AppSettings) -> GameProfilesCatalog {
+    let known = known_game_profiles();
+    let running = running_process_names();
+    let detected = known
+        .iter()
+        .filter(|profile| {
+            profile
+                .process_names
+                .iter()
+                .any(|process| running.contains(&process.to_ascii_lowercase()))
+        })
+        .cloned()
+        .map(|mut profile| {
+            profile.detected = true;
+            profile
+        })
+        .collect();
+    GameProfilesCatalog {
+        known,
+        detected,
+        learned: settings
+            .zapret
+            .learned_game_profiles
+            .iter()
+            .map(runtime_game_profile_from_settings)
+            .collect(),
+    }
+}
+
+fn known_game_profiles() -> Vec<RuntimeGameProfile> {
+    vec![
+        RuntimeGameProfile {
+            id: "discord_rtc".to_string(),
+            title: "Discord voice".to_string(),
+            process_names: vec!["Discord.exe".to_string()],
+            domains: vec!["discord.com".to_string(), "discord.gg".to_string()],
+            udp_ports: vec!["50000-50100".to_string()],
+            filter_mode: "udp_first".to_string(),
+            risk_level: "low".to_string(),
+            ..RuntimeGameProfile::default()
+        },
+        RuntimeGameProfile {
+            id: "steam".to_string(),
+            title: "Steam games".to_string(),
+            process_names: vec!["steam.exe".to_string(), "steamwebhelper.exe".to_string()],
+            domains: vec![
+                "steamcontent.com".to_string(),
+                "steamstatic.com".to_string(),
+            ],
+            udp_ports: vec!["27000-27100".to_string()],
+            filter_mode: "udp_first".to_string(),
+            risk_level: "normal".to_string(),
+            ..RuntimeGameProfile::default()
+        },
+        RuntimeGameProfile {
+            id: "epic".to_string(),
+            title: "Epic Games".to_string(),
+            process_names: vec!["EpicGamesLauncher.exe".to_string()],
+            domains: vec!["epicgames.com".to_string()],
+            udp_ports: vec!["50000-50100".to_string()],
+            filter_mode: "tcp_udp".to_string(),
+            risk_level: "normal".to_string(),
+            ..RuntimeGameProfile::default()
+        },
+    ]
+}
+
+fn running_process_names() -> BTreeSet<String> {
+    #[cfg(not(windows))]
+    {
+        BTreeSet::new()
+    }
+
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("powershell");
+        command.args([
+            "-NoProfile",
+            "-Command",
+            "Get-Process | Select-Object -ExpandProperty ProcessName",
+        ]);
+        hide_process_window(&mut command);
+        command
+            .output()
+            .ok()
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .flat_map(|line| [format!("{line}.exe"), line.to_string()])
+                    .map(|line| line.to_ascii_lowercase())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+async fn import_profile_body(
+    name: &str,
+    source_path: Option<&Path>,
+    body: &str,
+) -> Result<SubscriptionProfilesApplyResult, String> {
+    let summary = summarize_subscription_body(body);
+    if summary.node_count == 0 {
+        return Err("Imported local profile does not contain supported proxy nodes.".to_string());
+    }
+    write_mihomo_config(body)?;
+    let now = current_unix_timestamp();
+    let subscription = SubscriptionState {
+        url: None,
+        is_valid: Some(true),
+        validation_error: None,
+        last_refreshed_at: Some(now.to_string()),
+        profile_title: Some(if name.trim().is_empty() {
+            "Local profile".to_string()
+        } else {
+            name.trim().to_string()
+        }),
+        announce: source_path.map(|path| {
+            format!(
+                "Imported from local file {}; raw path is not stored in profile metadata.",
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("profile")
+            )
+        }),
+        announce_url: None,
+        support_url: None,
+        profile_web_page_url: None,
+        update_interval_hours: None,
+        user_info: Default::default(),
+        node_count: summary.node_count,
+        format: summary.format,
+    };
+    let id = format!(
+        "local-{}",
+        stable_config_hash(&format!("{now}:{name}:{body}"))
+    );
+    let mut store = read_persisted_subscription_profiles()?;
+    if let Some(existing) = store.profiles.iter_mut().find(|profile| profile.id == id) {
+        existing.name = subscription
+            .profile_title
+            .clone()
+            .unwrap_or_else(|| "Local profile".to_string());
+        existing.subscription = subscription.clone();
+        existing.protected_body = Some(protect_secret(body)?);
+        existing.updated_at = now;
+    } else {
+        store.profiles.push(PersistedSubscriptionProfile {
+            id: id.clone(),
+            name: subscription
+                .profile_title
+                .clone()
+                .unwrap_or_else(|| "Local profile".to_string()),
+            subscription: subscription.clone(),
+            protected_url: None,
+            protected_body: Some(protect_secret(body)?),
+            created_at: now,
+            updated_at: now,
+        });
+    }
+    store.active_id = Some(id);
+    write_persisted_subscription_profiles(&store)?;
+    persist_subscription_state_with_body(&subscription, Some(body))?;
+    let state = apply_active_subscription_state(
+        subscription,
+        Some("Local profile imported and validated.".to_string()),
+    )?;
+    Ok(SubscriptionProfilesApplyResult {
+        profiles: build_subscription_profiles_state()?,
+        state,
+        message: "Local profile imported and selected.".to_string(),
+    })
+}
+
+fn backup_history_snapshot() -> Result<BackupHistory, String> {
+    Ok(BackupHistory {
+        backups: list_backup_files(&data_dir()?.join("backups"), "badvpn-backup")?,
+        support_bundles: list_backup_files(&data_dir()?.join("support-bundles"), "badvpn-support")?,
+    })
+}
+
+fn list_backup_files(dir: &Path, prefix: &str) -> Result<Vec<BackupFileView>, String> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut files = fs::read_dir(dir)
+        .map_err(|error| format!("Failed to read backup directory {}: {error}", dir.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.starts_with(prefix))
+        })
+        .map(|path| {
+            let modified_at = fs::metadata(&path)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs());
+            BackupFileView {
+                name: path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("backup")
+                    .to_string(),
+                path: path.to_string_lossy().to_string(),
+                modified_at,
+            }
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
+    files.truncate(20);
+    Ok(files)
+}
+
+fn redacted_support_bundle_text(snapshot: &OperatorSnapshot) -> String {
+    let policy = last_preview_policy()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .map(|policy| {
+            let summary: badvpn_common::ipc::PolicySummaryResponse = (&policy).into();
+            format!(
+                "available={} rules={} suppressed={} zapret_domains={} warnings={}",
+                summary.available,
+                summary.rule_count,
+                summary.suppressed_count,
+                summary.zapret_domain_count,
+                summary.warnings_count
+            )
+        })
+        .unwrap_or_else(|| {
+            "available=false rules=0 suppressed=0 zapret_domains=0 warnings=0".to_string()
+        });
+    let runtime = runtime_readiness()
+        .map(|readiness| {
+            format!(
+                "ready={} components_ready={} mihomo_ready={} zapret_ready={} needs_zapret={} message={}",
+                readiness.ready,
+                readiness.components_ready,
+                readiness.mihomo_ready,
+                readiness.zapret_ready,
+                readiness.needs_zapret,
+                readiness.message
+            )
+        })
+        .unwrap_or_else(|error| format!("unavailable: {error}"));
+    let agent_service = read_badvpn_agent_service_status();
+    let zapret_service = read_badvpn_zapret_service_status();
+    let app_data_path = data_dir()
+        .map(|path| redact_path(&path))
+        .unwrap_or_else(|error| format!("unavailable: {error}"));
+    let runtime_path = programdata_dir()
+        .map(|path| redact_path(&path))
+        .unwrap_or_else(|error| format!("unavailable: {error}"));
+    let log_path = app_log_path()
+        .map(|path| redact_path(&path))
+        .unwrap_or_else(|error| format!("unavailable: {error}"));
+    let app_uptime_seconds = current_unix_timestamp().saturating_sub(app_started_at());
+    let override_summary = local_override_support_summary(&load_app_settings());
+    let resources = snapshot
+        .resources
+        .resources
+        .iter()
+        .map(|resource| {
+            format!(
+                "{} installed={} version={}",
+                resource.id,
+                resource.installed,
+                resource.version.as_deref().unwrap_or("unknown")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let log_lines = snapshot
+        .logs
+        .sources
+        .iter()
+        .flat_map(|source| {
+            source
+                .lines
+                .iter()
+                .rev()
+                .take(30)
+                .map(move |line| format!("[{}:{}] {}", source.id, line.level, line.text))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    redact_sensitive_text(&format!(
+        "BadVpn support bundle\n\
+generated_at={}\n\
+privacy=redacted\n\
+system=os:{} arch:{} family:{}\n\
+app_uptime_seconds={app_uptime_seconds}\n\
+service_status=agent installed={} running={} ipc_ready={} state={:?}; zapret installed={} running={} state={:?}\n\
+admin_elevation=ui-not-elevated-by-design\n\
+paths=app_data={app_data_path}; runtime={runtime_path}; logs={log_path}\n\
+resources={resources}\n\
+policy={policy}\n\
+runtime_readiness={runtime}\n\
+overrides={override_summary}\n\
+providers=rules:{} proxy:{}\n\
+runtime_config_lines={}\n\
+source_profile_lines={}\n\
+health_checks={}\n\n\
+logs:\n{log_lines}\n",
+        snapshot.generated_at,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        std::env::consts::FAMILY,
+        agent_service.installed,
+        agent_service.running,
+        agent_service.ipc_ready,
+        agent_service.state,
+        zapret_service.installed,
+        zapret_service.running,
+        zapret_service.state,
+        snapshot.providers.rule_providers.len(),
+        snapshot.providers.proxy_providers.len(),
+        snapshot.config.runtime_yaml.line_count,
+        snapshot.config.source_profile.line_count,
+        snapshot.health.checks.len(),
+    ))
+}
+
+fn local_override_support_summary(settings: &AppSettings) -> String {
+    let typed_total = settings.routing_policy.local_overrides.rules.len();
+    let typed_enabled = settings
+        .routing_policy
+        .local_overrides
+        .rules
+        .iter()
+        .filter(|rule| rule.enabled)
+        .count();
+    format!(
+        "enabled={} typed={typed_enabled}/{typed_total} legacy_vpn_domains={} legacy_zapret_domains={} legacy_direct_processes={}",
+        settings.routing_policy.local_overrides_enabled,
+        settings.routing_policy.force_vpn_domains.len(),
+        settings.routing_policy.force_zapret_domains.len(),
+        settings.routing_policy.force_direct_processes.len()
+    )
+}
+
+fn redact_sensitive_text(input: &str) -> String {
+    let mut lines = Vec::new();
+    for line in input.lines() {
+        let trimmed = line.trim_start();
+        let (list_prefix, key_source) = trimmed
+            .strip_prefix("- ")
+            .map(|value| ("- ", value.trim_start()))
+            .unwrap_or(("", trimmed));
+        let lower = key_source.to_ascii_lowercase();
+        let sensitive_key = [
+            "secret:",
+            "authorization:",
+            "proxy-authorization:",
+            "password:",
+            "passwd:",
+            "token:",
+            "access-token:",
+            "refresh-token:",
+            "subscription:",
+        ]
+        .iter()
+        .any(|key| lower.starts_with(key));
+        if sensitive_key {
+            let indent_len = line.len().saturating_sub(trimmed.len());
+            let indent = &line[..indent_len];
+            let key = key_source.split(':').next().unwrap_or("secret");
+            lines.push(format!("{indent}{list_prefix}{key}: <redacted>"));
+        } else {
+            lines.push(redact_urls_in_line(line));
+        }
+    }
+    lines.join("\n")
+}
+
+fn redact_urls_in_line(line: &str) -> String {
+    let mut out = String::new();
+    let mut rest = line;
+    loop {
+        let http = rest.find("http://");
+        let https = rest.find("https://");
+        let Some(index) = (match (http, https) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }) else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..index]);
+        let tail = &rest[index..];
+        let end = tail
+            .find(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '<' | '>' | ')'))
+            .unwrap_or(tail.len());
+        let (url, next) = tail.split_at(end);
+        out.push_str(&redact_url(url));
+        rest = next;
+    }
+    out
+}
+
+fn redact_path(path: &Path) -> String {
+    redact_path_string(&path.to_string_lossy())
+}
+
+fn redact_path_string(path: &str) -> String {
+    let mut out = path.to_string();
+    if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
+        if !home.trim().is_empty() {
+            out = out.replace(&home, "%USERPROFILE%");
+        }
+    }
+    out
+}
+
 async fn refresh_runtime_state(run_network_tests: bool) -> Result<AgentState, String> {
     hydrate_persisted_state()?;
     let settings = load_app_settings();
@@ -3007,6 +4714,11 @@ fn tracked_connection_from_mihomo(connection: MihomoConnection) -> TrackedConnec
         network: uppercase_or_unknown(&connection.metadata.network),
         connection_type: uppercase_or_unknown(&connection.metadata.connection_type),
         process: connection.metadata.process,
+        process_path: connection.metadata.process_path,
+        rule_source: infer_connection_rule_source(
+            connection.rule.as_deref(),
+            connection.rule_payload.as_deref(),
+        ),
         rule: connection.rule,
         rule_payload: connection.rule_payload,
         chains: connection.chains,
@@ -3017,6 +4729,26 @@ fn tracked_connection_from_mihomo(connection: MihomoConnection) -> TrackedConnec
         path,
         path_label,
         path_note,
+    }
+}
+
+fn infer_connection_rule_source(rule: Option<&str>, rule_payload: Option<&str>) -> Option<String> {
+    let text = format!(
+        "{} {}",
+        rule.unwrap_or_default(),
+        rule_payload.unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    if text.contains("process") || text.contains("dst-port") {
+        Some("local override or app/game rule".to_string())
+    } else if text.contains("rule-set") {
+        Some("provider rule-set".to_string())
+    } else if text.contains("geosite") || text.contains("geoip") {
+        Some("provider/geodata rule".to_string())
+    } else if text.contains("domain") || text.contains("ip-cidr") {
+        Some("domain/CIDR policy rule".to_string())
+    } else {
+        None
     }
 }
 
@@ -3765,6 +5497,7 @@ fn runtime_game_profile_from_settings(
         filter_mode: format_game_filter_mode(profile.filter_mode).to_string(),
         risk_level: profile.risk_level.clone(),
         detected: profile.detected,
+        enabled: profile.enabled,
     }
 }
 
@@ -4481,15 +6214,21 @@ async fn fetch_subscription(url: &str) -> Result<ImportedSubscription, String> {
         .header(ACCEPT, "application/x-yaml,text/yaml,text/plain,*/*")
         .send()
         .await
-        .map_err(|error| format!("Failed to fetch subscription: {error}"))?;
+        .map_err(|error| {
+            format_subscription_fetch_error("Failed to fetch subscription", url, error)
+        })?;
 
     let headers = response.headers().clone();
     let body = response
         .error_for_status()
-        .map_err(|error| format!("Subscription server returned an error: {error}"))?
+        .map_err(|error| {
+            format_subscription_fetch_error("Subscription server returned an error", url, error)
+        })?
         .text()
         .await
-        .map_err(|error| format!("Failed to read subscription body: {error}"))?;
+        .map_err(|error| {
+            format_subscription_fetch_error("Failed to read subscription body", url, error)
+        })?;
 
     let summary = summarize_subscription_body(&body);
     log_event(
@@ -4530,6 +6269,30 @@ async fn fetch_subscription(url: &str) -> Result<ImportedSubscription, String> {
         },
         body,
     })
+}
+
+fn format_subscription_fetch_error(action: &str, url: &str, error: reqwest::Error) -> String {
+    let redacted_url = redact_url(url);
+    if let Some(status) = error.status() {
+        return format!("{action} from {redacted_url}: HTTP {status}");
+    }
+
+    let reason = if error.is_timeout() {
+        "request timed out"
+    } else if error.is_connect() {
+        "connection failed"
+    } else if error.is_redirect() {
+        "redirect failed"
+    } else if error.is_body() {
+        "response body read failed"
+    } else if error.is_decode() {
+        "response decode failed"
+    } else if error.is_request() {
+        "request failed"
+    } else {
+        "network error"
+    };
+    format!("{action} from {redacted_url}: {reason}")
 }
 
 fn write_mihomo_config(subscription_body: &str) -> Result<(), String> {
@@ -7007,6 +8770,31 @@ fn write_persisted_subscription_profiles(
         .map_err(|error| format!("Failed to write subscription profiles: {error}"))
 }
 
+fn write_subscription_profiles_backup(
+    store: &PersistedSubscriptionProfiles,
+    reason: &str,
+) -> Result<(), String> {
+    let dir = data_dir()?.join("backups");
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("Failed to create backup directory: {error}"))?;
+    let mut safe_store = store.clone();
+    for profile in &mut safe_store.profiles {
+        profile.subscription.url = None;
+    }
+    let path = dir.join(format!(
+        "subscriptions-{reason}-{}.json",
+        current_unix_timestamp()
+    ));
+    let content = serde_json::to_string_pretty(&safe_store)
+        .map_err(|error| format!("Failed to serialize subscription backup: {error}"))?;
+    fs::write(&path, content).map_err(|error| {
+        format!(
+            "Failed to write subscription profile backup {}: {error}",
+            path.display()
+        )
+    })
+}
+
 fn read_proxy_selections() -> Result<BTreeMap<String, String>, String> {
     let path = proxy_selections_file_path()?;
     let Ok(content) = fs::read_to_string(&path) else {
@@ -7205,8 +8993,69 @@ fn redact_url(url: &str) -> String {
     let Some((scheme, rest)) = trimmed.split_once("://") else {
         return "subscription".to_string();
     };
-    let host = rest.split('/').next().unwrap_or(rest);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host = authority.rsplit('@').next().unwrap_or(authority);
     format!("{scheme}://{host}/...")
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    #[test]
+    fn subscription_url_redaction_keeps_origin_only() {
+        let redacted =
+            redact_url("https://example.com/sub/token-secret?user=alice&password=hidden");
+
+        assert_eq!(redacted, "https://example.com/...");
+        assert!(!redacted.contains("token-secret"));
+        assert!(!redacted.contains("password"));
+        assert!(!redacted.contains("alice"));
+    }
+
+    #[test]
+    fn subscription_url_redaction_removes_userinfo_credentials() {
+        let redacted = redact_url("https://alice:secret@example.com/sub/token-secret");
+
+        assert_eq!(redacted, "https://example.com/...");
+        assert!(!redacted.contains("alice"));
+        assert!(!redacted.contains("secret"));
+    }
+
+    #[test]
+    fn invalid_subscription_url_redaction_uses_generic_label() {
+        assert_eq!(redact_url("not-a-url-with-token-secret"), "subscription");
+    }
+
+    #[test]
+    fn redaction_masks_controller_secret_and_local_credentials() {
+        let redacted = redact_sensitive_text(
+            "secret: badvpn-controller-secret\npassword: hunter2\nhttps://user:pass@example.com/sub/token?password=hunter2",
+        );
+
+        assert!(redacted.contains("secret: <redacted>"));
+        assert!(redacted.contains("password: <redacted>"));
+        assert!(redacted.contains("https://example.com/..."));
+        assert!(!redacted.contains("badvpn-controller-secret"));
+        assert!(!redacted.contains("hunter2"));
+        assert!(!redacted.contains("user:pass"));
+    }
+
+    #[test]
+    fn text_artifact_redacts_before_rendering() {
+        let artifact = text_artifact(
+            "Generated runtime YAML",
+            None,
+            Some("secret: controller-secret\nproxies:\n  - password: node-secret\n"),
+            None,
+        );
+
+        assert!(artifact.redacted);
+        assert!(artifact.text.contains("secret: <redacted>"));
+        assert!(artifact.text.contains("password: <redacted>"));
+        assert!(!artifact.text.contains("controller-secret"));
+        assert!(!artifact.text.contains("node-secret"));
+    }
 }
 
 fn apply_active_subscription_state(
