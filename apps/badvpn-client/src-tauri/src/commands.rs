@@ -2871,6 +2871,10 @@ pub async fn import_profile_deep_link(
             profile.subscription = imported.subscription.clone();
             profile.protected_url = Some(protect_secret(trimmed)?);
             profile.protected_body = Some(protect_secret(&imported.body)?);
+            profile.last_successful_refresh_at = Some(now);
+            profile.last_failed_refresh_at = None;
+            profile.last_refresh_error = None;
+            profile.next_refresh_at = next_profile_refresh_at(&profile.subscription, now);
             profile.updated_at = now;
             profile.id.clone()
         } else {
@@ -2878,9 +2882,15 @@ pub async fn import_profile_deep_link(
             store.profiles.push(PersistedSubscriptionProfile {
                 id: id.clone(),
                 name: display_name,
+                description: None,
                 subscription: imported.subscription.clone(),
                 protected_url: Some(protect_secret(trimmed)?),
                 protected_body: Some(protect_secret(&imported.body)?),
+                last_successful_refresh_at: Some(now),
+                last_failed_refresh_at: None,
+                last_refresh_error: None,
+                next_refresh_at: next_profile_refresh_at(&imported.subscription, now),
+                fetch_options: PersistedSubscriptionFetchOptions::default(),
                 created_at: now,
                 updated_at: now,
             });
