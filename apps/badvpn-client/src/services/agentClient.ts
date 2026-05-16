@@ -208,6 +208,7 @@ export interface AppSettings {
   };
   updates: {
     auto_flowseal_list_refresh: boolean;
+    safe_resource_auto_update_interval_hours: number;
   };
   diagnostics: {
     runtime_checks_after_connect: boolean;
@@ -340,12 +341,27 @@ export interface SubscriptionProfilesState {
   profiles: SubscriptionProfileView[];
 }
 
+export type SubscriptionFetchProxyMode = "direct" | "system" | "custom";
+
+export interface SubscriptionFetchOptionsView {
+  timeout_seconds: number;
+  proxy_mode: SubscriptionFetchProxyMode;
+  custom_proxy_redacted: string | null;
+  user_agent: string | null;
+}
+
 export interface SubscriptionProfileView {
   id: string;
   name: string;
+  description: string | null;
   active: boolean;
   redacted_url: string | null;
   subscription: SubscriptionState;
+  last_successful_refresh_at: number | null;
+  last_failed_refresh_at: number | null;
+  last_refresh_error: string | null;
+  next_refresh_at: number | null;
+  fetch_options: SubscriptionFetchOptionsView;
   created_at: number;
   updated_at: number;
 }
@@ -354,6 +370,16 @@ export interface SubscriptionProfilesApplyResult {
   profiles: SubscriptionProfilesState;
   state: AgentState;
   message: string;
+}
+
+export interface LocalProfilePreview {
+  display_name: string;
+  source_file_name: string | null;
+  format: SubscriptionFormat;
+  node_count: number;
+  decoded_size_bytes: number;
+  import_ready: boolean;
+  warning: string | null;
 }
 
 export interface ZapretProfileState {
@@ -516,6 +542,32 @@ export function selectSubscriptionProfile(id: string): Promise<SubscriptionProfi
 
 export function removeSubscriptionProfile(id: string): Promise<SubscriptionProfilesApplyResult> {
   return invokeCommand<SubscriptionProfilesApplyResult>("remove_subscription_profile", { id });
+}
+
+export function updateSubscriptionProfileMetadata(
+  id: string,
+  description?: string | null,
+): Promise<SubscriptionProfilesApplyResult> {
+  return invokeCommand<SubscriptionProfilesApplyResult>("update_subscription_profile_metadata", {
+    id,
+    description: description ?? null,
+  });
+}
+
+export function updateSubscriptionProfileFetchOptions(
+  id: string,
+  timeoutSeconds: number,
+  proxyMode: SubscriptionFetchProxyMode,
+  customProxyUrl?: string,
+  userAgent?: string | null,
+): Promise<SubscriptionProfilesApplyResult> {
+  return invokeCommand<SubscriptionProfilesApplyResult>("update_subscription_profile_fetch_options", {
+    id,
+    timeoutSeconds,
+    proxyMode,
+    customProxyUrl: customProxyUrl ?? null,
+    userAgent: userAgent ?? null,
+  });
 }
 
 export function checkComponentUpdates(): Promise<ComponentUpdateReport> {
@@ -798,6 +850,10 @@ export function runZapretHealthChecks(customDomain?: string): Promise<ZapretHeal
   return invokeCommand<ZapretHealthReport>("run_zapret_health_checks", { customDomain: customDomain ?? null });
 }
 
+export function repairWindowsNetwork(): Promise<AgentState> {
+  return invokeCommand<AgentState>("repair_windows_network");
+}
+
 export function updateOperatorResource(id: string): Promise<ResourceActionResult> {
   return invokeCommand<ResourceActionResult>("update_operator_resource", { id });
 }
@@ -808,6 +864,14 @@ export function updateAllOperatorResources(): Promise<ResourceActionResult> {
 
 export function rollbackOperatorResource(id: string): Promise<ResourceActionResult> {
   return invokeCommand<ResourceActionResult>("rollback_operator_resource", { id });
+}
+
+export function previewLocalProfileFromText(name: string, body: string): Promise<LocalProfilePreview> {
+  return invokeCommand<LocalProfilePreview>("preview_local_profile_from_text", { name, body });
+}
+
+export function previewLocalProfileFromPath(path: string, name?: string): Promise<LocalProfilePreview> {
+  return invokeCommand<LocalProfilePreview>("preview_local_profile_from_path", { path, name: name ?? null });
 }
 
 export function importLocalProfileFromText(name: string, body: string): Promise<SubscriptionProfilesApplyResult> {
@@ -824,6 +888,10 @@ export function importProfileDeepLink(link: string): Promise<SubscriptionProfile
 
 export function refreshAllSubscriptionProfiles(): Promise<SubscriptionProfilesApplyResult> {
   return invokeCommand<SubscriptionProfilesApplyResult>("refresh_all_subscription_profiles");
+}
+
+export function refreshDueSubscriptionProfiles(): Promise<SubscriptionProfilesApplyResult> {
+  return invokeCommand<SubscriptionProfilesApplyResult>("refresh_due_subscription_profiles");
 }
 
 export function exportBackupBundle(): Promise<BackupActionResult> {

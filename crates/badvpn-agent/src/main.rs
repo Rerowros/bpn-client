@@ -187,6 +187,7 @@ fn parse_command() -> anyhow::Result<AgentCommand> {
         "refresh-subscription" => Ok(AgentCommand::RefreshSubscription),
         "diagnostics" => Ok(AgentCommand::RunDiagnostics),
         "cleanup-legacy-zapret" => Ok(AgentCommand::CleanupLegacyZapret),
+        "repair-windows-network" => Ok(AgentCommand::RepairWindowsNetwork),
         "verify-installed-agent" => Ok(AgentCommand::VerifyInstalledAgent),
         other => anyhow::bail!("unknown command: {other}"),
     }
