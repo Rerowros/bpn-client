@@ -204,9 +204,9 @@ impl AgentController {
                 Ok(self.runtime.snapshot())
             }
             Err(error) => {
-                self.runtime
-                    .set_error(format!("failed to repair Windows network state: {error}"));
-                Ok(self.runtime.snapshot())
+                let message = format!("failed to repair Windows network state: {error}");
+                self.runtime.set_error(message.clone());
+                Err(BadVpnError::OperationFailed(message))
             }
         }
     }
