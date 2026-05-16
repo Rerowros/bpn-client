@@ -116,14 +116,15 @@ export function buildLocalOverridePatch(
 export function buildLocalOverrideRule(route: LocalOverrideRoute, kind: LocalOverrideTargetKind, rawValue: string, normalized = normalizeLocalOverrideValue(kind, rawValue)): LocalOverrideRule {
   const now = Math.floor(Date.now() / 1000);
   const processName = kind === "process" ? normalized : null;
+  const rawTrimmed = rawValue.trim().replace(/^["']|["']$/g, "");
   return {
     id: `local-${route}-${kind}-${normalized.toLocaleLowerCase().replace(/[^a-z0-9]+/g, "-")}-${now}`,
     enabled: true,
     title: `${route.toUpperCase()} ${formatLocalOverrideKind(kind)} ${normalized}`,
     path: route,
-    target_kind: kind === "process" && rawValue.trim().toLocaleLowerCase().endsWith(".exe") ? "app" : kind,
+    target_kind: kind === "process" && rawTrimmed.toLocaleLowerCase().endsWith(".exe") ? "app" : kind,
     value: normalized,
-    executable_path: kind === "process" && rawValue.includes("\\") ? rawValue.trim().replace(/^["']|["']$/g, "") : null,
+    executable_path: kind === "process" && /[\\/]/.test(rawTrimmed) ? rawTrimmed : null,
     process_name: processName,
     source: "user",
     created_at: now,

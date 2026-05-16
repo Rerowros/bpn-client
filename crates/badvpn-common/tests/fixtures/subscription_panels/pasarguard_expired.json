@@ -1,0 +1,6 @@
+{
+  "panel": "pasarguard",
+  "status": "subscription_expired",
+  "detail": "User subscription expired. Renew the service plan in the panel.",
+  "profile_url": "https://panel.example/profile"
+}

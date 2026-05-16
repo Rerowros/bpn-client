@@ -13,6 +13,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "check": "tsc --noEmit",
+    "test": "vitest run",
     "prepare:bundle": "powershell -ExecutionPolicy Bypass -File ../../scripts/stage-tauri-resources.ps1",
     "tauri": "powershell -ExecutionPolicy Bypass -File ../../scripts/tauri.ps1",
     "tauri:build": "npm run tauri -- build",
@@ -31,6 +32,7 @@
     "@types/react-dom": "18.3.7",
     "@vitejs/plugin-react": "^6.0.1",
     "typescript": "^6.0.3",
-    "vite": "^8.0.10"
+    "vite": "^8.0.10",
+    "vitest": "^4.1.6"
   }
 }

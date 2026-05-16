@@ -2852,6 +2852,119 @@ pub fn cleanup_legacy_zapret_service() -> Result<String> {
     Ok("Legacy BadVpnZapret service stop was requested; badvpn-agent owns winws now.".to_string())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecoveryCommandPlan {
+    label: &'static str,
+    program: &'static str,
+    args: &'static [&'static str],
+    required: bool,
+}
+
+pub fn repair_windows_network_state() -> Result<String> {
+    #[cfg(windows)]
+    {
+        let mut messages = Vec::new();
+        for plan in windows_network_recovery_plan() {
+            match run_recovery_command(plan) {
+                Ok(message) => messages.push(message),
+                Err(error) if plan.required => return Err(error),
+                Err(error) => messages.push(format!("{} warning: {error}", plan.label)),
+            }
+        }
+        Ok(format!(
+            "Windows network recovery completed via badvpn-agent: {}",
+            messages.join("; ")
+        ))
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(
+            "Windows network recovery is only required on Windows; no action was taken."
+                .to_string(),
+        )
+    }
+}
+
+fn windows_network_recovery_plan() -> Vec<RecoveryCommandPlan> {
+    vec![
+        RecoveryCommandPlan {
+            label: "DNS cache flush",
+            program: "ipconfig",
+            args: &["/flushdns"],
+            required: false,
+        },
+        RecoveryCommandPlan {
+            label: "IPv4 destination cache reset",
+            program: "netsh",
+            args: &["interface", "ip", "delete", "destinationcache"],
+            required: false,
+        },
+        RecoveryCommandPlan {
+            label: "IPv4 neighbor cache reset",
+            program: "netsh",
+            args: &["interface", "ip", "delete", "arpcache"],
+            required: false,
+        },
+        RecoveryCommandPlan {
+            label: "IPv6 destination cache reset",
+            program: "netsh",
+            args: &["interface", "ipv6", "delete", "destinationcache"],
+            required: false,
+        },
+        RecoveryCommandPlan {
+            label: "IPv6 neighbor cache reset",
+            program: "netsh",
+            args: &["interface", "ipv6", "delete", "neighbors"],
+            required: false,
+        },
+        RecoveryCommandPlan {
+            label: "BPN Mihomo firewall rule cleanup",
+            program: "netsh",
+            args: &[
+                "advfirewall",
+                "firewall",
+                "delete",
+                "rule",
+                "name=BadVpn Mihomo",
+            ],
+            required: false,
+        },
+        RecoveryCommandPlan {
+            label: "BPN winws firewall rule cleanup",
+            program: "netsh",
+            args: &[
+                "advfirewall",
+                "firewall",
+                "delete",
+                "rule",
+                "name=BadVpn winws",
+            ],
+            required: false,
+        },
+    ]
+}
+
+fn run_recovery_command(plan: RecoveryCommandPlan) -> Result<String> {
+    let output = Command::new(plan.program)
+        .args(plan.args)
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("failed to run {}", plan.program))?;
+    if output.status.success() {
+        return Ok(format!("{} ok", plan.label));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = stderr
+        .lines()
+        .chain(stdout.lines())
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("command returned non-zero status");
+    Err(anyhow!("{} failed: {detail}", plan.label))
+}
+
 #[cfg(test)]
 mod architecture_fix_tests {
     use super::*;
@@ -2872,6 +2985,34 @@ mod architecture_fix_tests {
     #[test]
     fn hex_encoding_is_lowercase_and_stable() {
         assert_eq!(to_hex(&[0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
+    }
+
+    #[test]
+    fn windows_network_recovery_plan_is_scoped_to_cache_and_bpn_rules() {
+        let plan = windows_network_recovery_plan();
+        assert!(plan
+            .iter()
+            .any(|command| command.args.contains(&"destinationcache")));
+        assert!(plan
+            .iter()
+            .any(|command| command.args.contains(&"arpcache")));
+        assert!(plan
+            .iter()
+            .any(|command| command.args.contains(&"name=BadVpn Mihomo")));
+        assert!(plan
+            .iter()
+            .any(|command| command.args.contains(&"name=BadVpn winws")));
+
+        for command in plan {
+            let joined = std::iter::once(command.program)
+                .chain(command.args.iter().copied())
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase();
+            assert!(!joined.contains("advfirewall reset"));
+            assert!(!joined.contains("winsock reset"));
+            assert!(!joined.contains("route -f"));
+        }
     }
 }
 

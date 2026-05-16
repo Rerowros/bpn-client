@@ -10,6 +10,7 @@ import {
   Download,
   ExternalLink,
   Gauge,
+  Globe2,
   History,
   LifeBuoy,
   ListTree,
@@ -58,6 +59,7 @@ import {
   ConnectionsSnapshot,
   BackupHistory,
   GameProfilesCatalog,
+  LocalProfilePreview,
   OperatorSnapshot,
   ResourceCatalog,
   PolicyRuleView,
@@ -67,6 +69,8 @@ import {
   ProxyNodeView,
   RuntimeDiagnosticsReport,
   RuntimeReadinessResponse,
+  SubscriptionFetchProxyMode,
+  SubscriptionProfileView,
   SubscriptionProfilesState,
   TrackedConnection,
   ZapretServiceStatus,
@@ -94,7 +98,11 @@ import {
   importProfileDeepLink,
   openOperatorDirectory,
   pickExecutablePath,
+  previewLocalProfileFromPath,
+  previewLocalProfileFromText,
   refreshAllSubscriptionProfiles,
+  refreshDueSubscriptionProfiles,
+  repairWindowsNetwork,
   removeAgentService,
   removeSubscriptionProfile,
   refreshSubscription,
@@ -112,6 +120,8 @@ import {
   stopConnection,
   updateAllOperatorResources,
   updateOperatorResource,
+  updateSubscriptionProfileMetadata,
+  updateSubscriptionProfileFetchOptions,
   updateRuntimeComponents,
 } from "./services/agentClient";
 import { AppUpdateStatus, checkAppUpdate, installAppUpdate } from "./services/updateClient";
@@ -130,6 +140,7 @@ type LocalOverrideSummaryItem = {
   kind: string;
   value: string;
 };
+type TrafficSample = { at: number; upload: number; download: number };
 
 const emptyState: AgentState = {
   installed: false,
@@ -249,6 +260,7 @@ const defaultSettings: AppSettings = {
   },
   updates: {
     auto_flowseal_list_refresh: true,
+    safe_resource_auto_update_interval_hours: 24,
   },
   diagnostics: {
     runtime_checks_after_connect: true,
@@ -344,6 +356,7 @@ export function App() {
   const [operatorProfileName, setOperatorProfileName] = useState("");
   const [operatorProfilePath, setOperatorProfilePath] = useState("");
   const [operatorProfileText, setOperatorProfileText] = useState("");
+  const [operatorProfilePreview, setOperatorProfilePreview] = useState<LocalProfilePreview | null>(null);
   const [operatorDeepLink, setOperatorDeepLink] = useState("");
   const [operatorBackupPath, setOperatorBackupPath] = useState("");
   const [manualGameProfile, setManualGameProfile] = useState({
@@ -370,6 +383,7 @@ export function App() {
   const [progressNow, setProgressNow] = useState(() => Date.now());
   const [showConnectionDetails, setShowConnectionDetails] = useState(false);
   const [connectionFailureStage, setConnectionFailureStage] = useState<string | null>(null);
+  const [trafficSamples, setTrafficSamples] = useState<TrafficSample[]>([]);
 
   function pushNotification({
     tone,
@@ -498,7 +512,7 @@ export function App() {
   }, [state.connection.connected, view]);
 
   useEffect(() => {
-    if (view === "servers") {
+    if (view === "servers" || view === "overview") {
       void refreshCatalog(false);
     }
     if (view === "policy") {
@@ -542,6 +556,19 @@ export function App() {
     setSelectedGroup((current) => current ?? catalog.groups[0].name);
   }, [catalog]);
 
+  useEffect(() => {
+    const upload = state.metrics.upload_bytes;
+    const download = state.metrics.download_bytes;
+    setTrafficSamples((current) => {
+      const now = Date.now();
+      const last = current[current.length - 1];
+      if (last && last.upload === upload && last.download === download && now - last.at < 2500) {
+        return current;
+      }
+      return [...current, { at: now, upload, download }].slice(-12);
+    });
+  }, [state.metrics.download_bytes, state.metrics.upload_bytes]);
+
   const hasSubscription =
     state.subscription.is_valid !== false &&
     (state.subscription.node_count > 0 ||
@@ -550,12 +577,17 @@ export function App() {
   const isOnboarding = !hasSubscription || state.phase === "onboarding";
   const quota = getQuota(state);
   const supportUrl = state.subscription.support_url;
-  const announceUrl = state.subscription.announce_url || state.subscription.profile_web_page_url;
+  const providerAnnouncement = providerAnnouncementMetadata(state.subscription);
+  const providerLinks = providerMetadataLinks(state.subscription);
   const isRuntimeTransitioning = state.connection.status === "starting" || state.connection.status === "stopping";
   const isConnected = state.connection.connected && state.connection.status === "running";
   const smartFallbackActive =
     isConnected && settings.core.route_mode === "smart" && state.connection.route_mode === "vpn_only";
   const agentReady = Boolean(agentService?.installed && agentService.ipc_ready);
+  const zapretReady = Boolean(runtimeReadiness?.zapret_ready || state.diagnostics.zapret_healthy);
+  const needsZapret = runtimeReadiness?.needs_zapret ?? settings.core.route_mode === "smart";
+  const agentHomeStatus = agentReady ? "Ready" : agentService?.installed ? "IPC недоступен" : "Нужна установка";
+  const zapretHomeStatus = !needsZapret ? "Не нужен в VPN Only" : zapretReady ? "Готов" : "Standby / check";
   const runtimeComponentStatus = getRuntimeComponentStatus(componentUpdates, runtimeReadiness);
   const connectionProgress = getConnectionProgress({
     attempt: connectionAttempt,
@@ -587,16 +619,25 @@ export function App() {
 
   const routeSummary = getHomeRouteSummary(settings.core.route_mode, smartFallbackActive);
   const startupTimeline = parseStartupTimeline(state.diagnostics.message);
-  const currentNode = state.connection.selected_proxy ?? "Автовыбор провайдера";
+  const catalogSelectedNode = getSelectedCatalogNode(catalog);
+  const currentNode = state.connection.selected_proxy ?? catalogSelectedNode?.name ?? "Автовыбор провайдера";
+  const activeHomeGroup = getActiveHomeGroup(catalog, selectedGroup);
+  const currentServerName = activeHomeGroup?.selected ?? catalogSelectedNode?.name ?? currentNode;
+  const currentServer = parseServerIdentity(currentServerName);
+  const homeGroups = catalog?.groups ?? [];
+  const homeNodes = activeHomeGroup
+    ? sortProxyNodes(activeHomeGroup.nodes, "selected", activeHomeGroup.selected ?? currentNode).slice(0, 14)
+    : [];
+  const trafficStats = getTrafficStats(trafficSamples, state);
   const heroTitle = isConnected
-    ? "Вы защищены"
+    ? "Соединение активно"
     : state.connection.status === "starting"
       ? "Подключаем защиту"
       : state.connection.status === "stopping"
         ? "Отключаем защиту"
         : "Готово к подключению";
   const heroSubtitle = isConnected
-    ? `${currentNode} активен. Маршруты применены через ${formatRouteMode(state.connection.route_mode)}.`
+    ? `${currentServer.label} активен. Маршруты применены через ${formatRouteMode(state.connection.route_mode)}.`
     : hasSubscription
       ? "Профиль готов. Подключите VPN, чтобы применить Smart-маршрутизацию и локальные правила."
       : "Добавьте подписку, чтобы BadVpn подготовил профиль Mihomo.";
@@ -608,7 +649,6 @@ export function App() {
     { label: "AI через VPN", enabled: settings.routing_policy.smart_presets.ai_vpn },
     { label: "Соцсети через VPN", enabled: settings.routing_policy.smart_presets.social_vpn },
   ].filter((preset) => preset.enabled);
-  const activeConnectionCount = connections?.active.length ?? 0;
 
   async function runAction(action: () => Promise<AgentState>, showBusy = true) {
     if (showBusy) {
@@ -1265,6 +1305,24 @@ export function App() {
     }
   }
 
+  async function handleRepairWindowsNetwork() {
+    setOperatorBusy(true);
+    try {
+      const nextState = await repairWindowsNetwork();
+      setState(nextState);
+      pushNotification({
+        tone: "success",
+        title: "Network recovery finished",
+        message: nextState.diagnostics.message ?? "badvpn-agent completed Windows network recovery.",
+      });
+      await refreshOperatorSnapshot(false);
+    } catch (error) {
+      notifyFromError("Network recovery failed", error);
+    } finally {
+      setOperatorBusy(false);
+    }
+  }
+
   async function handleResourceUpdate(id: string) {
     setOperatorBusy(true);
     try {
@@ -1315,10 +1373,32 @@ export function App() {
             : await importProfileDeepLink(operatorDeepLink);
       setSubscriptionProfiles(result.profiles);
       setState(result.state);
+      setOperatorProfilePreview(null);
       pushNotification({ tone: "success", title: "Profile imported", message: result.message });
       await refreshOperatorSnapshot(false);
     } catch (error) {
       notifyFromError("Profile import failed", error);
+    } finally {
+      setOperatorBusy(false);
+    }
+  }
+
+  async function handlePreviewLocalProfile(mode: "path" | "text") {
+    setOperatorBusy(true);
+    try {
+      const preview =
+        mode === "path"
+          ? await previewLocalProfileFromPath(operatorProfilePath, operatorProfileName || undefined)
+          : await previewLocalProfileFromText(operatorProfileName || "Local profile", operatorProfileText);
+      setOperatorProfilePreview(preview);
+      pushNotification({
+        tone: preview.import_ready ? "success" : "warning",
+        title: "Profile preview ready",
+        message: preview.warning ?? `${preview.node_count} node(s), ${formatRouteMode(preview.format)}.`,
+      });
+    } catch (error) {
+      setOperatorProfilePreview(null);
+      notifyFromError("Profile preview failed", error);
     } finally {
       setOperatorBusy(false);
     }
@@ -1333,6 +1413,100 @@ export function App() {
       pushNotification({ tone: "success", title: "Profiles refreshed", message: result.message });
     } catch (error) {
       notifyFromError("Refresh all failed", error);
+    } finally {
+      setProfilesBusy(false);
+    }
+  }
+
+  async function handleRefreshDueProfiles() {
+    setProfilesBusy(true);
+    try {
+      const result = await refreshDueSubscriptionProfiles();
+      setSubscriptionProfiles(result.profiles);
+      setState(result.state);
+      pushNotification({ tone: "success", title: "Due profiles refreshed", message: result.message });
+    } catch (error) {
+      notifyFromError("Due refresh failed", error);
+    } finally {
+      setProfilesBusy(false);
+    }
+  }
+
+  async function handleProfileFetchProxyMode(profile: SubscriptionProfileView, proxyMode: SubscriptionFetchProxyMode) {
+    let customProxyUrl: string | undefined;
+    if (proxyMode === "custom") {
+      const value = window.prompt("Custom HTTP(S) proxy URL", profile.fetch_options.custom_proxy_redacted ?? "http://127.0.0.1:8080");
+      if (!value?.trim()) {
+        return;
+      }
+      customProxyUrl = value.trim();
+    }
+    await applyProfileFetchOptions(profile, profile.fetch_options.timeout_seconds, proxyMode, customProxyUrl);
+  }
+
+  async function handleProfileNotes(profile: SubscriptionProfileView) {
+    const value = window.prompt("Subscription profile notes", profile.description ?? "");
+    if (value === null) {
+      return;
+    }
+    setProfilesBusy(true);
+    try {
+      const result = await updateSubscriptionProfileMetadata(profile.id, value);
+      setSubscriptionProfiles(result.profiles);
+      setState(result.state);
+      pushNotification({ tone: "success", title: "Profile notes saved", message: result.message });
+    } catch (error) {
+      notifyFromError("Profile notes failed", error);
+    } finally {
+      setProfilesBusy(false);
+    }
+  }
+
+  async function handleProfileFetchUserAgent(profile: SubscriptionProfileView) {
+    const value = window.prompt(
+      "Subscription fetch user-agent. Leave empty to use default.",
+      profile.fetch_options.user_agent ?? "",
+    );
+    if (value === null) {
+      return;
+    }
+    await applyProfileFetchOptions(
+      profile,
+      profile.fetch_options.timeout_seconds,
+      profile.fetch_options.proxy_mode,
+      undefined,
+      value,
+    );
+  }
+
+  async function handleProfileFetchTimeout(profile: SubscriptionProfileView) {
+    const value = window.prompt("Subscription fetch timeout, seconds", String(profile.fetch_options.timeout_seconds));
+    if (!value?.trim()) {
+      return;
+    }
+    const timeoutSeconds = Number(value);
+    if (!Number.isFinite(timeoutSeconds)) {
+      pushNotification({ tone: "warning", title: "Invalid timeout", message: "Timeout must be a number of seconds." });
+      return;
+    }
+    await applyProfileFetchOptions(profile, timeoutSeconds, profile.fetch_options.proxy_mode);
+  }
+
+  async function applyProfileFetchOptions(
+    profile: SubscriptionProfileView,
+    timeoutSeconds: number,
+    proxyMode: SubscriptionFetchProxyMode,
+    customProxyUrl?: string,
+    userAgent?: string | null,
+  ) {
+    setProfilesBusy(true);
+    try {
+      const result = await updateSubscriptionProfileFetchOptions(profile.id, timeoutSeconds, proxyMode, customProxyUrl, userAgent);
+      setSubscriptionProfiles(result.profiles);
+      setState(result.state);
+      pushNotification({ tone: "success", title: "Fetch options saved", message: result.message });
+    } catch (error) {
+      notifyFromError("Fetch options failed", error);
     } finally {
       setProfilesBusy(false);
     }
@@ -1499,6 +1673,7 @@ export function App() {
           operatorProfileName,
           operatorProfilePath,
           operatorProfileText,
+          operatorProfilePreview,
           operatorDeepLink,
           operatorBackupPath,
           manualGameProfile,
@@ -1529,7 +1704,10 @@ export function App() {
           setOperatorCustomDomain,
           setOperatorProfileName,
           setOperatorProfilePath,
-          setOperatorProfileText,
+          setOperatorProfileText: (value) => {
+            setOperatorProfileText(value);
+            setOperatorProfilePreview(null);
+          },
           setOperatorDeepLink,
           setOperatorBackupPath,
           setManualGameProfile,
@@ -1543,11 +1721,14 @@ export function App() {
           refreshOperatorSnapshot: () => void refreshOperatorSnapshot(),
           pickExecutable: () => void handlePickExecutable(),
           runZapretChecks: () => void handleRunZapretChecks(),
+          repairWindowsNetwork: () => void handleRepairWindowsNetwork(),
           updateResource: (id) => void handleResourceUpdate(id),
           updateAllResources: () => void handleResourceUpdateAll(),
           rollbackResource: (id) => void handleResourceRollback(id),
+          previewLocalProfile: (mode) => void handlePreviewLocalProfile(mode),
           importLocalProfile: (mode) => void handleImportLocalProfile(mode),
           refreshAllProfiles: () => void handleRefreshAllProfiles(),
+          refreshDueProfiles: () => void handleRefreshDueProfiles(),
           droppedProfile: handleDroppedProfile,
           addManualGameProfile: handleAddManualGameProfile,
           backupAction: (action) => void handleBackupAction(action),
@@ -1556,6 +1737,10 @@ export function App() {
           addSubscriptionProfile: () => void handleAddSubscriptionProfile(),
           selectSubscriptionProfile: (id) => void handleSelectSubscriptionProfile(id),
           removeSubscriptionProfile: (id) => void handleRemoveSubscriptionProfile(id),
+          updateProfileNotes: (profile) => void handleProfileNotes(profile),
+          updateProfileFetchProxyMode: (profile, proxyMode) => void handleProfileFetchProxyMode(profile, proxyMode),
+          updateProfileFetchTimeout: (profile) => void handleProfileFetchTimeout(profile),
+          updateProfileFetchUserAgent: (profile) => void handleProfileFetchUserAgent(profile),
           runDiagnostics: () => void handleRunDiagnostics(),
           copyText: (label, text) => void handleCopyText(label, text),
           refreshAgentService: () => void refreshAgentService(),
@@ -1598,7 +1783,7 @@ export function App() {
                 </button>
               </div>
               {state.subscription.validation_error ? (
-                <span className="inlineError">{state.subscription.validation_error}</span>
+                <span className="inlineError">{subscriptionFailureCopy(state.subscription.validation_error)}</span>
               ) : null}
             </form>
 
@@ -1609,6 +1794,8 @@ export function App() {
                 detail={
                   hasSubscription
                     ? `${state.subscription.node_count || "Imported"} nodes ready`
+                    : state.subscription.validation_error
+                      ? subscriptionFailureCopy(state.subscription.validation_error)
                     : "Paste your BPN Clash/Mihomo subscription URL first."
                 }
               />
@@ -1661,58 +1848,26 @@ export function App() {
           </section>
         ) : (
           <section className="connectionPane dashboardPane">
-            {state.subscription.announce ? (
-              <div className="announceLine">
-                <Bell size={16} aria-hidden="true" />
-                <span>{state.subscription.announce}</span>
-                {announceUrl ? (
-                  <a href={announceUrl} target="_blank" rel="noreferrer" title="Open">
-                    <ExternalLink size={14} aria-hidden="true" />
-                  </a>
-                ) : null}
+            <div className="slothProfileHeader">
+              <div>
+                <span>Активный профиль</span>
+                <strong>{state.subscription.profile_title ?? "BPN subscription"}</strong>
+                <small>Подписка</small>
               </div>
-            ) : null}
-
-            <div className="heroLayout">
-              <div className="heroMain">
-                <div className="heroStatusLine">
-                  <span className={isConnected ? "statusDot online" : isRuntimeTransitioning ? "statusDot pending" : "statusDot"} />
-                  <span>{heroModeLabel}</span>
-                  {smartFallbackActive ? <span className="fallbackBadge">Fallback</span> : null}
-                </div>
-                <div className="heroCopy">
-                  <h1>{heroTitle}</h1>
-                  <p>{heroSubtitle}</p>
-                </div>
-                <div className="heroStats">
-                  <div className="statPill">
-                    <span>Профиль</span>
-                    <strong>{state.subscription.profile_title ?? "Subscription"}</strong>
-                  </div>
-                  <div className="statPill">
-                    <span>Узел</span>
-                    <strong>{currentNode}</strong>
-                  </div>
-                  <div className="statPill">
-                    <span>Остаток</span>
-                    <strong>{quota.trafficLeft}</strong>
-                  </div>
-                </div>
-              </div>
-
-              <div className="powerPanel">
-                <span className="powerPanelLabel">VPN</span>
-                <button
-                  className={isConnected ? "connectButton connected" : isRuntimeTransitioning ? "connectButton pending" : "connectButton"}
-                  type="button"
-                  onClick={() => void handlePrimaryConnectionAction()}
-                  disabled={busy || isRuntimeTransitioning}
-                  aria-label={isConnected ? "Disconnect" : "Connect"}
-                >
-                  {isRuntimeTransitioning ? <RefreshCw size={46} /> : isConnected ? <CirclePause size={48} /> : <Power size={48} />}
+              <div className="slothHeaderActions">
+                <button className="slothGhostButton" type="button" onClick={() => setState((current) => ({ ...current, phase: "onboarding" }))}>
+                  <Plus size={15} aria-hidden="true" />
+                  Добавить подписку
                 </button>
-                <strong>{statusLabel}</strong>
-                <span>{isConnected ? "Сессия активна" : hasSubscription ? "Нажмите для старта" : "Нужна подписка"}</span>
+                {supportUrl ? (
+                  <a className="slothSupportButton" href={supportUrl} target="_blank" rel="noreferrer">
+                    Поддержка
+                  </a>
+                ) : (
+                  <button className="slothSupportButton" type="button" onClick={() => setView("settings")}>
+                    Поддержка
+                  </button>
+                )}
               </div>
             </div>
 
@@ -1741,84 +1896,152 @@ export function App() {
               ) : null}
             </div>
 
-            <div className="dashboardGrid">
-              <section className="dashboardCard currentNodeCard">
-                <div className="cardTitleRow">
-                  <span>Текущий узел</span>
-                  <Server size={17} aria-hidden="true" />
+            <section className="slothCenterControl">
+              <button
+                className={isConnected ? "connectButton connected" : isRuntimeTransitioning ? "connectButton pending" : "connectButton"}
+                type="button"
+                onClick={() => void handlePrimaryConnectionAction()}
+                disabled={busy || isRuntimeTransitioning}
+                aria-label={isConnected ? "Disconnect" : "Connect"}
+              >
+                {isRuntimeTransitioning ? <RefreshCw size={50} /> : isConnected ? <CirclePause size={52} /> : <Power size={52} />}
+              </button>
+              <strong>{isConnected ? "Подключено" : statusLabel}</strong>
+              <span className="slothStatusPill">{heroModeLabel}</span>
+            </section>
+
+            <section className="slothControlRow">
+              <div className="slothSegmentBlock">
+                <span>Режим</span>
+                <div className="slothSegmented">
+                  <button className={settings.core.route_mode === "smart" ? "active" : ""} type="button" onClick={() => updateSettings({ ...settings, core: { ...settings.core, route_mode: "smart" } })}>
+                    Rule
+                  </button>
+                  <button className={settings.core.route_mode === "vpn_only" ? "active" : ""} type="button" onClick={() => updateSettings({ ...settings, core: { ...settings.core, route_mode: "vpn_only" } })}>
+                    Global
+                  </button>
                 </div>
-                <strong>{currentNode}</strong>
-                <p>{state.subscription.node_count ? `${state.subscription.node_count} узлов в подписке` : "Узлы появятся после импорта профиля."}</p>
-                <button className="subtleButton" type="button" onClick={() => setView("servers")} disabled={!hasSubscription}>
-                  <ListTree size={15} aria-hidden="true" />
-                  Выбрать узел
+              </div>
+
+              <button className="slothServerPill" type="button" onClick={() => setView("servers")}>
+                <IdentityBadge identity={currentServer} className="serverMedallion" size={24} />
+                <strong>{currentServer.label}</strong>
+                <span aria-hidden="true">›</span>
+              </button>
+
+              <div className="slothSegmentBlock alignEnd">
+                <span>Трафик</span>
+                <div className="slothSegmented">
+                  <button type="button">Прокси</button>
+                  <button className="active" type="button">TUN</button>
+                </div>
+              </div>
+            </section>
+
+            <section className="slothNoticeGrid">
+              <section className="slothAnnouncement">
+                <div className="slothAnnouncementHeader">
+                  <div className="providerAnnouncementMeta">
+                    <strong>Provider</strong>
+                    <small>{providerAnnouncement.timestamp}</small>
+                  </div>
+                  {providerAnnouncement.href ? (
+                    <a href={providerAnnouncement.href} target="_blank" rel="noreferrer">
+                      <ExternalLink size={13} aria-hidden="true" />
+                      {formatExternalLinkHost(providerAnnouncement.href)}
+                    </a>
+                  ) : null}
+                </div>
+                <span>{providerAnnouncement.message}</span>
+                <div className="bpnAnnouncementLine">
+                  <strong>BPN</strong>
+                  <span>Signed product announcements are not active.</span>
+                </div>
+              </section>
+
+              <section className="slothAgentCard">
+                <div className="slothAgentHeader">
+                  <Shield size={17} aria-hidden="true" />
+                  <div>
+                    <strong>badvpn-agent</strong>
+                    <span>служба для Mihomo, TUN и zapret/winws</span>
+                  </div>
+                </div>
+                <div className="slothAgentRows">
+                  <StatusRow label="Agent" value={agentHomeStatus} good={agentReady} />
+                  <StatusRow label="zapret" value={zapretHomeStatus} good={!needsZapret || zapretReady} />
+                </div>
+                <div className="slothAgentActions">
+                  {!agentReady ? (
+                    <button className="slothTextButton" type="button" onClick={() => void handleInstallAgentService()} disabled={agentServiceBusy || busy}>
+                      Install / repair
+                    </button>
+                  ) : null}
+                  <button className="slothTextButton" type="button" onClick={() => void handleRunZapretChecks()} disabled={busy}>
+                    Check zapret
+                  </button>
+                </div>
+              </section>
+            </section>
+
+            <section className="slothStatusGrid">
+              <div className="slothInfoPanel">
+                <StatusRow label="Сервис" value={state.running ? "Mihomo running" : "Stopped"} good={state.running} />
+                <StatusRow label="Активная группа" value={activeHomeGroup ? parseServerIdentity(activeHomeGroup.name).label : "—"} />
+                <StatusRow label="Сервер" value={currentServer.label} />
+                <StatusRow label="Latency" value={catalogSelectedNode?.delay_ms !== null && catalogSelectedNode?.delay_ms !== undefined ? `${catalogSelectedNode.delay_ms} ms` : "—"} />
+              </div>
+
+              <div className="slothInfoPanel">
+                <StatusRow label="Speed" value={`↑ ${trafficStats.uploadSpeed} ↓ ${trafficStats.downloadSpeed}`} />
+                <StatusRow label="Сессия" value={`↑ ${trafficStats.uploadTotal} ↓ ${trafficStats.downloadTotal}`} />
+                <StatusRow label="Осталось" value={quota.trafficLeft} />
+                <StatusRow label="Истекает" value={quota.expires} />
+              </div>
+            </section>
+
+            <section className="slothGroupsPanel">
+              <div className="slothGroupHeader">
+                <span>Proxy-groups</span>
+                <button className="slothTextButton" type="button" onClick={() => void refreshCatalog()} disabled={catalogBusy}>
+                  <RefreshCw size={14} aria-hidden="true" />
+                  Обновить
                 </button>
-              </section>
-
-              <section className="dashboardCard trafficCard">
-                <div className="cardTitleRow">
-                  <span>Трафик</span>
-                  <Wifi size={17} aria-hidden="true" />
-                </div>
-                <div className="trafficSplit">
-                  <Metric icon={<Upload size={15} />} label="Up" value={formatBytes(state.metrics.upload_bytes)} />
-                  <Metric icon={<Download size={15} />} label="Down" value={formatBytes(state.metrics.download_bytes)} />
-                </div>
-                <button className="statusActionRow" type="button" onClick={() => setView("connections")} disabled={!state.connection.connected}>
-                  <span>Active flows</span>
-                  <strong>{state.connection.connected ? String(activeConnectionCount) : "0"}</strong>
-                </button>
-                <StatusRow label="Expires" value={quota.expires} />
-              </section>
-
-              <section className="dashboardCard routeMatrixCard">
-                <div className="cardTitleRow">
-                  <span>Активные правила</span>
-                  <Router size={17} aria-hidden="true" />
-                </div>
-                <div className="homeRouteSummary">
-                  {routeSummary.map((item) => (
-                    <div key={item.label} className="homeRouteItem">
-                      <span>{item.label}</span>
-                      <strong>{item.value}</strong>
-                    </div>
-                  ))}
-                </div>
-                <div className="ruleChips">
-                  <span>{policySummary?.rule_count ?? "—"} rules</span>
-                  <span>{overrideCount} local overrides</span>
-                </div>
-                <div className="balanceStrip">
-                  <span className={state.diagnostics.mihomo_healthy || state.running ? "ok" : "idle"}>Mihomo</span>
-                  <span className={smartFallbackActive ? "warn" : state.diagnostics.zapret_healthy ? "ok" : "idle"}>zapret</span>
-                  <strong>{smartFallbackActive ? "VPN Only fallback" : heroModeLabel}</strong>
-                </div>
-              </section>
-
-              <section className="dashboardCard quickActionsCard">
-                <div className="cardTitleRow">
-                  <span>Быстрые действия</span>
-                  <Zap size={17} aria-hidden="true" />
-                </div>
-                <div className="quickActionGrid">
-                  <button className="subtleButton" type="button" onClick={() => void handleRefreshSubscription()} disabled={busy || !hasSubscription}>
-                    <RefreshCw size={15} aria-hidden="true" />
-                    Обновить
-                  </button>
-                  <button className="subtleButton" type="button" onClick={() => setView("policy")}>
-                    <BookOpen size={15} aria-hidden="true" />
-                    Policy
-                  </button>
-                  <button className="subtleButton" type="button" onClick={() => setView("settings")}>
-                    <Settings size={15} aria-hidden="true" />
-                    Settings
-                  </button>
-                </div>
-                <div className="presetList">
-                  {activeSmartPresets.length ? activeSmartPresets.map((preset) => <span key={preset.label}>{preset.label}</span>) : <span>Пресеты выключены</span>}
-                </div>
-              </section>
-            </div>
+              </div>
+              <div className="slothGroupList">
+                {homeGroups.length ? (
+                  homeGroups.map((group) => {
+                    const identity = parseServerIdentity(group.name);
+                    return (
+                      <button
+                        className={group.name === activeHomeGroup?.name ? "slothGroupChip active" : "slothGroupChip"}
+                        type="button"
+                        key={group.name}
+                        onClick={() => setSelectedGroup(group.name)}
+                      >
+                        <IdentityBadge identity={identity} className="groupEmoji" size={14} fallback={<ListTree size={14} aria-hidden="true" />} />
+                        <strong>{identity.label}</strong>
+                        <small>{group.selected ? parseServerIdentity(group.selected).label : `${group.nodes.length} nodes`}</small>
+                      </button>
+                    );
+                  })
+                ) : (
+                  <EmptyList icon={<Server size={22} />} title="Каталог недоступен" text={lastCatalogError ?? "Запустите runtime или обновите подписку, чтобы увидеть proxy-groups."} />
+                )}
+              </div>
+              <div className="slothNodeList">
+                {homeNodes.slice(0, 6).map((node) => (
+                  <HomeNodeButton
+                    key={`${activeHomeGroup?.name}-${node.name}`}
+                    group={activeHomeGroup?.name ?? ""}
+                    node={node}
+                    selected={node.selected || node.name === activeHomeGroup?.selected || node.name === currentNode}
+                    busy={catalogBusy}
+                    select={handleSelectProxy}
+                  />
+                ))}
+              </div>
+            </section>
           </section>
         )}
 
@@ -1848,6 +2071,17 @@ export function App() {
                 <StatusRow label="Nodes" value={String(state.subscription.node_count)} good />
                 <StatusRow label="Format" value={formatRouteMode(state.subscription.format)} />
                 <StatusRow label="Refresh" value={formatRefreshInterval(state.subscription.update_interval_hours)} />
+                {providerLinks.length > 0 ? (
+                  <div className="providerLinkList">
+                    {providerLinks.map((link) => (
+                      <a key={`${link.label}-${link.href}`} href={link.href} target="_blank" rel="noreferrer">
+                        <ExternalLink size={13} aria-hidden="true" />
+                        <span>{link.label}</span>
+                        <small>{formatExternalLinkHost(link.href)}</small>
+                      </a>
+                    ))}
+                  </div>
+                ) : null}
                 <button className="subtleButton" type="button" onClick={() => void handleRefreshSubscription()} disabled={busy}>
                   <RefreshCw size={15} aria-hidden="true" />
                   Refresh
@@ -1905,16 +2139,16 @@ export function App() {
             <Settings size={19} aria-hidden="true" />
           </RailButton>
         </nav>
-        <div className="railStatusCard" title={statusLabel}>
+        <div className="railStatusCard" title={heroModeLabel}>
           <span className={isConnected ? "railLed on" : "railLed"} />
           <div>
-            <strong>{statusLabel}</strong>
-            <span>{heroModeLabel}</span>
+            <strong>{heroModeLabel}</strong>
+            <span>{state.connection.status}</span>
           </div>
         </div>
       </aside>
 
-      <section className="appPane">
+      <section className={view === "overview" ? "appPane overviewPane" : "appPane"}>
         <header className="appHeader">
           <div className="titleGroup">
             <strong>{viewTitle(view)}</strong>
@@ -2293,12 +2527,12 @@ function renderServersPage({
             <div className="nodeList">
               <div className="nodeHeader">
                 <div>
-                  <strong>{activeGroup?.name}</strong>
+                  <strong>{activeGroup ? parseServerIdentity(activeGroup.name).label : ""}</strong>
                   <span>
                     {activeGroup?.group_type} group · {visibleNodes.length}/{activeGroup?.nodes.length ?? 0} nodes
                   </span>
                 </div>
-                <span>{activeGroup?.selected ? `Selected: ${activeGroup.selected}` : "No runtime selection"}</span>
+                <span>{activeGroup?.selected ? `Selected: ${parseServerIdentity(activeGroup.selected).label}` : "No runtime selection"}</span>
               </div>
               {activeGroup && visibleNodes.length > 0 ? (
                 visibleNodes.map((node) => (
@@ -2764,6 +2998,7 @@ function renderSettingsPage({
   operatorProfileName,
   operatorProfilePath,
   operatorProfileText,
+  operatorProfilePreview,
   operatorDeepLink,
   operatorBackupPath,
   manualGameProfile,
@@ -2808,11 +3043,14 @@ function renderSettingsPage({
   refreshOperatorSnapshot,
   pickExecutable,
   runZapretChecks,
+  repairWindowsNetwork,
   updateResource,
   updateAllResources,
   rollbackResource,
+  previewLocalProfile,
   importLocalProfile,
   refreshAllProfiles,
+  refreshDueProfiles,
   droppedProfile,
   addManualGameProfile,
   backupAction,
@@ -2821,6 +3059,10 @@ function renderSettingsPage({
   addSubscriptionProfile,
   selectSubscriptionProfile,
   removeSubscriptionProfile,
+  updateProfileNotes,
+  updateProfileFetchProxyMode,
+  updateProfileFetchTimeout,
+  updateProfileFetchUserAgent,
   runDiagnostics,
   copyText,
   refreshAgentService,
@@ -2850,6 +3092,7 @@ function renderSettingsPage({
   operatorProfileName: string;
   operatorProfilePath: string;
   operatorProfileText: string;
+  operatorProfilePreview: LocalProfilePreview | null;
   operatorDeepLink: string;
   operatorBackupPath: string;
   manualGameProfile: {
@@ -2908,11 +3151,14 @@ function renderSettingsPage({
   refreshOperatorSnapshot: () => void;
   pickExecutable: () => void;
   runZapretChecks: () => void;
+  repairWindowsNetwork: () => void;
   updateResource: (id: string) => void;
   updateAllResources: () => void;
   rollbackResource: (id: string) => void;
+  previewLocalProfile: (mode: "path" | "text") => void;
   importLocalProfile: (mode: "path" | "text" | "link") => void;
   refreshAllProfiles: () => void;
+  refreshDueProfiles: () => void;
   droppedProfile: (file: File) => void;
   addManualGameProfile: () => void;
   backupAction: (action: "export" | "support" | "restore") => void;
@@ -2921,6 +3167,10 @@ function renderSettingsPage({
   addSubscriptionProfile: () => void;
   selectSubscriptionProfile: (id: string) => void;
   removeSubscriptionProfile: (id: string) => void;
+  updateProfileNotes: (profile: SubscriptionProfileView) => void;
+  updateProfileFetchProxyMode: (profile: SubscriptionProfileView, proxyMode: SubscriptionFetchProxyMode) => void;
+  updateProfileFetchTimeout: (profile: SubscriptionProfileView) => void;
+  updateProfileFetchUserAgent: (profile: SubscriptionProfileView) => void;
   runDiagnostics: () => void;
   copyText: (label: string, text: string) => void;
   refreshAgentService: () => void;
@@ -2960,6 +3210,7 @@ function renderSettingsPage({
   const localOverridePreview = previewLocalOverride(localOverrideRoute, localOverrideKind, localOverrideValue);
   const localOverrideAllowed = localOverrideKinds.includes(localOverrideKind);
   const localOverrideDuplicate = localOverrideExists(settings.routing_policy, localOverrideRoute, localOverrideKind, localOverrideValue);
+  const providerLinks = providerMetadataLinks(state.subscription);
   const addLocalOverride = () => {
     const patch = buildLocalOverridePatch(settings.routing_policy, localOverrideRoute, localOverrideKind, localOverrideValue);
     if (!patch) {
@@ -3500,6 +3751,7 @@ function renderSettingsPage({
                 setProfilePath: setOperatorProfilePath,
                 profileText: operatorProfileText,
                 setProfileText: setOperatorProfileText,
+                profilePreview: operatorProfilePreview,
                 deepLink: operatorDeepLink,
                 setDeepLink: setOperatorDeepLink,
                 backupPath: operatorBackupPath,
@@ -3511,11 +3763,14 @@ function renderSettingsPage({
                 refresh: refreshOperatorSnapshot,
                 pickExecutable,
                 runZapretChecks,
+                repairWindowsNetwork,
                 updateResource,
                 updateAllResources,
                 rollbackResource,
+                previewLocalProfile,
                 importLocalProfile,
                 refreshAllProfiles,
+                refreshDueProfiles,
                 droppedProfile,
                 addManualGameProfile,
                 backupAction,
@@ -3533,6 +3788,17 @@ function renderSettingsPage({
                     <StatusRow label="Nodes" value={String(state.subscription.node_count)} good />
                     <StatusRow label="Format" value={formatRouteMode(state.subscription.format)} />
                     <StatusRow label="Refresh" value={formatRefreshInterval(state.subscription.update_interval_hours)} />
+                    {providerLinks.length > 0 ? (
+                      <div className="providerLinkList">
+                        {providerLinks.map((link) => (
+                          <a key={`${link.label}-${link.href}`} href={link.href} target="_blank" rel="noreferrer">
+                            <ExternalLink size={13} aria-hidden="true" />
+                            <span>{link.label}</span>
+                            <small>{formatExternalLinkHost(link.href)}</small>
+                          </a>
+                        ))}
+                      </div>
+                    ) : null}
                   </>
                 ) : (
                   <p className="diagnosticText">No subscription imported.</p>
@@ -3554,6 +3820,10 @@ function renderSettingsPage({
                     <RefreshCw size={15} aria-hidden="true" />
                     Refresh active
                   </button>
+                  <button className="subtleButton" type="button" onClick={refreshDueProfiles} disabled={busy || profilesBusy}>
+                    <RefreshCw size={15} aria-hidden="true" />
+                    Refresh due
+                  </button>
                 </div>
                 <div className="profileList">
                   {subscriptionProfiles.profiles.length ? (
@@ -3561,11 +3831,40 @@ function renderSettingsPage({
                       <div key={profile.id} className={profile.active ? "profileRow active" : "profileRow"}>
                         <div>
                           <strong>{profile.name}</strong>
+                          {profile.description ? <em>{profile.description}</em> : null}
                           <span>{profile.redacted_url ?? formatRouteMode(profile.subscription.format)}</span>
+                          {profile.last_refresh_error ? (
+                            <em className="profileRefreshError">
+                              Last refresh failed: {subscriptionFailureCopy(profile.last_refresh_error)}
+                            </em>
+                          ) : (
+                            <em>{formatProfileRefreshStatus(profile)}</em>
+                          )}
+                          <em>{formatProfileFetchOptions(profile)}</em>
+                          <div className="profileFetchControls">
+                            <select
+                              value={profile.fetch_options.proxy_mode}
+                              onChange={(event) => updateProfileFetchProxyMode(profile, event.currentTarget.value as SubscriptionFetchProxyMode)}
+                              disabled={profilesBusy}
+                            >
+                              <option value="system">System proxy</option>
+                              <option value="direct">Direct</option>
+                              <option value="custom">Custom proxy</option>
+                            </select>
+                            <button className="textAction" type="button" onClick={() => updateProfileFetchTimeout(profile)} disabled={profilesBusy}>
+                              {profile.fetch_options.timeout_seconds}s
+                            </button>
+                            <button className="textAction" type="button" onClick={() => updateProfileFetchUserAgent(profile)} disabled={profilesBusy}>
+                              UA
+                            </button>
+                          </div>
                         </div>
                         <span>{profile.subscription.node_count} nodes</span>
                         <button className="subtleButton" type="button" onClick={() => selectSubscriptionProfile(profile.id)} disabled={profilesBusy || profile.active}>
                           {profile.active ? "Active" : "Select"}
+                        </button>
+                        <button className="subtleButton" type="button" onClick={() => updateProfileNotes(profile)} disabled={profilesBusy}>
+                          Notes
                         </button>
                         <button className="subtleButton danger" type="button" onClick={() => removeSubscriptionProfile(profile.id)} disabled={profilesBusy}>
                           <X size={14} aria-hidden="true" />
@@ -3579,6 +3878,14 @@ function renderSettingsPage({
               </Panel>
               <Panel title="Updates">
                 <ToggleRow label="Flowseal lists" checked={settings.updates.auto_flowseal_list_refresh} disabled={settingsBusy} onChange={(checked) => updateUpdates({ auto_flowseal_list_refresh: checked })} />
+                <NumberField
+                  label="Safe resource interval, h"
+                  value={settings.updates.safe_resource_auto_update_interval_hours}
+                  min={1}
+                  max={168}
+                  disabled={settingsBusy || !settings.updates.auto_flowseal_list_refresh}
+                  onChange={(value) => updateUpdates({ safe_resource_auto_update_interval_hours: Math.min(Math.max(value, 1), 168) })}
+                />
                 <StatusRow label="App" value={formatAppUpdateStatus(appUpdate)} />
                 {componentUpdates.slice(0, 3).map((component) => (
                   <StatusRow key={component.name} label={component.name} value={formatComponentUpdate(component)} />
@@ -3709,6 +4016,7 @@ function renderOperatorTools({
   setProfilePath,
   profileText,
   setProfileText,
+  profilePreview,
   deepLink,
   setDeepLink,
   backupPath,
@@ -3720,11 +4028,14 @@ function renderOperatorTools({
   refresh,
   pickExecutable,
   runZapretChecks,
+  repairWindowsNetwork,
   updateResource,
   updateAllResources,
   rollbackResource,
+  previewLocalProfile,
   importLocalProfile,
   refreshAllProfiles,
+  refreshDueProfiles,
   droppedProfile,
   addManualGameProfile,
   backupAction,
@@ -3752,6 +4063,7 @@ function renderOperatorTools({
   setProfilePath: (value: string) => void;
   profileText: string;
   setProfileText: (value: string) => void;
+  profilePreview: LocalProfilePreview | null;
   deepLink: string;
   setDeepLink: (value: string) => void;
   backupPath: string;
@@ -3777,11 +4089,14 @@ function renderOperatorTools({
   refresh: () => void;
   pickExecutable: () => void;
   runZapretChecks: () => void;
+  repairWindowsNetwork: () => void;
   updateResource: (id: string) => void;
   updateAllResources: () => void;
   rollbackResource: (id: string) => void;
+  previewLocalProfile: (mode: "path" | "text") => void;
   importLocalProfile: (mode: "path" | "text" | "link") => void;
   refreshAllProfiles: () => void;
+  refreshDueProfiles: () => void;
   droppedProfile: (file: File) => void;
   addManualGameProfile: () => void;
   backupAction: (action: "export" | "support" | "restore") => void;
@@ -3830,6 +4145,10 @@ function renderOperatorTools({
           <button className="primarySmall" type="button" onClick={runZapretChecks} disabled={busy}>
             <Activity size={15} aria-hidden="true" />
             Run checks
+          </button>
+          <button className="subtleButton" type="button" onClick={repairWindowsNetwork} disabled={busy}>
+            <Router size={15} aria-hidden="true" />
+            Repair network
           </button>
         </div>
         <div className="diagnosticList">
@@ -4002,14 +4321,32 @@ function renderOperatorTools({
         <div className="profileAddRow">
           <input value={profileName} placeholder="Display name" onChange={(event) => setProfileName(event.currentTarget.value)} />
           <input value={profilePath} placeholder="C:\\path\\profile.yaml" onChange={(event) => setProfilePath(event.currentTarget.value)} />
+          <button className="subtleButton" type="button" onClick={() => previewLocalProfile("path")} disabled={busy || !profilePath.trim()}>
+            Preview path
+          </button>
           <button className="subtleButton" type="button" onClick={() => importLocalProfile("path")} disabled={busy || !profilePath.trim()}>
             Import path
           </button>
         </div>
         <TextAreaField label="Profile body" value={profileText} onChange={setProfileText} />
-        <button className="subtleButton" type="button" onClick={() => importLocalProfile("text")} disabled={busy || !profileText.trim()}>
-          Import text
-        </button>
+        <div className="buttonRow">
+          <button className="subtleButton" type="button" onClick={() => previewLocalProfile("text")} disabled={busy || !profileText.trim()}>
+            Preview text
+          </button>
+          <button className="subtleButton" type="button" onClick={() => importLocalProfile("text")} disabled={busy || !profileText.trim()}>
+            Import text
+          </button>
+        </div>
+        {profilePreview ? (
+          <div className={profilePreview.import_ready ? "profilePreview" : "profilePreview warning"}>
+            <strong>{profilePreview.display_name}</strong>
+            <span>
+              {formatRouteMode(profilePreview.format)} · {profilePreview.node_count} node(s) · {formatBytes(profilePreview.decoded_size_bytes)}
+            </span>
+            {profilePreview.source_file_name ? <small>{profilePreview.source_file_name}</small> : null}
+            {profilePreview.warning ? <em>{profilePreview.warning}</em> : null}
+          </div>
+        ) : null}
         <div className="profileAddRow">
           <input value={deepLink} placeholder="bpn://import?url=..." onChange={(event) => setDeepLink(event.currentTarget.value)} />
           <button className="subtleButton" type="button" onClick={() => importLocalProfile("link")} disabled={busy || !deepLink.trim()}>
@@ -4017,6 +4354,9 @@ function renderOperatorTools({
           </button>
           <button className="subtleButton" type="button" onClick={refreshAllProfiles} disabled={busy}>
             Refresh all
+          </button>
+          <button className="subtleButton" type="button" onClick={refreshDueProfiles} disabled={busy}>
+            Refresh due
           </button>
         </div>
       </Panel>
@@ -4157,11 +4497,15 @@ function SegmentedControl({
 function NumberField({
   label,
   value,
+  min = 1,
+  max = 65535,
   disabled,
   onChange,
 }: {
   label: string;
   value: number;
+  min?: number;
+  max?: number;
   disabled?: boolean;
   onChange: (value: number) => void;
 }) {
@@ -4170,8 +4514,8 @@ function NumberField({
       <span>{label}</span>
       <input
         type="number"
-        min={1}
-        max={65535}
+        min={min}
+        max={max}
         value={value}
         disabled={disabled}
         onChange={(event) => onChange(Number(event.currentTarget.value))}
@@ -4401,20 +4745,29 @@ function DetailItem({ label, value }: { label: string; value: string }) {
 }
 
 function GroupButton({ group, active, onClick }: { group: ProxyGroupView; active: boolean; onClick: () => void }) {
+  const identity = parseServerIdentity(group.name);
+  const selected = group.selected ? parseServerIdentity(group.selected).label : `${group.nodes.length} nodes`;
   return (
     <button className={active ? "groupButton active" : "groupButton"} type="button" onClick={onClick}>
-      <span>{group.name}</span>
-      <strong>{group.selected ?? `${group.nodes.length} nodes`}</strong>
+      <IdentityBadge identity={identity} className="groupEmoji" size={14} fallback={<ListTree size={14} aria-hidden="true" />} />
+      <div>
+        <span>{identity.label}</span>
+        <strong>{selected}</strong>
+      </div>
     </button>
   );
 }
 
 function NodeRow({ group, node, busy, select }: { group: string; node: ProxyNodeView; busy: boolean; select: (group: string, proxy: string) => void }) {
+  const identity = parseServerIdentity(node.name);
   return (
     <div className={node.selected ? "nodeRow selected" : "nodeRow"}>
-      <div>
-        <strong>{node.name}</strong>
-        <span>{node.proxy_type ?? "proxy"}{node.server ? ` / ${node.server}` : ""}</span>
+      <div className="nodeIdentity">
+        <IdentityBadge identity={identity} className="nodeFlag" size={17} />
+        <div>
+          <strong>{identity.label}</strong>
+          <span>{node.proxy_type ?? "proxy"}{node.server ? ` / ${node.server}` : ""}</span>
+        </div>
       </div>
       <div className="nodeMeta">
         <span>{node.delay_ms !== null ? `${node.delay_ms} ms` : "No ping"}</span>
@@ -4429,6 +4782,54 @@ function NodeRow({ group, node, busy, select }: { group: string; node: ProxyNode
       </div>
     </div>
   );
+}
+
+function HomeNodeButton({
+  group,
+  node,
+  selected,
+  busy,
+  select,
+}: {
+  group: string;
+  node: ProxyNodeView;
+  selected: boolean;
+  busy: boolean;
+  select: (group: string, proxy: string) => void;
+}) {
+  const identity = parseServerIdentity(node.name);
+  return (
+    <button
+      className={selected ? "homeNodeButton selected" : "homeNodeButton"}
+      type="button"
+      onClick={() => select(group, node.name)}
+      disabled={busy || selected}
+    >
+      <IdentityBadge identity={identity} className="nodeFlag" size={17} />
+      <span className="homeNodeText">
+        <strong>{identity.label}</strong>
+        <small>{formatNodeMeta(node)}</small>
+      </span>
+      <span className={node.alive === false ? "nodeLatency bad" : "nodeLatency"}>{node.delay_ms !== null ? `${node.delay_ms} ms` : "—"}</span>
+    </button>
+  );
+}
+
+function IdentityBadge({
+  identity,
+  className,
+  size,
+  fallback,
+}: {
+  identity: ServerIdentity;
+  className: string;
+  size: number;
+  fallback?: ReactNode;
+}) {
+  if (identity.countryCode) {
+    return <span className={`${className} countryFlag flag-${identity.countryCode.toLowerCase()}`} aria-label={`${identity.countryCode} flag`} />;
+  }
+  return <span className={identity.flag ? `${className} hasFlag` : className}>{identity.flag ?? fallback ?? <Globe2 size={size} aria-hidden="true" />}</span>;
 }
 
 function LegendItem({ tone, title, text }: { tone: string; title: string; text: string }) {
@@ -4567,6 +4968,62 @@ function formatRefreshInterval(hours: number | null) {
     return "Manual";
   }
   return `${hours} h`;
+}
+
+function formatProfileRefreshStatus(profile: SubscriptionProfileView) {
+  if (profile.next_refresh_at) {
+    return `Next refresh ${new Date(profile.next_refresh_at * 1000).toLocaleString()}`;
+  }
+  if (profile.last_successful_refresh_at) {
+    return `Last refreshed ${new Date(profile.last_successful_refresh_at * 1000).toLocaleString()}`;
+  }
+  return `Added ${new Date(profile.created_at).toLocaleString()}`;
+}
+
+function formatProfileFetchOptions(profile: SubscriptionProfileView) {
+  const mode =
+    profile.fetch_options.proxy_mode === "direct"
+      ? "direct"
+      : profile.fetch_options.proxy_mode === "custom"
+        ? `custom ${profile.fetch_options.custom_proxy_redacted ?? "proxy"}`
+        : "system proxy";
+  const userAgent = profile.fetch_options.user_agent ? ", custom UA" : "";
+  return `Fetch: ${mode}, ${profile.fetch_options.timeout_seconds}s${userAgent}`;
+}
+
+function subscriptionFailureCopy(error: string | null) {
+  if (!error) {
+    return "";
+  }
+  const value = error.toLocaleLowerCase();
+  if (/(hwid|devices?|too many devices|лимит.*устрой|устройств|устройство)/i.test(error)) {
+    return "Панель провайдера отклонила профиль: достигнут лимит устройств/HWID. Откройте личный кабинет или поддержку провайдера, сбросьте привязки устройств и обновите подписку.";
+  }
+  if (value.includes("expired") || value.includes("истек") || value.includes("законч")) {
+    return "Подписка истекла. Продлите профиль в панели провайдера, затем обновите подписку в BadVpn.";
+  }
+  if (value.includes("quota") || value.includes("traffic") || value.includes("трафик") || value.includes("лимит трафика")) {
+    return "Лимит трафика по подписке исчерпан. Пополните или продлите тариф у провайдера, затем обновите профиль.";
+  }
+  if (value.includes("unauthorized") || value.includes("forbidden") || value.includes("token") || value.includes("401") || value.includes("403")) {
+    return "Провайдер не принял токен подписки. Сгенерируйте свежую ссылку в панели провайдера и импортируйте ее заново.";
+  }
+  if (value.includes("rate-limit") || value.includes("rate limit") || value.includes("too many requests") || value.includes("429")) {
+    return "Провайдер временно ограничил частоту обновлений. Подождите несколько минут и попробуйте снова.";
+  }
+  if (value.includes("not found") || value.includes("could not find") || value.includes("404") || value.includes("410")) {
+    return "Провайдер не нашел этот профиль. Создайте новую ссылку подписки в панели провайдера.";
+  }
+  if (value.includes("maintenance") || value.includes("temporarily unavailable") || value.includes("502") || value.includes("503") || value.includes("504")) {
+    return "Панель провайдера временно недоступна. BadVpn сохранит последний рабочий профиль; повторите обновление позже.";
+  }
+  if (value.includes("invalid format") || value.includes("not a supported") || value.includes("no usable nodes")) {
+    return "Ответ подписки не похож на Clash/Mihomo профиль или URI-list. Проверьте формат экспорта в панели провайдера.";
+  }
+  if (value.includes("provider returned") || value.includes("provider rejected")) {
+    return "Провайдер вернул ошибку подписки. Последний рабочий профиль сохранен; если ошибка повторится, обратитесь в поддержку провайдера.";
+  }
+  return error;
 }
 
 function formatBytes(bytes: number) {
@@ -4735,6 +5192,11 @@ function buildSupportSummary({
   const diagnosticSummary = runtimeDiagnostics
     ? runtimeDiagnostics.checks.map((check) => `${check.label}:${check.status}`).join(", ")
     : "not run";
+  const providerLinks = providerMetadataLinks(state.subscription);
+  const providerLinkSummary = providerLinks.length
+    ? providerLinks.map((link) => `${link.label}:${formatExternalLinkHost(link.href)}`).join(", ")
+    : "none";
+  const providerAnnouncement = providerAnnouncementMetadata(state.subscription);
 
   return [
     "BadVpn support summary",
@@ -4743,6 +5205,7 @@ function buildSupportSummary({
     "",
     `[state] phase=${state.phase}; connected=${state.connection.connected}; status=${state.connection.status}; route=${formatRouteMode(state.connection.route_mode)}; selected_profile=${state.connection.selected_profile ?? "none"}; selected_proxy=${state.connection.selected_proxy ?? "auto"}`,
     `[subscription] valid=${state.subscription.is_valid ?? "unknown"}; format=${formatRouteMode(state.subscription.format)}; nodes=${state.subscription.node_count}; title=${state.subscription.profile_title ?? "none"}`,
+    `[announcements] bpn_signed=none; provider_source=${providerAnnouncement.source}; provider_updated=${providerAnnouncement.timestamp}; provider_links=${providerLinkSummary}`,
     `[traffic] upload=${formatBytes(state.metrics.upload_bytes)}; download=${formatBytes(state.metrics.download_bytes)}`,
     `[settings] route_mode=${formatRouteMode(settings.core.route_mode)}; tun=${settings.tun.enabled}; dns=${settings.dns.mode}; zapret=${settings.zapret.enabled}; strategy=${settings.zapret.strategy}`,
     `[local_overrides] enabled=${settings.routing_policy.local_overrides_enabled}; total=${countLocalRoutingOverrides(settings.routing_policy)}; vpn=${settings.routing_policy.force_vpn_domains.length + settings.routing_policy.force_vpn_cidrs.length}; zapret=${settings.routing_policy.force_zapret_domains.length + settings.routing_policy.force_zapret_cidrs.length + settings.routing_policy.force_zapret_processes.length + settings.routing_policy.force_zapret_tcp_ports.length + settings.routing_policy.force_zapret_udp_ports.length}; direct=${settings.routing_policy.force_direct_domains.length + settings.routing_policy.force_direct_cidrs.length + settings.routing_policy.force_direct_processes.length}`,
@@ -4752,6 +5215,55 @@ function buildSupportSummary({
     `[diagnostics] mihomo=${runtimeDiagnostics?.mihomo_healthy ?? state.diagnostics.mihomo_healthy}; zapret=${runtimeDiagnostics?.zapret_healthy ?? state.diagnostics.zapret_healthy}; checks=${diagnosticSummary}; last_error=${state.last_error ?? "none"}`,
     `[policy] available=${policySummary?.available ?? false}; mode=${policySummary ? formatRouteMode(policySummary.mode) : "unknown"}; rules=${policySummary?.rule_count ?? 0}; suppressed=${policySummary?.suppressed_count ?? 0}; warnings=${policySummary?.warnings_count ?? 0}; zapret_domains=${policySummary?.zapret_domain_count ?? 0}; sources=${sourceSummary || "unknown"}`,
   ].join("\n");
+}
+
+function providerAnnouncementMetadata(subscription: AgentState["subscription"]) {
+  const link = providerMetadataLinks(subscription).find((item) => item.label === "Announcement" || item.label === "Account");
+  return {
+    source: "subscription",
+    timestamp: formatSubscriptionMetadataTimestamp(subscription.last_refreshed_at),
+    message: subscription.announce ?? "Нет объявлений от подписки.",
+    href: link?.href ?? null,
+  };
+}
+
+function formatSubscriptionMetadataTimestamp(value: string | null) {
+  if (!value) {
+    return "not refreshed";
+  }
+  const numeric = Number(value);
+  const date = Number.isFinite(numeric) ? new Date(numeric * 1000) : new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "not refreshed";
+  }
+  return date.toLocaleString();
+}
+
+function providerMetadataLinks(subscription: AgentState["subscription"]) {
+  const links: Array<{ label: string; href: string }> = [];
+  const push = (label: string, href: string | null) => {
+    const value = href?.trim();
+    if (!value || !/^https?:\/\//i.test(value)) {
+      return;
+    }
+    if (links.some((link) => link.href === value)) {
+      return;
+    }
+    links.push({ label, href: value });
+  };
+
+  push("Announcement", subscription.announce_url);
+  push("Account", subscription.profile_web_page_url);
+  push("Support", subscription.support_url);
+  return links;
+}
+
+function formatExternalLinkHost(href: string) {
+  try {
+    return new URL(href).host;
+  } catch {
+    return "provider link";
+  }
 }
 
 function countLocalRoutingOverrides(policy: AppSettings["routing_policy"]) {
@@ -4931,6 +5443,124 @@ function getRuntimeComponentStatus(components: ComponentUpdate[], readiness: Run
   return {
     status: "ready",
     detail: "Mihomo, zapret, and route lists are present.",
+  };
+}
+
+function getSelectedCatalogNode(catalog: ProxyCatalog | null) {
+  for (const group of catalog?.groups ?? []) {
+    const selected = group.nodes.find((node) => node.selected || node.name === group.selected);
+    if (selected) {
+      return selected;
+    }
+  }
+  return null;
+}
+
+function getActiveHomeGroup(catalog: ProxyCatalog | null, selectedGroup: string | null) {
+  const groups = catalog?.groups ?? [];
+  return (
+    groups.find((group) => group.name === selectedGroup) ??
+    groups.find((group) => group.name === "Выбор сервера") ??
+    groups.find((group) => group.group_type === "select") ??
+    groups[0] ??
+    null
+  );
+}
+
+type ServerIdentity = {
+  countryCode: string | null;
+  flag: string | null;
+  label: string;
+  raw: string;
+};
+
+function parseServerIdentity(name: string): ServerIdentity {
+  const flag = name.match(/[\u{1F1E6}-\u{1F1FF}]{2}/u)?.[0] ?? null;
+  const emoji = flag ?? name.match(/[\p{Emoji_Presentation}\u{2600}-\u{27BF}]/u)?.[0] ?? null;
+  const label = name
+    .replace(/[\u{1F1E6}-\u{1F1FF}]{2}/gu, "")
+    .replace(/[\p{Emoji_Presentation}\u{2600}-\u{27BF}]/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return {
+    countryCode: detectCountryCode(name, flag),
+    flag: emoji,
+    label: label || name,
+    raw: name,
+  };
+}
+
+function detectCountryCode(name: string, flag: string | null) {
+  const codeFromFlag = flag ? countryCodeFromRegionalFlag(flag) : null;
+  if (codeFromFlag) {
+    return codeFromFlag;
+  }
+  const normalized = name.toLocaleLowerCase();
+  const countryPatterns: Array<[RegExp, string]> = [
+    [/\b(?:nl|nld|netherlands)\b|нидерланд|голланд/, "NL"],
+    [/\b(?:de|deu|germany)\b|герман/, "DE"],
+    [/\b(?:us|usa|united states|dallas)\b|сша|америк/, "US"],
+    [/\b(?:se|swe|sweden)\b|швец/, "SE"],
+    [/\b(?:ch|che|switzerland)\b|швейцар/, "CH"],
+    [/\b(?:tr|tur|turkey)\b|турц/, "TR"],
+    [/\b(?:ru|rus|russia|spb|moscow)\b|росси|москв|спб/, "RU"],
+    [/\b(?:fi|fin|finland)\b|финлянд/, "FI"],
+    [/\b(?:fr|fra|france)\b|франц/, "FR"],
+    [/\b(?:gb|uk|gbr|united kingdom|london)\b|британ|англи/, "GB"],
+    [/\b(?:pl|pol|poland)\b|польш/, "PL"],
+    [/\b(?:jp|jpn|japan|tokyo)\b|япон/, "JP"],
+    [/\b(?:sg|sgp|singapore)\b|сингапур/, "SG"],
+    [/\b(?:ca|can|canada)\b|канад/, "CA"],
+  ];
+  return countryPatterns.find(([pattern]) => pattern.test(normalized))?.[1] ?? null;
+}
+
+function countryCodeFromRegionalFlag(flag: string) {
+  const chars = Array.from(flag);
+  if (chars.length !== 2) {
+    return null;
+  }
+  const code = chars
+    .map((char) => {
+      const point = char.codePointAt(0);
+      return point ? String.fromCharCode(point - 0x1f1e6 + 65) : "";
+    })
+    .join("");
+  return /^[A-Z]{2}$/.test(code) ? code : null;
+}
+
+function formatNodeMeta(node: ProxyNodeView) {
+  const parts = [node.proxy_type ?? (node.is_group ? "group" : "proxy")];
+  if (node.server) {
+    parts.push(node.server);
+  }
+  if (node.alive === false) {
+    parts.push("offline");
+  }
+  return parts.join(" / ");
+}
+
+function getTrafficStats(samples: TrafficSample[], state: AgentState) {
+  const lastSample = samples[samples.length - 1] ?? {
+    at: Date.now(),
+    upload: state.metrics.upload_bytes,
+    download: state.metrics.download_bytes,
+  };
+  const previous = samples
+    .slice(0, -1)
+    .reverse()
+    .find((sample) => sample.at < lastSample.at);
+  const seconds = previous ? Math.max((lastSample.at - previous.at) / 1000, 1) : 0;
+  const baselineJump = previous && previous.upload === 0 && previous.download === 0 && lastSample.upload + lastSample.download > 0;
+  const uploadRate = previous && !baselineJump ? Math.max((lastSample.upload - previous.upload) / seconds, 0) : 0;
+  const downloadRate = previous && !baselineJump ? Math.max((lastSample.download - previous.download) / seconds, 0) : 0;
+
+  return {
+    uploadSpeed: `${formatBytes(uploadRate)}/s`,
+    downloadSpeed: `${formatBytes(downloadRate)}/s`,
+    uploadTotal: formatBytes(lastSample.upload),
+    downloadTotal: formatBytes(lastSample.download),
+    total: formatBytes(lastSample.upload + lastSample.download),
   };
 }
 

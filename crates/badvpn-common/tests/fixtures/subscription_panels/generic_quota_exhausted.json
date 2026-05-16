@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "TRAFFIC_QUOTA_EXHAUSTED",
+    "message": "Traffic quota exceeded"
+  }
+}

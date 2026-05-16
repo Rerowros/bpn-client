@@ -27,7 +27,7 @@
 - [x] Ensure subscription refresh cannot overwrite local overrides.
 - [x] Add Rust policy tests for local override priority.
 - [x] Add settings serialization/migration tests.
-- [ ] Add frontend unit tests for local override normalization when a test runner is introduced.
+- [x] Add frontend unit tests for local override normalization when a test runner is introduced.
 - [ ] Add manual Windows QA with a real `.exe`.
 
 ## 2. Process-Aware Connections
@@ -114,11 +114,11 @@
 - [x] Show last check/update time.
 - [x] Add manual update action per resource.
 - [x] Add update all action.
-- [ ] Add auto-update interval setting for safe resources.
-- [ ] Verify digest/signature before activation.
+- [x] Add auto-update interval setting for safe resources.
+- [x] Verify digest/signature before activation.
 - [x] Activate atomically with rollback.
 - [x] Show rollback action if previous resource exists.
-- [ ] Add tests for failed update preserving previous resource.
+- [x] Add tests for failed update preserving previous resource.
 
 ## 9. Local Profile Import
 
@@ -126,23 +126,23 @@
 - [x] Add drag-and-drop import.
 - [x] Add `bpn://` deep link import.
 - [x] Validate imported profile before saving.
-- [ ] Show profile metadata preview before activation.
+- [x] Show profile metadata preview before activation.
 - [x] Do not store raw local file path if not needed.
 - [x] Add HWID/provider error-specific messaging where detected.
 
 ## 10. Subscription Fetch and Profile Lifecycle
 
-- [ ] Add per-profile fetch user-agent setting.
-- [ ] Add per-profile proxy mode: direct, system proxy, custom proxy.
-- [ ] Add per-profile fetch timeout.
-- [ ] Protect custom proxy credentials at rest.
+- [x] Add per-profile fetch user-agent setting.
+- [x] Add per-profile proxy mode: direct, system proxy, custom proxy.
+- [x] Add per-profile fetch timeout.
+- [x] Protect custom proxy credentials at rest.
 - [x] Add refresh all subscriptions.
-- [ ] Respect per-profile auto-update interval from provider headers.
+- [x] Respect per-profile auto-update interval from provider headers.
 - [x] Allow editing profile name.
-- [ ] Allow editing profile description/notes.
+- [x] Allow editing profile description/notes.
 - [x] Show support/homepage/announce metadata without raw subscription URL.
-- [ ] Add provider/HWID-limit error classification tests.
-- [ ] Add tests that failed refresh preserves last working profile.
+- [x] Add provider/HWID-limit error classification tests.
+- [x] Add tests that failed refresh preserves last working profile.
 
 ## 11. DNS, Sniffer and TUN Advanced Controls
 
@@ -158,9 +158,9 @@
 - [x] Add TUN MTU setting if supported by Mihomo config generator.
 - [x] Add DNS hijack controls if supported.
 - [x] Add excluded route/CIDR controls.
-- [ ] Add Windows firewall/route reset recovery action through `badvpn-agent`.
-- [ ] Validate TUN/DNS/sniffer config before replacing last working runtime config.
-- [ ] Add rollback to last-known-good config if advanced network settings fail validation.
+- [x] Add Windows firewall/route reset recovery action through `badvpn-agent`.
+- [x] Validate TUN/DNS/sniffer config before replacing last working runtime config.
+- [x] Add rollback to last-known-good config if advanced network settings fail validation.
 
 ## 12. Backup and Support Bundle
 
@@ -184,10 +184,10 @@
 ## 13. Safe File Retirement
 
 - [x] Product cleanup flows must not destructively delete profiles, resources, logs or generated configs by default.
-- [ ] Retired files should be renamed to `.del`, quarantined or backed up.
+- [x] Retired files should be renamed to `.del`, quarantined or backed up.
 - [x] Resource rollback must preserve previous resource until new resource is verified.
 - [x] Profile removal must preserve recoverable backup or require explicit destructive confirmation in a future approved change.
-- [ ] Tests must cover rename/quarantine behavior for cleanup flows touched by this change.
+- [x] Tests must cover rename/quarantine behavior for cleanup flows touched by this change.
 
 ## 14. Validation
 
@@ -195,6 +195,6 @@
 - [x] `npm --prefix apps/badvpn-client run build`
 - [x] `cargo test -p badvpn-common policy`
 - [x] `cargo test -p badvpn-agent runtime`
-- [ ] Tauri command tests for settings/import/resource changes.
+- [x] Tauri command tests for settings/import/resource changes.
 - [x] Browser QA for every new UI page.
 - [ ] Manual Windows QA for `.exe` override, zapret health checks, resource update rollback and support bundle redaction.

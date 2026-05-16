@@ -16,6 +16,7 @@ import type {
   RuntimeReadinessResponse,
   RuntimeUpdateResult,
   ZapretHealthReport,
+  LocalProfilePreview,
   SettingsApplyResult,
   SubscriptionProfilesApplyResult,
   SubscriptionProfilesState,
@@ -29,7 +30,7 @@ type InvokeArgs = Record<string, unknown>;
 
 let mockSettings = createMockSettings();
 let mockConnected = true;
-let mockSelectedProxy = "NL Amsterdam";
+let mockSelectedProxy = "🇳🇱 Нидерланды";
 
 export function mockInvoke(command: string, args?: InvokeArgs): unknown {
   switch (command) {
@@ -49,6 +50,8 @@ export function mockInvoke(command: string, args?: InvokeArgs): unknown {
     case "add_subscription_profile":
     case "select_subscription_profile":
     case "remove_subscription_profile":
+    case "update_subscription_profile_metadata":
+    case "update_subscription_profile_fetch_options":
       return { profiles: createMockProfiles(), state: createMockState(), message: "Mock profile action applied." } satisfies SubscriptionProfilesApplyResult;
     case "check_component_updates":
       return { components: mockComponents() } satisfies ComponentUpdateReport;
@@ -97,14 +100,36 @@ export function mockInvoke(command: string, args?: InvokeArgs): unknown {
       return "C:\\Games\\MockGame\\MockGame.exe";
     case "run_zapret_health_checks":
       return mockHealthReport();
+    case "repair_windows_network":
+      mockConnected = false;
+      return {
+        ...createMockState(),
+        diagnostics: {
+          mihomo_healthy: false,
+          zapret_healthy: false,
+          message: "Mock Windows network recovery completed via badvpn-agent.",
+        },
+      } satisfies AgentState;
     case "update_operator_resource":
     case "update_all_operator_resources":
     case "rollback_operator_resource":
       return { changed: true, message: "Mock resource action applied.", resources: mockOperatorSnapshot().resources } satisfies ResourceActionResult;
+    case "preview_local_profile_from_text":
+    case "preview_local_profile_from_path":
+      return {
+        display_name: String(args?.name || "Local profile"),
+        source_file_name: command === "preview_local_profile_from_path" ? "mock-profile.yaml" : null,
+        format: "clash_yaml",
+        node_count: 2,
+        decoded_size_bytes: 256,
+        import_ready: true,
+        warning: null,
+      } satisfies LocalProfilePreview;
     case "import_local_profile_from_text":
     case "import_local_profile_from_path":
     case "import_profile_deep_link":
     case "refresh_all_subscription_profiles":
+    case "refresh_due_subscription_profiles":
       return { profiles: createMockProfiles(), state: createMockState(), message: "Mock profile import applied." } satisfies SubscriptionProfilesApplyResult;
     case "export_backup_bundle":
     case "restore_backup_bundle_from_path":
@@ -118,17 +143,28 @@ export function mockInvoke(command: string, args?: InvokeArgs): unknown {
 }
 
 function createMockState(): AgentState {
+  const scenario = mockScenario();
+  const connected =
+    scenario === "fallback"
+      ? true
+      : scenario === "onboarding" || scenario === "runtime-missing"
+        ? false
+        : mockConnected;
+  const routeMode = scenario === "fallback" ? "vpn_only" : mockSettings.core.route_mode;
   return {
     installed: true,
-    running: mockConnected,
-    phase: mockConnected ? "connected" : "ready",
+    running: connected,
+    phase: scenario === "onboarding" ? "onboarding" : connected ? "connected" : "ready",
     subscription: mockSubscription(),
     connection: {
-      connected: mockConnected,
-      status: mockConnected ? "running" : "idle",
+      connected,
+      status: connected ? "running" : "idle",
       selected_profile: "mock-profile",
-      selected_proxy: mockSelectedProxy,
-      route_mode: mockSettings.core.route_mode,
+      selected_proxy:
+        scenario === "long-text"
+          ? "🇩🇪 Germany xHTTP (Desktop) Premium Streaming Ultra Stable 01"
+          : mockSelectedProxy,
+      route_mode: routeMode,
     },
     metrics: {
       upload_bytes: 128 * 1024 * 1024,
@@ -136,24 +172,56 @@ function createMockState(): AgentState {
     },
     diagnostics: {
       mihomo_healthy: true,
-      zapret_healthy: mockSettings.core.route_mode === "smart",
-      message: mockConnected ? "connected via mock runtime" : null,
+      zapret_healthy: scenario === "fallback" ? false : mockSettings.core.route_mode === "smart",
+      message:
+        scenario === "fallback"
+          ? "zapret probe failed; using VPN Only fallback until diagnostics recover."
+          : connected
+            ? "connected via mock runtime"
+            : null,
     },
     last_error: null,
   };
 }
 
 function mockSubscription(): SubscriptionState {
+  const scenario = mockScenario();
+  if (scenario === "onboarding") {
+    return {
+      url: null,
+      is_valid: null,
+      validation_error: null,
+      last_refreshed_at: null,
+      profile_title: null,
+      announce: null,
+      announce_url: null,
+      support_url: null,
+      profile_web_page_url: null,
+      update_interval_hours: null,
+      user_info: {
+        upload_bytes: null,
+        download_bytes: null,
+        total_bytes: null,
+        expire_at: null,
+      },
+      node_count: 0,
+      format: "unknown",
+    };
+  }
+
   return {
     url: null,
     is_valid: true,
     validation_error: null,
     last_refreshed_at: new Date().toISOString(),
-    profile_title: "Mock BPN profile",
-    announce: "Mock mode is active for browser QA.",
-    announce_url: null,
-    support_url: null,
-    profile_web_page_url: null,
+    profile_title:
+      scenario === "long-text"
+        ? "🚀 Очень длинный профиль BPN Premium для проверки переносов, лимитов трафика и русских строк | 🔒 296.16 GB"
+        : "🚀 2026-05-20 тариф | 🔒 296.16 GB",
+    announce: "Технические работы ночью. Если YouTube или Discord открываются нестабильно, обновите подписку и переподключитесь.",
+    announce_url: "https://panel.example/announcements",
+    support_url: "https://panel.example/support",
+    profile_web_page_url: "https://panel.example/account",
     update_interval_hours: 24,
     user_info: {
       upload_bytes: 128 * 1024 * 1024,
@@ -161,7 +229,7 @@ function mockSubscription(): SubscriptionState {
       total_bytes: 100 * 1024 * 1024 * 1024,
       expire_at: Math.floor(Date.now() / 1000) + 86400 * 30,
     },
-    node_count: 5,
+    node_count: 18,
     format: "clash_yaml",
   };
 }
@@ -258,6 +326,7 @@ function createMockSettings(): AppSettings {
     },
     updates: {
       auto_flowseal_list_refresh: true,
+      safe_resource_auto_update_interval_hours: 24,
     },
     diagnostics: {
       runtime_checks_after_connect: true,
@@ -329,9 +398,20 @@ function createMockProfiles(): SubscriptionProfilesState {
       {
         id: "mock-profile",
         name: "Mock BPN profile",
+        description: "Gaming and media provider profile",
         active: true,
         redacted_url: "https://provider.example/sub/***",
         subscription: mockSubscription(),
+        last_successful_refresh_at: Math.floor(Date.now() / 1000) - 3600,
+        last_failed_refresh_at: null,
+        last_refresh_error: null,
+        next_refresh_at: Math.floor(Date.now() / 1000) + 23 * 3600,
+        fetch_options: {
+          timeout_seconds: 20,
+          proxy_mode: "system",
+          custom_proxy_redacted: null,
+          user_agent: null,
+        },
         created_at: Date.now() - 86400_000,
         updated_at: Date.now(),
       },
@@ -364,6 +444,18 @@ function mockZapretStatus(): ZapretServiceStatus {
 }
 
 function createMockReadiness(): RuntimeReadinessResponse {
+  if (mockScenario() === "runtime-missing") {
+    return {
+      agent: mockAgentStatus(),
+      mihomo_ready: false,
+      zapret_ready: false,
+      needs_zapret: mockSettings.core.route_mode === "smart",
+      components_ready: false,
+      ready: false,
+      message: "Mihomo and zapret runtime components are missing. Prepare runtime before connecting.",
+    };
+  }
+
   return {
     agent: mockAgentStatus(),
     mihomo_ready: true,
@@ -373,6 +465,13 @@ function createMockReadiness(): RuntimeReadinessResponse {
     ready: true,
     message: "Mock runtime is ready.",
   };
+}
+
+function mockScenario() {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  return new URL(window.location.href).searchParams.get("mockState");
 }
 
 function mockComponents(): ComponentUpdate[] {
@@ -455,18 +554,48 @@ function mockProxyCatalog(): ProxyCatalog {
         group_type: "select",
         selected: mockSelectedProxy,
         nodes: [
-          { name: "NL Amsterdam", proxy_type: "trojan", server: "nl.example", delay_ms: 42, alive: true, is_group: false, selected: mockSelectedProxy === "NL Amsterdam" },
-          { name: "DE Frankfurt", proxy_type: "vless", server: "de.example", delay_ms: 55, alive: true, is_group: false, selected: mockSelectedProxy === "DE Frankfurt" },
-          { name: "US New York", proxy_type: "ss", server: "us.example", delay_ms: 118, alive: true, is_group: false, selected: mockSelectedProxy === "US New York" },
+          { name: "⚡ Авто (рекомендуется)", proxy_type: "fallback", server: null, delay_ms: 38, alive: true, is_group: true, selected: mockSelectedProxy === "⚡ Авто (рекомендуется)" },
+          { name: "🇺🇸 США (все серверы)", proxy_type: "fallback", server: null, delay_ms: 118, alive: true, is_group: true, selected: mockSelectedProxy === "🇺🇸 США (все серверы)" },
+          { name: "🇸🇪 Швеция (все серверы)", proxy_type: "fallback", server: null, delay_ms: 64, alive: true, is_group: true, selected: mockSelectedProxy === "🇸🇪 Швеция (все серверы)" },
+          { name: "🇨🇭 Швейцария (все серверы)", proxy_type: "fallback", server: null, delay_ms: 72, alive: true, is_group: true, selected: mockSelectedProxy === "🇨🇭 Швейцария (все серверы)" },
+          { name: "🇳🇱 Нидерланды (все серверы)", proxy_type: "fallback", server: null, delay_ms: 42, alive: true, is_group: true, selected: mockSelectedProxy === "🇳🇱 Нидерланды (все серверы)" },
+          { name: "🇩🇪 Германия (все серверы)", proxy_type: "fallback", server: null, delay_ms: 55, alive: true, is_group: true, selected: mockSelectedProxy === "🇩🇪 Германия (все серверы)" },
+          { name: "🇹🇷 Турция (все серверы)", proxy_type: "fallback", server: null, delay_ms: 84, alive: true, is_group: true, selected: mockSelectedProxy === "🇹🇷 Турция (все серверы)" },
         ],
       },
       {
-        name: "AI",
-        group_type: "url-test",
-        selected: "NL Amsterdam",
+        name: "📺 YouTube и Discord",
+        group_type: "fallback",
+        selected: "🇷🇺 SPB | YouTube/Discord",
         nodes: [
-          { name: "NL Amsterdam", proxy_type: "trojan", server: "nl.example", delay_ms: 42, alive: true, is_group: false, selected: true },
-          { name: "DE Frankfurt", proxy_type: "vless", server: "de.example", delay_ms: 55, alive: true, is_group: false, selected: false },
+          { name: "🇷🇺 SPB | YouTube/Discord", proxy_type: "vless", server: "spb.example", delay_ms: 24, alive: true, is_group: false, selected: true },
+          { name: "⚡ Авто (рекомендуется)", proxy_type: "fallback", server: null, delay_ms: 38, alive: true, is_group: true, selected: false },
+        ],
+      },
+      {
+        name: "🤖 AI",
+        group_type: "select",
+        selected: "🤖 AI Авто",
+        nodes: [
+          { name: "🤖 AI Авто", proxy_type: "fallback", server: null, delay_ms: 42, alive: true, is_group: true, selected: true },
+          { name: "🇨🇭 Швейцария", proxy_type: "vless", server: "ch.example", delay_ms: 72, alive: true, is_group: false, selected: false },
+          { name: "🇳🇱 Нидерланды", proxy_type: "trojan", server: "nl.example", delay_ms: 42, alive: true, is_group: false, selected: false },
+          { name: "🇸🇪 Швеция", proxy_type: "vless", server: "se.example", delay_ms: 64, alive: true, is_group: false, selected: false },
+          { name: "🇺🇸 Dallas USA", proxy_type: "vless", server: "us.example", delay_ms: 118, alive: true, is_group: false, selected: false },
+          { name: "🇹🇷 Турция", proxy_type: "vless", server: "tr.example", delay_ms: 84, alive: true, is_group: false, selected: false },
+        ],
+      },
+      {
+        name: "⚙️ Обычные серверы",
+        group_type: "url-test",
+        selected: "🇳🇱 Нидерланды",
+        nodes: [
+          { name: "🇹🇷 Турция", proxy_type: "vless", server: "tr.example", delay_ms: 84, alive: true, is_group: false, selected: false },
+          { name: "🇩🇪 Germany", proxy_type: "vless", server: "de.example", delay_ms: 55, alive: true, is_group: false, selected: false },
+          { name: "🇨🇭 Швейцария", proxy_type: "vless", server: "ch.example", delay_ms: 72, alive: true, is_group: false, selected: false },
+          { name: "🇺🇸 Dallas USA", proxy_type: "vless", server: "us.example", delay_ms: 118, alive: true, is_group: false, selected: false },
+          { name: "🇸🇪 Швеция", proxy_type: "vless", server: "se.example", delay_ms: 64, alive: true, is_group: false, selected: false },
+          { name: "🇳🇱 Нидерланды", proxy_type: "trojan", server: "nl.example", delay_ms: 42, alive: true, is_group: false, selected: true },
         ],
       },
     ],
