@@ -2764,19 +2764,7 @@ pub fn restore_backup_bundle_from_path(path: String) -> Result<BackupActionResul
         return Err("Unsupported backup schema.".to_string());
     }
     write_settings_to_path(&settings_file_path()?, &backup.settings)?;
-    if !backup.proxy_selections.is_empty() {
-        let proxy_path = proxy_selections_file_path()?;
-        if let Some(parent) = proxy_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| format!("Failed to create proxy selection directory: {error}"))?;
-        }
-        fs::write(
-            &proxy_path,
-            serde_json::to_string_pretty(&backup.proxy_selections)
-                .map_err(|error| format!("Failed to serialize proxy selections: {error}"))?,
-        )
-        .map_err(|error| format!("Failed to restore proxy selections: {error}"))?;
-    }
+    persist_proxy_selections(&backup.proxy_selections)?;
     Ok(BackupActionResult {
         message: "Backup settings restored. Reconnect to apply runtime settings.".to_string(),
         path: Some(path.to_string_lossy().to_string()),
@@ -8804,20 +8792,24 @@ fn read_proxy_selections() -> Result<BTreeMap<String, String>, String> {
         .map_err(|error| format!("Failed to parse proxy selections: {error}"))
 }
 
-fn persist_proxy_selection(group: &str, proxy: &str) -> Result<(), String> {
-    if group.trim().is_empty() || proxy.trim().is_empty() {
-        return Ok(());
-    }
+fn persist_proxy_selections(selections: &BTreeMap<String, String>) -> Result<(), String> {
     let path = proxy_selections_file_path()?;
-    let mut selections = read_proxy_selections().unwrap_or_default();
-    selections.insert(group.trim().to_string(), proxy.trim().to_string());
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("Failed to create proxy selection directory: {error}"))?;
     }
-    let content = serde_json::to_string_pretty(&selections)
+    let content = serde_json::to_string_pretty(selections)
         .map_err(|error| format!("Failed to serialize proxy selections: {error}"))?;
     fs::write(path, content).map_err(|error| format!("Failed to write proxy selections: {error}"))
+}
+
+fn persist_proxy_selection(group: &str, proxy: &str) -> Result<(), String> {
+    if group.trim().is_empty() || proxy.trim().is_empty() {
+        return Ok(());
+    }
+    let mut selections = read_proxy_selections().unwrap_or_default();
+    selections.insert(group.trim().to_string(), proxy.trim().to_string());
+    persist_proxy_selections(&selections)
 }
 
 fn migrate_legacy_subscription_profile() -> PersistedSubscriptionProfiles {
