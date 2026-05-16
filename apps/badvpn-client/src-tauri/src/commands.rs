@@ -511,41 +511,53 @@ async fn build_agent_connect_request(settings: &AppSettings) -> Result<ConnectRe
         })
         .filter(subscription_is_present)
         .ok_or_else(|| "Import a subscription before connecting.".to_string())?;
-    let url = subscription
-        .url
-        .as_deref()
-        .ok_or_else(|| "Active subscription URL is not available.".to_string())?;
-    let imported = match fetch_subscription(url).await {
-        Ok(imported) => imported,
-        Err(error) => {
-            if let Some(body) = active_persisted_subscription_profile_body() {
-                log_event(
-                    "subscription",
-                    format!(
-                        "using cached subscription profile for connect because live fetch failed: {error}"
-                    ),
-                );
-                ImportedSubscription {
-                    subscription: subscription.clone(),
-                    body,
+    let imported = if let Some(url) = subscription.url.as_deref() {
+        match fetch_subscription(url).await {
+            Ok(imported) => imported,
+            Err(error) => {
+                if let Some(body) = active_persisted_subscription_profile_body() {
+                    log_event(
+                        "subscription",
+                        format!(
+                            "using cached subscription profile for connect because live fetch failed: {error}"
+                        ),
+                    );
+                    ImportedSubscription {
+                        subscription: subscription.clone(),
+                        body,
+                    }
+                } else if let Some(body) = existing_mihomo_config_profile_body() {
+                    log_event(
+                        "subscription",
+                        format!(
+                            "using existing Mihomo config for connect because live fetch failed: {error}"
+                        ),
+                    );
+                    ImportedSubscription {
+                        subscription: subscription.clone(),
+                        body,
+                    }
+                } else {
+                    return Err(format!(
+                        "Failed to fetch subscription and no cached profile body or local Mihomo config is available: {error}"
+                    ));
                 }
-            } else if let Some(body) = existing_mihomo_config_profile_body() {
-                log_event(
-                    "subscription",
-                    format!(
-                        "using existing Mihomo config for connect because live fetch failed: {error}"
-                    ),
-                );
-                ImportedSubscription {
-                    subscription: subscription.clone(),
-                    body,
-                }
-            } else {
-                return Err(format!(
-                    "Failed to fetch subscription and no cached profile body or local Mihomo config is available: {error}"
-                ));
             }
         }
+    } else if let Some(body) = active_persisted_subscription_profile_body() {
+        ImportedSubscription {
+            subscription: subscription.clone(),
+            body,
+        }
+    } else if let Some(body) = existing_mihomo_config_profile_body() {
+        ImportedSubscription {
+            subscription: subscription.clone(),
+            body,
+        }
+    } else {
+        return Err(
+            "Active local profile body is not available. Re-import the local profile.".to_string(),
+        );
     };
     persist_subscription_state_with_body(&imported.subscription, Some(&imported.body))?;
 

@@ -1389,6 +1389,16 @@ export function App() {
       pushNotification({ tone: "success", title: "Backup", message: result.message });
       if (action === "restore") {
         await loadSettings();
+        const [nextState, nextProfiles, nextCatalog, nextSnapshot] = await Promise.all([
+          getStatus(),
+          getSubscriptionProfiles(),
+          getProxyCatalog(),
+          getOperatorSnapshot(),
+        ]);
+        setState(nextState);
+        setSubscriptionProfiles(nextProfiles);
+        setCatalog(nextCatalog);
+        setOperatorSnapshot(nextSnapshot);
       }
     } catch (error) {
       notifyFromError("Backup action failed", error);
