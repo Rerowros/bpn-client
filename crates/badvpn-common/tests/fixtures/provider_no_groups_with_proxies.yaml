@@ -1,0 +1,8 @@
+proxies:
+  - name: Node-DE
+    type: http
+    server: 198.51.100.50
+    port: 443
+rules:
+  - GEOSITE,openai,PROXY
+  - MATCH,PROXY

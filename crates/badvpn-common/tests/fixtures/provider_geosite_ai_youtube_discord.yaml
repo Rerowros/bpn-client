@@ -1,0 +1,25 @@
+proxies:
+  - name: Node-DE
+    type: http
+    server: 198.51.100.70
+    port: 443
+proxy-groups:
+  - name: MainProxy
+    type: select
+    proxies:
+      - Node-DE
+  - name: AI
+    type: select
+    proxies:
+      - MainProxy
+  - name: Streaming
+    type: select
+    proxies:
+      - MainProxy
+rules:
+  - GEOSITE,openai,AI
+  - GEOSITE,anthropic,AI
+  - GEOSITE,youtube,Streaming
+  - DOMAIN-SUFFIX,googlevideo.com,Streaming
+  - GEOSITE,discord,Streaming
+  - MATCH,MainProxy

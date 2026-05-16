@@ -26,6 +26,7 @@ pub fn run() {
             commands::remove_subscription_profile,
             commands::check_app_release_update,
             commands::check_component_updates,
+            commands::runtime_readiness,
             commands::get_settings,
             commands::save_settings,
             commands::reset_settings,

@@ -1,0 +1,9 @@
+proxies: []
+proxy-groups:
+  - name: MainProxy
+    type: select
+    proxies:
+      - DIRECT
+rules:
+  - DOMAIN-SUFFIX,example.test,DIRECT
+  - MATCH,MainProxy

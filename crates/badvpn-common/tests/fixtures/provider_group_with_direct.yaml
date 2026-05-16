@@ -1,0 +1,19 @@
+proxies:
+  - name: Node-DE
+    type: http
+    server: 198.51.100.20
+    port: 443
+  - name: Node-FR
+    type: http
+    server: 198.51.100.21
+    port: 443
+proxy-groups:
+  - name: MainProxy
+    type: select
+    proxies:
+      - DIRECT
+      - Node-DE
+      - Node-FR
+rules:
+  - GEOSITE,telegram,MainProxy
+  - MATCH,MainProxy

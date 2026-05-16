@@ -1,0 +1,27 @@
+proxies:
+  - name: Node-DE
+    type: http
+    server: 198.51.100.30
+    port: 443
+  - name: Node-US
+    type: http
+    server: 198.51.100.31
+    port: 443
+proxy-groups:
+  - name: MainProxy
+    type: select
+    proxies:
+      - AutoWithDirect
+      - BackupOnly
+  - name: AutoWithDirect
+    type: url-test
+    proxies:
+      - DIRECT
+      - Node-DE
+  - name: BackupOnly
+    type: select
+    proxies:
+      - Node-US
+rules:
+  - GEOSITE,telegram,MainProxy
+  - MATCH,MainProxy

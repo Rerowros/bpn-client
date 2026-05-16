@@ -676,6 +676,7 @@ fn overlay_mihomo_config_yaml_with_policy(
         serde_yaml::Value::String(format!("127.0.0.1:{}", options.controller_port)),
     );
     insert_yaml(map, "secret", serde_yaml::Value::String(secret.to_string()));
+    insert_yaml(map, "profile", profile_yaml());
     insert_yaml(map, "tun", tun_yaml(options));
     insert_yaml(
         map,
@@ -1004,7 +1005,7 @@ fn tun_yaml(options: &MihomoConfigOptions) -> serde_yaml::Value {
 }
 
 fn dns_yaml(options: &MihomoConfigOptions) -> serde_yaml::Value {
-    dns_yaml_base(options, None, &[], true)
+    dns_yaml_base(options, None, &[], &[], true)
 }
 
 fn dns_yaml_with_policy(
@@ -1012,10 +1013,16 @@ fn dns_yaml_with_policy(
     existing: Option<&serde_yaml::Value>,
     policy: &CompiledPolicy,
 ) -> serde_yaml::Value {
+    let fake_ip_filter_domains = if policy.mode == AppRouteMode::Smart {
+        policy.zapret_hostlist.as_slice()
+    } else {
+        &[]
+    };
     dns_yaml_base(
         options,
         existing,
         &policy.dns_nameserver_policy,
+        fake_ip_filter_domains,
         policy.mode == AppRouteMode::Smart,
     )
 }
@@ -1024,6 +1031,7 @@ fn dns_yaml_base(
     options: &MihomoConfigOptions,
     existing: Option<&serde_yaml::Value>,
     policy_rules: &[crate::DnsPolicyRule],
+    fake_ip_filter_domains: &[String],
     preserve_existing_nameserver_policy: bool,
 ) -> serde_yaml::Value {
     let mut map = existing
@@ -1046,6 +1054,11 @@ fn dns_yaml_base(
             &mut map,
             "fake-ip-range",
             serde_yaml::Value::String("198.18.0.1/16".to_string()),
+        );
+        insert_yaml(
+            &mut map,
+            "fake-ip-filter",
+            fake_ip_filter_sequence(existing, fake_ip_filter_domains),
         );
     }
     insert_yaml(&mut map, "respect-rules", serde_yaml::Value::Bool(true));
@@ -1094,6 +1107,34 @@ fn nameserver_sequence(values: &[String]) -> serde_yaml::Value {
     )
 }
 
+fn fake_ip_filter_sequence(
+    existing: Option<&serde_yaml::Value>,
+    zapret_domains: &[String],
+) -> serde_yaml::Value {
+    let mut filters = existing
+        .and_then(|value| value.get("fake-ip-filter"))
+        .and_then(serde_yaml::Value::as_sequence)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_yaml::Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    for domain in zapret_domains {
+        let domain = domain
+            .trim()
+            .trim_start_matches('.')
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if domain.is_empty() || domain.contains('/') || domain.contains('*') {
+            continue;
+        }
+        filters.insert(format!("+.{domain}"));
+    }
+
+    serde_yaml::Value::Sequence(filters.into_iter().map(serde_yaml::Value::String).collect())
+}
+
 fn base_config_yaml(secret: &str, options: &MihomoConfigOptions) -> String {
     let mut map = serde_yaml::Mapping::new();
     insert_yaml(
@@ -1128,14 +1169,7 @@ fn base_config_yaml(secret: &str, options: &MihomoConfigOptions) -> String {
         serde_yaml::Value::String(secret.to_string()),
     );
 
-    let mut profile = serde_yaml::Mapping::new();
-    insert_yaml(
-        &mut profile,
-        "store-selected",
-        serde_yaml::Value::Bool(true),
-    );
-    insert_yaml(&mut profile, "store-fake-ip", serde_yaml::Value::Bool(true));
-    insert_yaml(&mut map, "profile", serde_yaml::Value::Mapping(profile));
+    insert_yaml(&mut map, "profile", profile_yaml());
     insert_yaml(&mut map, "tun", tun_yaml(options));
     insert_yaml(&mut map, "dns", dns_yaml(options));
 
@@ -1147,6 +1181,17 @@ fn base_config_yaml(secret: &str, options: &MihomoConfigOptions) -> String {
             yaml_string(secret)
         )
     })
+}
+
+fn profile_yaml() -> serde_yaml::Value {
+    let mut profile = serde_yaml::Mapping::new();
+    insert_yaml(
+        &mut profile,
+        "store-selected",
+        serde_yaml::Value::Bool(true),
+    );
+    insert_yaml(&mut profile, "store-fake-ip", serde_yaml::Value::Bool(true));
+    serde_yaml::Value::Mapping(profile)
 }
 
 fn count_yaml_proxies(value: &serde_yaml::Value) -> usize {
@@ -1201,7 +1246,7 @@ mod tests {
         assert!(generated
             .yaml
             .contains("DOMAIN-SUFFIX,googlevideo.com,DIRECT"));
-        assert!(generated.yaml.contains("MATCH,DIRECT"));
+        assert!(generated.yaml.contains("MATCH,PROXY"));
     }
 
     #[test]
@@ -1253,6 +1298,8 @@ mod tests {
         assert!(generated.yaml.contains("tcp://any:53"));
         assert!(generated.yaml.contains("mtu: 1500"));
         assert!(generated.yaml.contains("udp-timeout: 300"));
+        assert!(generated.yaml.contains("profile:"));
+        assert!(generated.yaml.contains("store-fake-ip: true"));
         assert!(generated.yaml.contains("enhanced-mode: redir-host"));
         assert!(generated.yaml.contains("https://9.9.9.9/dns-query"));
     }
@@ -1319,8 +1366,8 @@ rules:
         assert!(!generated
             .yaml
             .contains("DOMAIN-KEYWORD,discord,YouTube Group"));
-        assert!(generated.yaml.contains("MATCH,DIRECT"));
-        assert!(!generated.yaml.contains("MATCH,Manual"));
+        assert!(generated.yaml.contains("MATCH,Manual"));
+        assert!(!generated.yaml.contains("MATCH,DIRECT"));
     }
 
     #[test]
@@ -1573,6 +1620,45 @@ rules:
     }
 
     #[test]
+    fn clash_yaml_overlay_enables_fake_ip_cache_persistence() {
+        let generated = overlay_mihomo_config_yaml(
+            "proxies:\n  - name: Test\n    type: direct\nproxy-groups:\n  - name: PROXY\n    type: select\n    proxies:\n      - Test\nrules:\n  - MATCH,PROXY\n",
+            "secret",
+            &MihomoConfigOptions::default(),
+        )
+        .unwrap();
+
+        assert!(generated.contains("profile:"));
+        assert!(generated.contains("store-selected: true"));
+        assert!(generated.contains("store-fake-ip: true"));
+    }
+
+    #[test]
+    fn clash_yaml_overlay_excludes_zapret_domains_from_fake_ip() {
+        let generated = overlay_mihomo_config_yaml(
+            "dns:\n  fake-ip-filter:\n    - +.existing.example\nproxies:\n  - name: Test\n    type: direct\nproxy-groups:\n  - name: PROXY\n    type: select\n    proxies:\n      - Test\nrules:\n  - MATCH,PROXY\n",
+            "secret",
+            &MihomoConfigOptions::default(),
+        )
+        .unwrap();
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(&generated).unwrap();
+        let filters = yaml
+            .get("dns")
+            .and_then(|dns| dns.get("fake-ip-filter"))
+            .and_then(serde_yaml::Value::as_sequence)
+            .unwrap()
+            .iter()
+            .filter_map(serde_yaml::Value::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(filters.contains("+.existing.example"));
+        assert!(filters.contains("+.discord.com"));
+        assert!(filters.contains("+.discord.gg"));
+        assert!(filters.contains("+.googlevideo.com"));
+        assert!(filters.contains("+.youtube.com"));
+    }
+
+    #[test]
     fn clash_yaml_overlay_preserves_provider_proxy_groups() {
         let body = r#"
 mode: rule
@@ -1614,7 +1700,7 @@ rules:
         assert_eq!(generated.proxy_count, 2);
         assert!(generated.yaml.contains("name: Manual"));
         assert!(generated.yaml.contains("name: Auto"));
-        assert!(generated.yaml.contains("MATCH,DIRECT"));
+        assert!(generated.yaml.contains("MATCH,Manual"));
         assert!(generated.yaml.contains("DOMAIN-SUFFIX,discord.com,DIRECT"));
         assert!(generated.yaml.contains("DOMAIN-SUFFIX,youtube.com,DIRECT"));
         assert!(generated

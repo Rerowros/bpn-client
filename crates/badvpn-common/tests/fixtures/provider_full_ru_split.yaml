@@ -1,0 +1,50 @@
+proxies:
+  - name: Node-DE
+    type: http
+    server: 198.51.100.10
+    port: 443
+  - name: Node-US
+    type: http
+    server: 198.51.100.11
+    port: 443
+proxy-groups:
+  - name: MainProxy
+    type: select
+    proxies:
+      - Node-DE
+      - Node-US
+  - name: Streaming
+    type: select
+    proxies:
+      - MainProxy
+  - name: AI
+    type: select
+    proxies:
+      - MainProxy
+  - name: Social
+    type: select
+    proxies:
+      - MainProxy
+  - name: Telegram
+    type: select
+    proxies:
+      - MainProxy
+rules:
+  - GEOSITE,category-ads-all,REJECT
+  - GEOSITE,youtube,Streaming
+  - DOMAIN-SUFFIX,googlevideo.com,Streaming
+  - DOMAIN-SUFFIX,youtu.be,Streaming
+  - GEOSITE,discord,Streaming
+  - GEOSITE,openai,AI
+  - DOMAIN-SUFFIX,chatgpt.com,AI
+  - GEOSITE,category-social,Social
+  - DOMAIN-SUFFIX,instagram.com,Social
+  - GEOSITE,telegram,Telegram
+  - IP-CIDR,149.154.160.0/20,Telegram,no-resolve
+  - DOMAIN-KEYWORD,sberbank,DIRECT
+  - DOMAIN-SUFFIX,yandex.com,DIRECT
+  - GEOSITE,yandex,DIRECT
+  - DOMAIN-SUFFIX,vk.com,DIRECT
+  - DOMAIN-SUFFIX,ru,DIRECT
+  - GEOIP,ru,DIRECT,no-resolve
+  - MATCH,MainProxy

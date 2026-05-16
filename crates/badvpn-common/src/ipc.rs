@@ -477,7 +477,7 @@ pub struct PolicySummaryResponse {
     pub active_config_id: Option<String>,
     pub desired_mode: Option<RouteMode>,
     pub effective_mode: Option<RouteMode>,
-    
+
     pub mode: String,
     pub main_proxy_group: String,
     pub final_rule: String,

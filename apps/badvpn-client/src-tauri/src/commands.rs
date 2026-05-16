@@ -509,9 +509,39 @@ async fn build_agent_connect_request(settings: &AppSettings) -> Result<ConnectRe
         .url
         .as_deref()
         .ok_or_else(|| "Active subscription URL is not available.".to_string())?;
-    let imported = fetch_subscription(url).await?;
-    persist_subscription_state(&imported.subscription)?;
-    upsert_active_subscription_profile(&imported.subscription, None)?;
+    let imported = match fetch_subscription(url).await {
+        Ok(imported) => imported,
+        Err(error) => {
+            if let Some(body) = active_persisted_subscription_profile_body() {
+                log_event(
+                    "subscription",
+                    format!(
+                        "using cached subscription profile for connect because live fetch failed: {error}"
+                    ),
+                );
+                ImportedSubscription {
+                    subscription: subscription.clone(),
+                    body,
+                }
+            } else if let Some(body) = existing_mihomo_config_profile_body() {
+                log_event(
+                    "subscription",
+                    format!(
+                        "using existing Mihomo config for connect because live fetch failed: {error}"
+                    ),
+                );
+                ImportedSubscription {
+                    subscription: subscription.clone(),
+                    body,
+                }
+            } else {
+                return Err(format!(
+                    "Failed to fetch subscription and no cached profile body or local Mihomo config is available: {error}"
+                ));
+            }
+        }
+    };
+    persist_subscription_state_with_body(&imported.subscription, Some(&imported.body))?;
 
     let route_mode = settings.effective_route_mode();
     let mut mihomo = mihomo_options_for_runtime_route(settings, route_mode);
@@ -693,6 +723,7 @@ fn send_agent_pipe_command_raw(command: &AgentCommand) -> Result<AgentWireRespon
 
 #[cfg(not(windows))]
 fn send_agent_pipe_command(_command: &AgentCommand) -> Result<AgentState, String> {
+    Err("BadVpn named pipe IPC is only available on Windows.".to_string())
 }
 
 #[cfg(not(windows))]
@@ -1080,7 +1111,7 @@ pub async fn set_subscription(url: String) -> Result<AgentState, String> {
         .lock()
         .map_err(|_| "agent state lock is poisoned".to_string())?;
 
-    let subscription = match imported {
+    let imported = match imported {
         Ok(imported) => {
             if let Err(error) = write_mihomo_config(&imported.body) {
                 log_event("subscription", format!("config generation failed: {error}"));
@@ -1094,7 +1125,7 @@ pub async fn set_subscription(url: String) -> Result<AgentState, String> {
                 state.last_error = Some(error);
                 return Ok(state.clone());
             }
-            imported.subscription
+            imported
         }
         Err(error) => {
             log_event("subscription", format!("fetch/import failed: {error}"));
@@ -1111,8 +1142,8 @@ pub async fn set_subscription(url: String) -> Result<AgentState, String> {
     };
 
     state.phase = AppPhase::Ready;
-    state.subscription = subscription;
-    let _ = persist_subscription_state(&state.subscription);
+    state.subscription = imported.subscription;
+    let _ = persist_subscription_state_with_body(&state.subscription, Some(&imported.body));
     state.last_error = None;
     log_event(
         "subscription",
@@ -1165,7 +1196,7 @@ pub async fn refresh_subscription() -> Result<AgentState, String> {
                 return Ok(state.clone());
             }
             state.subscription = imported.subscription;
-            let _ = persist_subscription_state(&state.subscription);
+            let _ = persist_subscription_state_with_body(&state.subscription, Some(&imported.body));
             state.last_error = None;
         }
         Err(error) => {
@@ -1229,6 +1260,7 @@ pub async fn add_subscription_profile(
         profile.name = display_name;
         profile.subscription = imported.subscription.clone();
         profile.protected_url = Some(protect_secret(trimmed)?);
+        profile.protected_body = Some(protect_secret(&imported.body)?);
         profile.updated_at = now;
         profile.id.clone()
     } else {
@@ -1238,6 +1270,7 @@ pub async fn add_subscription_profile(
             name: display_name,
             subscription: imported.subscription.clone(),
             protected_url: Some(protect_secret(trimmed)?),
+            protected_body: Some(protect_secret(&imported.body)?),
             created_at: now,
             updated_at: now,
         });
@@ -1245,7 +1278,7 @@ pub async fn add_subscription_profile(
     };
     store.active_id = Some(active_id.clone());
     write_persisted_subscription_profiles(&store)?;
-    persist_subscription_state(&imported.subscription)?;
+    persist_subscription_state_with_body(&imported.subscription, Some(&imported.body))?;
 
     let state = apply_active_subscription_state(
         imported.subscription,
@@ -1288,10 +1321,11 @@ pub async fn select_subscription_profile(
     let reload_message =
         maybe_reload_mihomo_after_subscription_change("subscription profile select").await;
     store.profiles[index].subscription = imported.subscription.clone();
+    store.profiles[index].protected_body = Some(protect_secret(&imported.body)?);
     store.profiles[index].updated_at = current_unix_timestamp();
     store.active_id = Some(id.clone());
     write_persisted_subscription_profiles(&store)?;
-    persist_subscription_state(&imported.subscription)?;
+    persist_subscription_state_with_body(&imported.subscription, Some(&imported.body))?;
 
     let state = apply_active_subscription_state(
         imported.subscription,
@@ -1337,10 +1371,11 @@ pub async fn remove_subscription_profile(
                 .find(|profile| profile.id == next_profile.id)
             {
                 profile.subscription = imported.subscription.clone();
+                profile.protected_body = Some(protect_secret(&imported.body)?);
                 profile.updated_at = current_unix_timestamp();
             }
             store.active_id = Some(next_profile.id.clone());
-            persist_subscription_state(&imported.subscription)?;
+            persist_subscription_state_with_body(&imported.subscription, Some(&imported.body))?;
             message = reload_message.unwrap_or_else(|| {
                 "Subscription profile removed. Another profile was selected.".to_string()
             });
@@ -1386,6 +1421,8 @@ struct PersistedSubscriptionState {
     subscription: SubscriptionState,
     #[serde(default)]
     protected_url: Option<String>,
+    #[serde(default)]
+    protected_body: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1403,6 +1440,8 @@ struct PersistedSubscriptionProfile {
     subscription: SubscriptionState,
     #[serde(default)]
     protected_url: Option<String>,
+    #[serde(default)]
+    protected_body: Option<String>,
     created_at: u64,
     updated_at: u64,
 }
@@ -1656,6 +1695,17 @@ pub struct AgentServiceStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct RuntimeReadinessResponse {
+    pub agent: AgentServiceStatus,
+    pub mihomo_ready: bool,
+    pub zapret_ready: bool,
+    pub needs_zapret: bool,
+    pub components_ready: bool,
+    pub ready: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct RuntimeDiagnosticsReport {
     pub checked_at: u64,
     pub mihomo_healthy: bool,
@@ -1803,6 +1853,46 @@ pub async fn check_component_updates() -> Result<ComponentUpdateReport, String> 
 }
 
 #[tauri::command]
+pub fn runtime_readiness() -> Result<RuntimeReadinessResponse, String> {
+    let settings = load_app_settings();
+    let needs_zapret =
+        settings.effective_route_mode() == RouteMode::Smart && settings.zapret.enabled;
+    let agent = read_badvpn_agent_service_status();
+    let mihomo_ready = resolve_mihomo_bin().is_ok()
+        || programdata_mihomo_bin()
+            .map(|path| path.exists())
+            .unwrap_or(false);
+    let zapret_ready = !needs_zapret
+        || zapret_runtime_assets_ready().is_ok()
+        || programdata_zapret_runtime_assets_ready().is_ok();
+    let components_ready = mihomo_ready && zapret_ready;
+    let ready = agent.installed && agent.ipc_ready && components_ready;
+    let message = if ready {
+        "Ready to connect.".to_string()
+    } else if !agent.installed {
+        "Install badvpn-agent before connecting.".to_string()
+    } else if !agent.ipc_ready {
+        "badvpn-agent is installed but not reachable yet.".to_string()
+    } else if !mihomo_ready {
+        "Mihomo runtime is missing; prepare runtime components.".to_string()
+    } else if !zapret_ready {
+        "zapret runtime assets are missing for Smart mode; prepare runtime components.".to_string()
+    } else {
+        "Runtime setup needs attention.".to_string()
+    };
+
+    Ok(RuntimeReadinessResponse {
+        agent,
+        mihomo_ready,
+        zapret_ready,
+        needs_zapret,
+        components_ready,
+        ready,
+        message,
+    })
+}
+
+#[tauri::command]
 pub fn get_settings() -> Result<AppSettings, String> {
     Ok(load_app_settings())
 }
@@ -1928,6 +2018,14 @@ async fn maybe_apply_vpn_fallback_after_zapret_failure(
     report: &RuntimeDiagnosticsReport,
     context: &str,
 ) -> Result<Option<String>, String> {
+    if should_use_agent_runtime() {
+        log_event(
+            "routing",
+            format!("skipped UI VPN fallback because service-first runtime owns routing; context={context}"),
+        );
+        return Ok(None);
+    }
+
     if !settings.zapret.fallback_to_vpn_on_failed_probe
         || !settings.zapret.enabled
         || !report.mihomo_healthy
@@ -1969,6 +2067,14 @@ async fn maybe_restore_smart_hybrid_after_zapret_recovery(
     report: &RuntimeDiagnosticsReport,
     context: &str,
 ) -> Result<Option<String>, String> {
+    if should_use_agent_runtime() {
+        log_event(
+            "routing",
+            format!("skipped UI Smart restore because service-first runtime owns routing; context={context}"),
+        );
+        return Ok(None);
+    }
+
     if !settings.zapret.enabled
         || settings.effective_route_mode() != RouteMode::Smart
         || !report.mihomo_healthy
@@ -2243,15 +2349,18 @@ pub async fn policy_summary() -> Result<badvpn_common::ipc::PolicySummaryRespons
         }
     }
 
-    let program_data = std::env::var("PROGRAMDATA").unwrap_or_else(|_| "C:\\ProgramData".to_string());
+    let program_data =
+        std::env::var("PROGRAMDATA").unwrap_or_else(|_| "C:\\ProgramData".to_string());
     let path = std::path::PathBuf::from(program_data)
         .join("BadVpn")
         .join("runtime")
         .join("mihomo")
         .join("policy-summary.json");
-    
+
     if let Ok(json) = std::fs::read_to_string(&path) {
-        if let Ok(summary) = serde_json::from_str::<badvpn_common::ipc::PolicySummaryResponse>(&json) {
+        if let Ok(summary) =
+            serde_json::from_str::<badvpn_common::ipc::PolicySummaryResponse>(&json)
+        {
             return Ok(summary);
         }
     }
@@ -4445,6 +4554,16 @@ fn write_mihomo_config(subscription_body: &str) -> Result<(), String> {
 }
 
 async fn maybe_reload_mihomo_after_subscription_change(context: &str) -> Option<String> {
+    if should_use_agent_runtime() {
+        log_event(
+            "mihomo",
+            format!(
+                "{context}: service-first runtime owns reload; reconnect to apply profile changes"
+            ),
+        );
+        return Some("Profile saved. Reconnect to apply it through badvpn-agent.".to_string());
+    }
+
     let running = state().lock().map(|state| state.running).unwrap_or(false);
     if !running {
         return None;
@@ -6645,9 +6764,12 @@ fn hydrate_persisted_state() -> Result<(), String> {
     Ok(())
 }
 
-fn persist_subscription_state(subscription: &SubscriptionState) -> Result<(), String> {
-    write_legacy_subscription_state(subscription)?;
-    if let Err(error) = upsert_active_subscription_profile(subscription, None) {
+fn persist_subscription_state_with_body(
+    subscription: &SubscriptionState,
+    profile_body: Option<&str>,
+) -> Result<(), String> {
+    write_legacy_subscription_state(subscription, profile_body)?;
+    if let Err(error) = upsert_active_subscription_profile(subscription, None, profile_body) {
         log_event(
             "subscription-profile",
             format!("failed to update profile store from active subscription: {error}"),
@@ -6656,7 +6778,10 @@ fn persist_subscription_state(subscription: &SubscriptionState) -> Result<(), St
     Ok(())
 }
 
-fn write_legacy_subscription_state(subscription: &SubscriptionState) -> Result<(), String> {
+fn write_legacy_subscription_state(
+    subscription: &SubscriptionState,
+    profile_body: Option<&str>,
+) -> Result<(), String> {
     let path = subscription_file_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -6668,9 +6793,11 @@ fn write_legacy_subscription_state(subscription: &SubscriptionState) -> Result<(
         .take()
         .map(|url| protect_secret(&url))
         .transpose()?;
+    let protected_body = profile_body.map(protect_secret).transpose()?;
     let persisted = PersistedSubscriptionState {
         subscription: stored_subscription,
         protected_url,
+        protected_body,
     };
     let content = serde_json::to_string_pretty(&persisted)
         .map_err(|error| format!("Failed to serialize subscription state: {error}"))?;
@@ -6739,6 +6866,38 @@ fn active_persisted_subscription_profile() -> Option<SubscriptionState> {
         .into_iter()
         .find(|profile| profile.id == active_id)
         .map(|profile| profile.subscription)
+}
+
+fn active_persisted_subscription_profile_body() -> Option<String> {
+    let store = read_persisted_subscription_profiles().ok()?;
+    let active_id = store.active_id.as_deref()?;
+    let profile = store
+        .profiles
+        .into_iter()
+        .find(|profile| profile.id == active_id)?;
+    profile
+        .protected_body
+        .as_deref()
+        .and_then(|value| match unprotect_secret(value) {
+            Ok(body) => Some(body),
+            Err(error) => {
+                log_event(
+                    "subscription-profile",
+                    format!("failed to unprotect cached profile body: {error}"),
+                );
+                None
+            }
+        })
+}
+
+fn existing_mihomo_config_profile_body() -> Option<String> {
+    let path = active_mihomo_config_path().ok()?;
+    let body = fs::read_to_string(&path).ok()?;
+    let summary = summarize_subscription_body(&body);
+    if summary.node_count == 0 {
+        return None;
+    }
+    Some(body)
 }
 
 fn merged_subscription_for_ui(
@@ -6895,6 +7054,7 @@ fn migrate_legacy_subscription_profile() -> PersistedSubscriptionProfiles {
                 .url
                 .as_deref()
                 .and_then(|url| protect_secret(url).ok()),
+            protected_body: None,
             subscription,
             created_at: now,
             updated_at: now,
@@ -6926,6 +7086,7 @@ fn hydrate_subscription_profile_urls(store: &mut PersistedSubscriptionProfiles) 
 fn upsert_active_subscription_profile(
     subscription: &SubscriptionState,
     name: Option<&str>,
+    profile_body: Option<&str>,
 ) -> Result<(), String> {
     if subscription.url.is_none() && !subscription_is_present(subscription) {
         return Ok(());
@@ -6964,6 +7125,9 @@ fn upsert_active_subscription_profile(
         }
         profile.subscription = subscription.clone();
         profile.protected_url = url.map(protect_secret).transpose()?;
+        if let Some(profile_body) = profile_body {
+            profile.protected_body = Some(protect_secret(profile_body)?);
+        }
         profile.updated_at = now;
         profile.id.clone()
     } else {
@@ -6975,6 +7139,7 @@ fn upsert_active_subscription_profile(
             name: display_name,
             subscription: subscription.clone(),
             protected_url: url.map(protect_secret).transpose()?,
+            protected_body: profile_body.map(protect_secret).transpose()?,
             created_at: now,
             updated_at: now,
         });

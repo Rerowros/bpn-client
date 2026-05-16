@@ -3,15 +3,15 @@ use std::{
     net::{TcpListener, UdpSocket},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, Context, Result};
 use badvpn_common::{
     generate_mihomo_config_from_subscription_with_options, AgentRuntimeSnapshot, AppRouteMode,
-    CompiledPolicy, ConnectRequest, PreflightCheck, PreflightSeverity, PreflightStatus,
-    RuntimeComponentSnapshot, RuntimeComponentState, RuntimeGameProfile, RuntimeMode, RuntimePhase,
-    SubscriptionState,
+    CompiledPolicy, ConnectRequest, PolicyTargetKind, PreflightCheck, PreflightSeverity,
+    PreflightStatus, RuntimeComponentSnapshot, RuntimeComponentState, RuntimeGameProfile,
+    RuntimeMode, RuntimePhase, SubscriptionState,
 };
 use serde_yaml::Value as YamlValue;
 use tokio::time::sleep;
@@ -57,6 +57,7 @@ impl RuntimeManager {
     }
 
     pub async fn connect(&mut self, mut request: ConnectRequest) -> Result<AgentRuntimeSnapshot> {
+        let mut timeline = StartupTimeline::new();
         tracing::info!(
             route_mode = ?request.route_mode,
             mixed_port = request.settings.mihomo.mixed_port,
@@ -80,12 +81,17 @@ impl RuntimeManager {
             return Ok(self.snapshot.clone());
         }
 
-        if self.mihomo.is_running() {
-            self.snapshot.phase = RuntimePhase::Running;
-            self.snapshot
-                .diagnostics
-                .push("BadVpn-owned Mihomo is already running.".to_string());
-            return Ok(self.snapshot.clone());
+        let owned_runtime_was_running = self.mihomo.is_running() || self.zapret.is_running();
+        if owned_runtime_was_running {
+            let secret = self.config_store.controller_secret().unwrap_or_default();
+            if !secret.is_empty() {
+                let _ = self
+                    .mihomo
+                    .close_connections(self.last_controller_port(), &secret)
+                    .await;
+            }
+            self.mihomo.stop()?;
+            self.zapret.stop()?;
         }
 
         self.snapshot = AgentRuntimeSnapshot {
@@ -98,6 +104,12 @@ impl RuntimeManager {
         };
         let game_plan = apply_game_bypass_to_request(&mut request);
         self.snapshot.diagnostics.extend(game_plan.diagnostics);
+        if owned_runtime_was_running {
+            self.snapshot.diagnostics.push(
+                "Owned runtime was already running; restarted to apply the latest connect request."
+                    .to_string(),
+            );
+        }
         self.last_request = Some(request.clone());
 
         let preflight = match self.preflight(&request) {
@@ -108,6 +120,7 @@ impl RuntimeManager {
                 return Ok(self.snapshot.clone());
             }
         };
+        timeline.mark("preflight_ms");
 
         let mut effective_mode = request.route_mode;
         if preflight.force_vpn_only && effective_mode == RuntimeMode::Smart {
@@ -142,6 +155,7 @@ impl RuntimeManager {
             .context("failed to build Mihomo runtime config")?;
         self.prepare_runtime_config_for_local_mihomo(&mut runtime_config)?;
         self.record_policy_diagnostics(&runtime_config.policy);
+        timeline.mark("policy_render_ms");
         tracing::info!(
             effective_mode = ?effective_mode,
             config_id = %runtime_config.config_id,
@@ -155,10 +169,12 @@ impl RuntimeManager {
         self.mihomo
             .validate(&mihomo_bin, &draft_path, self.config_store.home_dir())
             .context("Mihomo rejected generated config")?;
+        timeline.mark("mihomo_validate_ms");
 
         if should_start_zapret {
             write_compiled_zapret_lists(&self.component_store, &runtime_config.policy)
                 .context("failed to write compiled zapret policy lists")?;
+            timeline.mark("zapret_list_write_ms");
             self.snapshot.phase = RuntimePhase::StartingZapret;
             self.snapshot.zapret =
                 RuntimeComponentSnapshot::new(RuntimeComponentState::Starting, None);
@@ -172,6 +188,7 @@ impl RuntimeManager {
                 .start(&self.component_store, &request.settings.zapret)
             {
                 Ok(message) => {
+                    timeline.mark("zapret_start_ms");
                     tracing::info!(message, "zapret started");
                     self.snapshot.zapret = RuntimeComponentSnapshot::new(
                         RuntimeComponentState::Running,
@@ -179,6 +196,7 @@ impl RuntimeManager {
                     );
                 }
                 Err(error) => {
+                    timeline.mark("zapret_start_ms");
                     tracing::warn!(%error, "zapret failed; falling back to VPN-only");
                     let _ = self.zapret.stop();
                     effective_mode = RuntimeMode::VpnOnly;
@@ -195,7 +213,8 @@ impl RuntimeManager {
                         .build_runtime_config(&request, effective_mode)
                         .context("failed to build Mihomo VPN-only fallback config")?;
                     self.prepare_runtime_config_for_local_mihomo(&mut runtime_config)?;
-                    debug_assert_vpn_only_policy(&runtime_config.policy);
+                    ensure_vpn_only_fallback_policy(&runtime_config.policy)
+                        .context("VPN-only fallback policy violated invariants")?;
                     write_compiled_zapret_lists(&self.component_store, &runtime_config.policy)
                         .context("failed to write empty VPN-only zapret policy lists")?;
                     self.record_policy_diagnostics(&runtime_config.policy);
@@ -206,6 +225,7 @@ impl RuntimeManager {
                     self.mihomo
                         .validate(&mihomo_bin, &fallback_draft, self.config_store.home_dir())
                         .context("Mihomo rejected VPN-only fallback config")?;
+                    timeline.mark("fallback_render_validate_ms");
                 }
             }
         }
@@ -214,9 +234,13 @@ impl RuntimeManager {
             .config_store
             .promote_draft_to_run(&self.config_store.draft_path())
             .context("failed to promote Mihomo runtime config")?;
+        timeline.mark("config_promote_ms");
 
         self.active_policy = Some(runtime_config.policy.clone());
-        if let Err(error) = self.config_store.write_policy_summary(&runtime_config.policy) {
+        if let Err(error) = self
+            .config_store
+            .write_policy_summary(&runtime_config.policy)
+        {
             tracing::warn!(%error, "failed to write policy summary JSON");
         }
 
@@ -234,6 +258,7 @@ impl RuntimeManager {
             self.set_error(error.to_string());
             return Ok(self.snapshot.clone());
         }
+        timeline.mark("mihomo_start_ms");
 
         if let Err(error) = self
             .mihomo
@@ -251,6 +276,7 @@ impl RuntimeManager {
             self.set_error(error.to_string());
             return Ok(self.snapshot.clone());
         }
+        timeline.mark("mihomo_ready_ms");
 
         self.snapshot.phase = RuntimePhase::Verifying;
         if request.settings.diagnostics.discord_youtube_probes
@@ -262,28 +288,29 @@ impl RuntimeManager {
                     .diagnostics
                     .push(format!("Smart probe warning: {error}"));
                 let zapret_still_running = self.zapret.is_running();
-                if request.settings.zapret.fallback_to_vpn_on_failed_probe && !zapret_still_running
-                {
-                    self.snapshot.diagnostics.push(
-                        "Falling back to VPN-only because winws stopped after probes failed."
-                            .to_string(),
-                    );
+                if request.settings.zapret.fallback_to_vpn_on_failed_probe {
+                    let fallback_reason = if zapret_still_running {
+                        "Smart probes failed while winws was running; falling back to VPN-only."
+                    } else {
+                        "Smart probes failed and winws is not running; falling back to VPN-only."
+                    };
+                    self.snapshot.diagnostics.push(fallback_reason.to_string());
                     effective_mode = RuntimeMode::VpnOnly;
-                    let fallback = self.build_runtime_config_with_secret(
+                    let mut fallback = self.build_runtime_config_with_secret(
                         &request,
                         effective_mode,
                         runtime_config.secret.clone(),
                     )?;
-                    debug_assert_vpn_only_policy(&fallback.policy);
+                    self.prepare_runtime_config_for_local_mihomo(&mut fallback)?;
+                    ensure_vpn_only_fallback_policy(&fallback.policy)
+                        .context("VPN-only probe fallback policy violated invariants")?;
                     write_compiled_zapret_lists(&self.component_store, &fallback.policy)
                         .context("failed to write empty VPN-only zapret policy lists")?;
                     self.record_policy_diagnostics(&fallback.policy);
                     let fallback_draft = self.config_store.write_draft(&fallback.yaml)?;
-                    self.mihomo.validate(
-                        &mihomo_bin,
-                        &fallback_draft,
-                        self.config_store.home_dir(),
-                    )?;
+                    self.mihomo
+                        .validate(&mihomo_bin, &fallback_draft, self.config_store.home_dir())
+                        .context("Mihomo rejected VPN-only probe fallback config")?;
                     let fallback_run = self.config_store.promote_draft_to_run(&fallback_draft)?;
                     if let Err(reload_error) = self
                         .mihomo
@@ -312,22 +339,33 @@ impl RuntimeManager {
                             )
                             .await?;
                     }
+                    if let Err(close_error) = self
+                        .mihomo
+                        .close_connections(
+                            request.settings.mihomo.controller_port,
+                            &fallback.secret,
+                        )
+                        .await
+                    {
+                        self.snapshot.diagnostics.push(format!(
+                            "Mihomo connection cleanup warning after VPN-only fallback: {close_error}"
+                        ));
+                    }
                     let _ = self.zapret.stop();
                     self.snapshot.zapret = RuntimeComponentSnapshot::new(
                         RuntimeComponentState::Unhealthy,
-                        Some(
-                            "winws stopped after probe failure; disabled for VPN-only fallback"
-                                .to_string(),
-                        ),
+                        Some("Smart probes failed; disabled for VPN-only fallback".to_string()),
                     );
+                    runtime_config = fallback;
                 } else {
                     self.snapshot.diagnostics.push(
-                        "Keeping Smart because winws is still running; service-level HTTPS probes are advisory."
+                        "Keeping Smart because VPN fallback on failed probes is disabled."
                             .to_string(),
                     );
                 }
             }
         }
+        timeline.mark("diagnostics_ms");
 
         self.config_store.commit_last_working()?;
         self.snapshot.effective_mode = effective_mode;
@@ -346,14 +384,17 @@ impl RuntimeManager {
         } else {
             RuntimeComponentSnapshot::default()
         };
-        self.snapshot.phase =
-            if request.route_mode == RuntimeMode::Smart && effective_mode == RuntimeMode::VpnOnly {
-                RuntimePhase::DegradedVpnOnly
-            } else {
-                RuntimePhase::Running
-            };
+        self.snapshot.phase = runtime_phase_after_connect(request.route_mode, effective_mode);
         self.snapshot.active_config_id = Some(runtime_config.config_id);
+        self.active_policy = Some(runtime_config.policy.clone());
+        if let Err(error) = self
+            .config_store
+            .write_policy_summary(&runtime_config.policy)
+        {
+            tracing::warn!(%error, "failed to write final policy summary JSON");
+        }
         self.snapshot.last_error = None;
+        self.snapshot.diagnostics.push(timeline.summary());
         tracing::info!(
             phase = ?self.snapshot.phase,
             effective_mode = ?self.snapshot.effective_mode,
@@ -430,6 +471,27 @@ impl RuntimeManager {
                 "Repair zapret components; BadVpn can still start in VPN-only mode.",
             ));
         }
+
+        let managed_mihomo = self.component_store.mihomo_bin().ok();
+        if !self.mihomo.is_running() {
+            let mihomo_processes = running_process_details(&["mihomo.exe"]);
+            for message in
+                cleanup_stale_managed_mihomo_processes(&mihomo_processes, managed_mihomo.as_deref())
+            {
+                checks.push(PreflightCheck::new(
+                    "stale_managed_mihomo_process",
+                    PreflightSeverity::DiagnosticWarning,
+                    "mihomo",
+                    PreflightStatus::Warning,
+                    message.clone(),
+                    Some(
+                        "BadVpn cleaned up a stale managed mihomo.exe before starting.".to_string(),
+                    ),
+                ));
+                self.snapshot.diagnostics.push(message);
+            }
+        }
+
         for (id, port) in [
             ("mihomo_mixed_port", request.settings.mihomo.mixed_port),
             (
@@ -457,13 +519,23 @@ impl RuntimeManager {
             ));
         }
 
-        let external_vpn = running_process_names(&[
+        let vpn_process_names = [
             "mihomo.exe",
             "clash.exe",
             "clash-meta.exe",
             "sing-box.exe",
             "v2rayn.exe",
-        ]);
+        ];
+        let vpn_processes = running_process_details(&vpn_process_names);
+        let external_vpn = if vpn_processes.is_empty() {
+            running_process_names(&vpn_process_names)
+        } else {
+            vpn_processes
+                .iter()
+                .filter(|process| !process_is_managed_mihomo(process, managed_mihomo.as_deref()))
+                .map(process_label)
+                .collect::<Vec<_>>()
+        };
         if !external_vpn.is_empty() && !self.mihomo.is_running() {
             checks.push(preflight_failed(
                 "external_vpn_core",
@@ -602,7 +674,18 @@ impl RuntimeManager {
         &mut self,
         config: &mut RuntimeConfig,
     ) -> Result<()> {
-        let messages = strip_missing_geodata_rules(&mut config.yaml, self.config_store.home_dir())?;
+        let home = self.config_store.home_dir();
+        let geosite_available = geodata_asset_exists(home, &["GeoSite.dat", "geosite.dat"]);
+        let geoip_available = geodata_asset_exists(home, &["GeoIP.dat", "geoip.dat"]);
+        let messages =
+            strip_missing_geodata_rules(&mut config.yaml, geosite_available, geoip_available)?;
+        if !messages.is_empty() {
+            sync_policy_after_missing_geodata_strip(
+                &mut config.policy,
+                geosite_available,
+                geoip_available,
+            )?;
+        }
         for message in messages {
             tracing::warn!(message, "mihomo geodata rule disabled");
             self.snapshot.diagnostics.push(message);
@@ -767,6 +850,44 @@ struct RuntimeConfig {
     yaml: String,
     config_id: String,
     policy: CompiledPolicy,
+}
+
+#[derive(Debug)]
+struct StartupTimeline {
+    started: Instant,
+    last_mark: Instant,
+    stages: Vec<(&'static str, u128)>,
+}
+
+impl StartupTimeline {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            last_mark: now,
+            stages: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, name: &'static str) {
+        let now = Instant::now();
+        self.stages
+            .push((name, now.duration_since(self.last_mark).as_millis()));
+        self.last_mark = now;
+    }
+
+    fn summary(&self) -> String {
+        let mut parts = self
+            .stages
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>();
+        parts.push(format!(
+            "total_connect_ms={}",
+            self.started.elapsed().as_millis()
+        ));
+        format!("Startup timeline: {}", parts.join(" "))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1247,16 +1368,21 @@ fn build_winws_args(
         &lists.join("ipset-exclude.txt"),
         badvpn_common::flowseal_ipset_exclude(),
     )?;
-    let ipset_all = ensure_list_file(
-        &lists.join("ipset-all.txt"),
-        badvpn_common::zapret_default_ipset(),
-    )?;
+    let ipset_all = ensure_effective_ipset_all_file(&lists, settings)?;
     let game_overlay = write_game_overlay_lists(&lists, settings)?;
     ensure_empty_list_file(&lists.join("list-general-user.txt"))?;
     ensure_empty_list_file(&lists.join("list-exclude-user.txt"))?;
     ensure_empty_list_file(&lists.join("ipset-exclude-user.txt"))?;
 
     if let Ok(mut args) = parse_flowseal_profile_bat(component_store, settings) {
+        rewrite_ipset_all_args(&mut args, &ipset_all);
+        append_google_quic_hostlist_args(
+            &mut args,
+            &list_google,
+            &list_exclude,
+            &ipset_exclude,
+            &component_store.zapret_bin_dir(),
+        );
         append_game_overlay_winws_args(&mut args, &game_overlay, settings);
         return Ok(args);
     }
@@ -1656,11 +1782,13 @@ fn apply_game_bypass_to_request(request: &mut ConnectRequest) -> GameBypassPlan 
     request.settings.zapret.game_filter = filter.to_string();
     request.settings.zapret.active_game_profiles = active_profiles.clone();
     for profile in &active_profiles {
-        request
-            .settings
-            .mihomo
-            .zapret_direct_processes
-            .extend(profile.process_names.iter().cloned());
+        if game_profile_processes_are_routing_targets(profile) {
+            request
+                .settings
+                .mihomo
+                .zapret_direct_processes
+                .extend(profile.process_names.iter().cloned());
+        }
         request
             .settings
             .mihomo
@@ -1693,6 +1821,10 @@ fn apply_game_bypass_to_request(request: &mut ConnectRequest) -> GameBypassPlan 
         bypass_mode, filter, tcp, udp, titles
     ));
     plan
+}
+
+fn game_profile_processes_are_routing_targets(profile: &RuntimeGameProfile) -> bool {
+    profile.id != "discord_rtc"
 }
 
 fn effective_game_filter(mode: &str) -> &'static str {
@@ -1921,12 +2053,81 @@ fn ensure_list_file(path: &Path, values: Vec<&'static str>) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+fn ensure_effective_ipset_all_file(
+    lists: &Path,
+    settings: &badvpn_common::RuntimeZapretSettings,
+) -> Result<PathBuf> {
+    let source = lists.join("ipset-all.txt");
+    if !source.exists() || fs::metadata(&source).map_or(true, |metadata| metadata.len() == 0) {
+        write_file_atomically(&source, &badvpn_common::zapret_default_ipset().join("\n"))?;
+    }
+
+    let effective = lists.join("ipset-all.effective.txt");
+    match settings.ipset_filter.trim().to_ascii_lowercase().as_str() {
+        "any" => write_file_atomically(&effective, "")?,
+        "loaded" => {
+            let body = fs::read_to_string(&source).unwrap_or_default();
+            let body = if body.trim().is_empty() {
+                badvpn_common::zapret_default_ipset().join("\n")
+            } else {
+                body
+            };
+            write_file_atomically(&effective, &body)?;
+        }
+        _ => write_file_atomically(
+            &effective,
+            &badvpn_common::zapret_default_ipset().join("\n"),
+        )?,
+    }
+    Ok(effective)
+}
+
+fn rewrite_ipset_all_args(args: &mut [String], effective_ipset: &Path) {
+    for arg in args {
+        if !arg.starts_with("--ipset=") {
+            continue;
+        }
+        let normalized = arg
+            .trim_start_matches("--ipset=")
+            .trim_matches('"')
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        if normalized.ends_with("/ipset-all.txt") || normalized == "ipset-all.txt" {
+            *arg = format!("--ipset={}", effective_ipset.display());
+        }
+    }
+}
+
+fn append_google_quic_hostlist_args(
+    args: &mut Vec<String>,
+    list_google: &Path,
+    list_exclude: &Path,
+    ipset_exclude: &Path,
+    bin: &Path,
+) {
+    args.extend([
+        "--new".to_string(),
+        "--filter-udp=443".to_string(),
+        format!("--hostlist={}", list_google.display()),
+        format!("--hostlist-exclude={}", list_exclude.display()),
+        format!("--ipset-exclude={}", ipset_exclude.display()),
+        "--dpi-desync=fake".to_string(),
+        "--dpi-desync-repeats=6".to_string(),
+    ]);
+    let fake_quic = bin.join("quic_initial_www_google_com.bin");
+    if fake_quic.exists() {
+        args.push(format!("--dpi-desync-fake-quic={}", fake_quic.display()));
+    }
+}
+
 fn write_compiled_zapret_lists(
     component_store: &ComponentStore,
     policy: &CompiledPolicy,
 ) -> Result<()> {
     let lists = component_store.zapret_lists_dir();
     fs::create_dir_all(&lists)?;
+    let google_hostlist = flowseal_google_policy_hostlist(&policy.zapret_hostlist);
+    let general_hostlist = flowseal_general_policy_hostlist(&policy.zapret_hostlist);
     write_policy_list_file(&lists.join("zapret_hostlist.txt"), &policy.zapret_hostlist)?;
     write_policy_list_file(
         &lists.join("zapret_hostlist_exclude.txt"),
@@ -1938,13 +2139,12 @@ fn write_compiled_zapret_lists(
         &policy.zapret_ipset_exclude,
     )?;
 
-    write_policy_list_file(&lists.join("list-general.txt"), &policy.zapret_hostlist)?;
-    write_policy_list_file(&lists.join("list-google.txt"), &policy.zapret_hostlist)?;
+    write_policy_list_file(&lists.join("list-general.txt"), &general_hostlist)?;
+    write_policy_list_file(&lists.join("list-google.txt"), &google_hostlist)?;
     write_policy_list_file(
         &lists.join("list-exclude.txt"),
         &policy.zapret_hostlist_exclude,
     )?;
-    write_policy_list_file(&lists.join("ipset-all.txt"), &policy.zapret_ipset)?;
     write_policy_list_file(
         &lists.join("ipset-exclude.txt"),
         &policy.zapret_ipset_exclude,
@@ -1952,6 +2152,62 @@ fn write_compiled_zapret_lists(
     write_policy_list_file(&lists.join("list-general-user.txt"), &[])?;
     write_policy_list_file(&lists.join("list-exclude-user.txt"), &[])?;
     write_policy_list_file(&lists.join("ipset-exclude-user.txt"), &[])?;
+    Ok(())
+}
+
+fn flowseal_google_policy_hostlist(hosts: &[String]) -> Vec<String> {
+    hosts
+        .iter()
+        .filter(|host| is_flowseal_google_host(host))
+        .cloned()
+        .collect()
+}
+
+fn flowseal_general_policy_hostlist(hosts: &[String]) -> Vec<String> {
+    hosts
+        .iter()
+        .filter(|host| !is_flowseal_google_host(host))
+        .cloned()
+        .collect()
+}
+
+fn is_flowseal_google_host(host: &str) -> bool {
+    let host = host.trim().trim_start_matches('.').to_ascii_lowercase();
+    badvpn_common::flowseal_google_hostlist()
+        .into_iter()
+        .any(|candidate| host == candidate || host.ends_with(&format!(".{candidate}")))
+}
+
+fn ensure_vpn_only_fallback_policy(policy: &CompiledPolicy) -> Result<()> {
+    if policy.mode != AppRouteMode::VpnOnly {
+        return Err(anyhow!(
+            "VPN-only fallback compile returned {:?} policy.",
+            policy.mode
+        ));
+    }
+    policy
+        .validate_invariants()
+        .map_err(|error| anyhow!("invalid VPN-only fallback policy: {error}"))?;
+
+    for forbidden_rule in [
+        "MATCH,DIRECT",
+        "GEOSITE,youtube,DIRECT",
+        "DOMAIN-SUFFIX,googlevideo.com,DIRECT",
+        "DOMAIN-SUFFIX,youtu.be,DIRECT",
+        "GEOSITE,discord,DIRECT",
+    ] {
+        if policy
+            .mihomo_rules
+            .iter()
+            .any(|rule| rule == forbidden_rule)
+        {
+            return Err(anyhow!(
+                "VPN-only fallback policy contains Smart direct rule {forbidden_rule}."
+            ));
+        }
+    }
+
+    debug_assert_vpn_only_policy(policy);
     Ok(())
 }
 
@@ -1966,6 +2222,17 @@ fn debug_assert_vpn_only_policy(policy: &CompiledPolicy) {
         policy.mihomo_rules.last().map(String::as_str),
         Some(expected_final_rule.as_str())
     );
+}
+
+fn runtime_phase_after_connect(
+    requested_mode: RuntimeMode,
+    effective_mode: RuntimeMode,
+) -> RuntimePhase {
+    if requested_mode == RuntimeMode::Smart && effective_mode == RuntimeMode::VpnOnly {
+        RuntimePhase::DegradedVpnOnly
+    } else {
+        RuntimePhase::Running
+    }
 }
 
 fn write_policy_list_file(path: &Path, values: &[String]) -> Result<()> {
@@ -2044,11 +2311,13 @@ fn preflight_failed(
     )
 }
 
-fn strip_missing_geodata_rules(yaml: &mut String, home: &Path) -> Result<Vec<String>> {
+fn strip_missing_geodata_rules(
+    yaml: &mut String,
+    geosite_available: bool,
+    geoip_available: bool,
+) -> Result<Vec<String>> {
     let mut value: YamlValue =
         serde_yaml::from_str(yaml).context("failed to parse generated Mihomo YAML")?;
-    let geosite_available = geodata_asset_exists(home, &["GeoSite.dat", "geosite.dat"]);
-    let geoip_available = geodata_asset_exists(home, &["GeoIP.dat", "geoip.dat"]);
     let mut removed_geosite = 0usize;
     let mut removed_geoip = 0usize;
 
@@ -2090,6 +2359,45 @@ fn strip_missing_geodata_rules(yaml: &mut String, home: &Path) -> Result<Vec<Str
         *yaml = serde_yaml::to_string(&value).context("failed to render Mihomo YAML")?;
     }
     Ok(messages)
+}
+
+fn sync_policy_after_missing_geodata_strip(
+    policy: &mut CompiledPolicy,
+    geosite_available: bool,
+    geoip_available: bool,
+) -> Result<()> {
+    policy
+        .mihomo_rules
+        .retain(|rule| !missing_geodata_rule_text(rule, geosite_available, geoip_available));
+    policy.policy_rules.retain(|rule| {
+        !missing_geodata_target_kind(rule.target.kind, geosite_available, geoip_available)
+    });
+    policy.diagnostics_expectations.retain(|expectation| {
+        !missing_geodata_rule_text(&expectation.target, geosite_available, geoip_available)
+    });
+    policy.suppressed_rules.retain(|rule| {
+        !missing_geodata_rule_text(&rule.original_rule, geosite_available, geoip_available)
+            && !missing_geodata_rule_text(&rule.chosen_rule, geosite_available, geoip_available)
+    });
+    policy
+        .validate_invariants()
+        .map_err(|error| anyhow!("policy became invalid after geodata rule stripping: {error}"))?;
+    Ok(())
+}
+
+fn missing_geodata_rule_text(rule: &str, geosite_available: bool, geoip_available: bool) -> bool {
+    let normalized = rule.trim_start().to_ascii_uppercase();
+    (!geosite_available && normalized.starts_with("GEOSITE,"))
+        || (!geoip_available && normalized.starts_with("GEOIP,"))
+}
+
+fn missing_geodata_target_kind(
+    kind: PolicyTargetKind,
+    geosite_available: bool,
+    geoip_available: bool,
+) -> bool {
+    (!geosite_available && kind == PolicyTargetKind::GeoSite)
+        || (!geoip_available && kind == PolicyTargetKind::GeoIp)
 }
 
 fn geodata_asset_exists(home: &Path, names: &[&str]) -> bool {
@@ -2169,6 +2477,44 @@ fn classify_zapret_preflight_processes(
     }
 
     (external, cleanup_messages)
+}
+
+fn cleanup_stale_managed_mihomo_processes(
+    processes: &[RunningProcess],
+    managed_mihomo: Option<&Path>,
+) -> Vec<String> {
+    let mut cleanup_messages = Vec::new();
+
+    for process in processes {
+        if !process_is_managed_mihomo(process, managed_mihomo) {
+            continue;
+        }
+        match terminate_process(process.pid) {
+            Ok(()) => cleanup_messages.push(format!(
+                "Stopped stale BadVpn-owned mihomo.exe process pid {} before VPN start.",
+                process.pid
+            )),
+            Err(error) => cleanup_messages.push(format!(
+                "Failed to stop stale BadVpn-owned mihomo.exe process pid {}: {error}",
+                process.pid
+            )),
+        }
+    }
+
+    cleanup_messages
+}
+
+fn process_is_managed_mihomo(process: &RunningProcess, managed_mihomo: Option<&Path>) -> bool {
+    if !process.name.eq_ignore_ascii_case("mihomo.exe") {
+        return false;
+    }
+    let Some(managed_mihomo) = managed_mihomo else {
+        return false;
+    };
+    let Some(process_path) = process.executable_path.as_deref() else {
+        return false;
+    };
+    same_windows_path(process_path, managed_mihomo)
 }
 
 fn process_is_managed_winws(process: &RunningProcess, managed_winws: Option<&Path>) -> bool {
@@ -2565,7 +2911,16 @@ start "zapret: general (ALT9)" /min "%BIN%winws.exe" --wf-tcp=80,443,%GameFilter
 
         assert!(args.iter().any(|arg| arg == "--filter-l7=discord,stun"));
         assert!(args.iter().any(|arg| arg == "--ip-id=zero"));
-        assert!(args.iter().any(|arg| arg.contains("ipset-all.txt")));
+        assert!(args
+            .iter()
+            .any(|arg| arg.contains("ipset-all.effective.txt")));
+        assert!(!args.iter().any(|arg| arg.contains("ipset-all.txt")));
+        assert!(
+            args.windows(2).any(|window| {
+                window[0] == "--filter-udp=443" && window[1].contains("list-google.txt")
+            }),
+            "Flowseal BAT args should include a curated Google/YouTube QUIC hostlist branch"
+        );
         assert!(args.iter().any(|arg| arg == "--wf-filter-lan=1"));
         assert!(args.iter().any(|arg| arg == "--wf-l3=ipv4,ipv6"));
         let _ = fs::remove_dir_all(root);
@@ -2592,6 +2947,41 @@ start "zapret: general (ALT9)" /min "%BIN%winws.exe" --wf-tcp=80,443,%GameFilter
             .mihomo
             .zapret_direct_processes
             .contains(&"REPO.exe".to_string()));
+        assert!(plan
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("Game Bypass active")));
+    }
+
+    #[test]
+    fn discord_rtc_game_bypass_does_not_add_process_only_direct_rules() {
+        let mut request = test_request();
+        request.settings.zapret.game_bypass_mode = "manual".to_string();
+        request.settings.zapret.game_filter_mode = "udp_first".to_string();
+        request.settings.zapret.active_game_profiles = vec![RuntimeGameProfile {
+            id: "discord_rtc".to_string(),
+            title: "Discord RTC".to_string(),
+            process_names: vec!["Discord.exe".to_string()],
+            domains: vec!["discord.com".to_string(), "discord.gg".to_string()],
+            udp_ports: vec!["19294-19344".to_string(), "50000-50100".to_string()],
+            filter_mode: "udp_first".to_string(),
+            ..RuntimeGameProfile::default()
+        }];
+
+        let plan = apply_game_bypass_to_request(&mut request);
+
+        assert_eq!(request.settings.zapret.game_filter, "udp");
+        assert!(request.settings.mihomo.zapret_direct_processes.is_empty());
+        assert!(request
+            .settings
+            .mihomo
+            .zapret_direct_domains
+            .contains(&"discord.com".to_string()));
+        assert!(request
+            .settings
+            .mihomo
+            .zapret_direct_udp_ports
+            .contains(&"19294-19344".to_string()));
         assert!(plan
             .diagnostics
             .iter()
@@ -2662,9 +3052,12 @@ start "zapret: general (ALT9)" /min "%BIN%winws.exe" --wf-tcp=80,443,%GameFilter
         })
         .unwrap();
 
+        let lists = components.join("zapret").join("lists");
+        fs::create_dir_all(&lists).unwrap();
+        fs::write(lists.join("ipset-all.txt"), "198.51.100.0/24\n").unwrap();
+
         write_compiled_zapret_lists(&store, &policy).unwrap();
 
-        let lists = components.join("zapret").join("lists");
         assert!(fs::read_to_string(lists.join("zapret_hostlist.txt"))
             .unwrap()
             .contains("googlevideo.com"));
@@ -2673,12 +3066,16 @@ start "zapret: general (ALT9)" /min "%BIN%winws.exe" --wf-tcp=80,443,%GameFilter
                 .unwrap()
                 .contains("perplexity.ai")
         );
-        assert!(fs::read_to_string(lists.join("list-general.txt"))
-            .unwrap()
-            .contains("googlevideo.com"));
-        assert!(fs::read_to_string(lists.join("list-google.txt"))
-            .unwrap()
-            .contains("googlevideo.com"));
+        let general = fs::read_to_string(lists.join("list-general.txt")).unwrap();
+        let google = fs::read_to_string(lists.join("list-google.txt")).unwrap();
+        assert!(general.contains("discord.com"));
+        assert!(!general.contains("googlevideo.com"));
+        assert!(google.contains("googlevideo.com"));
+        assert!(!google.contains("discord.com"));
+        assert_eq!(
+            fs::read_to_string(lists.join("ipset-all.txt")).unwrap(),
+            "198.51.100.0/24\n"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2711,6 +3108,228 @@ start "zapret: general (ALT9)" /min "%BIN%winws.exe" --wf-tcp=80,443,%GameFilter
         assert!(!diagnostics.contains("sensitive0.example.com"));
         assert!(!diagnostics.contains("sensitive19.example.com"));
         assert!(manager.snapshot.diagnostics.len() <= 8);
+    }
+
+    #[test]
+    fn smart_fallback_recompiles_fresh_vpn_only_policy() {
+        let manager = RuntimeManager::new();
+        let mut request = test_request();
+        request.profile_body = r#"
+proxies:
+  - name: Node-DE
+    type: http
+    server: 198.51.100.80
+    port: 443
+proxy-groups:
+  - name: MainProxy
+    type: select
+    proxies:
+      - Node-DE
+  - name: Streaming
+    type: select
+    proxies:
+      - MainProxy
+rules:
+  - GEOSITE,youtube,Streaming
+  - DOMAIN-SUFFIX,googlevideo.com,Streaming
+  - GEOSITE,discord,Streaming
+  - MATCH,MainProxy
+"#
+        .to_string();
+
+        let smart = manager
+            .build_runtime_config_with_secret(&request, RuntimeMode::Smart, "shared-secret".into())
+            .unwrap();
+        assert_eq!(smart.policy.mode, AppRouteMode::Smart);
+        assert!(smart
+            .policy
+            .mihomo_rules
+            .contains(&"MATCH,MainProxy".to_string()));
+        assert!(!smart
+            .policy
+            .mihomo_rules
+            .contains(&"MATCH,DIRECT".to_string()));
+        assert!(smart
+            .policy
+            .mihomo_rules
+            .contains(&"GEOSITE,youtube,DIRECT".to_string()));
+        assert!(!smart.policy.zapret_hostlist.is_empty());
+
+        let fallback = manager
+            .build_runtime_config_with_secret(&request, RuntimeMode::VpnOnly, smart.secret.clone())
+            .unwrap();
+
+        ensure_vpn_only_fallback_policy(&fallback.policy).unwrap();
+        assert_eq!(fallback.secret, smart.secret);
+        assert_eq!(fallback.policy.mode, AppRouteMode::VpnOnly);
+        assert!(!fallback
+            .policy
+            .mihomo_rules
+            .contains(&"MATCH,DIRECT".to_string()));
+        assert!(!fallback
+            .policy
+            .mihomo_rules
+            .contains(&"GEOSITE,youtube,DIRECT".to_string()));
+        assert!(!fallback
+            .policy
+            .mihomo_rules
+            .contains(&"DOMAIN-SUFFIX,googlevideo.com,DIRECT".to_string()));
+        assert!(!fallback
+            .policy
+            .mihomo_rules
+            .contains(&"GEOSITE,discord,DIRECT".to_string()));
+        assert!(fallback.policy.zapret_hostlist.is_empty());
+        assert!(fallback.policy.zapret_hostlist_exclude.is_empty());
+        assert!(fallback.policy.zapret_ipset.is_empty());
+        assert!(fallback.policy.zapret_ipset_exclude.is_empty());
+    }
+
+    #[test]
+    fn probe_fallback_config_is_prepared_before_validation() {
+        let root = std::env::temp_dir().join(format!("badvpn-probe-fallback-test-{}", now_unix()));
+        let mut manager = RuntimeManager::new();
+        manager.config_store = RuntimeConfigStore { root: root.clone() };
+        let mut request = test_request();
+        request.profile_body = r#"
+proxies:
+  - name: Node-DE
+    type: http
+    server: 198.51.100.80
+    port: 443
+proxy-groups:
+  - name: MainProxy
+    type: select
+    proxies:
+      - Node-DE
+rules:
+  - GEOSITE,youtube,MainProxy
+  - GEOIP,telegram,MainProxy,no-resolve
+  - MATCH,MainProxy
+"#
+        .to_string();
+
+        let mut fallback = manager
+            .build_runtime_config_with_secret(
+                &request,
+                RuntimeMode::VpnOnly,
+                "shared-secret".into(),
+            )
+            .unwrap();
+        assert!(fallback.yaml.contains("GEOSITE,youtube,MainProxy"));
+        assert!(fallback
+            .yaml
+            .contains("GEOIP,telegram,MainProxy,no-resolve"));
+
+        manager
+            .prepare_runtime_config_for_local_mihomo(&mut fallback)
+            .unwrap();
+
+        assert!(!fallback.yaml.contains("GEOSITE,youtube,MainProxy"));
+        assert!(!fallback
+            .yaml
+            .contains("GEOIP,telegram,MainProxy,no-resolve"));
+        assert!(!fallback
+            .policy
+            .mihomo_rules
+            .iter()
+            .any(|rule| rule.starts_with("GEOSITE,") || rule.starts_with("GEOIP,")));
+        assert!(!fallback.policy.policy_rules.iter().any(|rule| {
+            matches!(
+                rule.target.kind,
+                PolicyTargetKind::GeoSite | PolicyTargetKind::GeoIp
+            )
+        }));
+        assert!(!fallback
+            .policy
+            .diagnostics_expectations
+            .iter()
+            .any(|expectation| expectation.target.starts_with("GEOSITE,")
+                || expectation.target.starts_with("GEOIP,")));
+        assert!(manager
+            .snapshot
+            .diagnostics
+            .iter()
+            .any(|message| { message.contains("GEOSITE provider rules") }));
+        assert!(manager
+            .snapshot
+            .diagnostics
+            .iter()
+            .any(|message| { message.contains("GEOIP provider rules") }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fallback_phase_is_degraded_only_for_requested_smart() {
+        assert_eq!(
+            runtime_phase_after_connect(RuntimeMode::Smart, RuntimeMode::VpnOnly),
+            RuntimePhase::DegradedVpnOnly
+        );
+        assert_eq!(
+            runtime_phase_after_connect(RuntimeMode::VpnOnly, RuntimeMode::VpnOnly),
+            RuntimePhase::Running
+        );
+        assert_eq!(
+            runtime_phase_after_connect(RuntimeMode::Smart, RuntimeMode::Smart),
+            RuntimePhase::Running
+        );
+    }
+
+    #[test]
+    fn startup_timeline_summary_is_redacted_and_stage_keyed() {
+        let mut timeline = StartupTimeline::new();
+        timeline.mark("preflight_ms");
+        timeline.mark("policy_render_ms");
+
+        let summary = timeline.summary();
+
+        assert!(summary.starts_with("Startup timeline: "));
+        assert!(summary.contains("preflight_ms="));
+        assert!(summary.contains("policy_render_ms="));
+        assert!(summary.contains("total_connect_ms="));
+        assert!(!summary.contains("http"));
+        assert!(!summary.contains("token"));
+        assert!(!summary.contains("secret"));
+    }
+
+    #[test]
+    fn managed_mihomo_classifier_only_matches_badvpn_binary_path() {
+        let managed = PathBuf::from(r"C:\ProgramData\BadVpn\components\mihomo.exe");
+        let managed_process = RunningProcess {
+            name: "mihomo.exe".to_string(),
+            pid: 42,
+            executable_path: Some(PathBuf::from(
+                r"C:\ProgramData\BadVpn\components\mihomo.exe",
+            )),
+        };
+        let external_process = RunningProcess {
+            name: "mihomo.exe".to_string(),
+            pid: 43,
+            executable_path: Some(PathBuf::from(r"C:\Tools\mihomo\mihomo.exe")),
+        };
+        let missing_path_process = RunningProcess {
+            name: "mihomo.exe".to_string(),
+            pid: 44,
+            executable_path: None,
+        };
+        let different_binary_process = RunningProcess {
+            name: "winws.exe".to_string(),
+            pid: 45,
+            executable_path: Some(managed.clone()),
+        };
+
+        assert!(process_is_managed_mihomo(&managed_process, Some(&managed)));
+        assert!(!process_is_managed_mihomo(
+            &external_process,
+            Some(&managed)
+        ));
+        assert!(!process_is_managed_mihomo(
+            &missing_path_process,
+            Some(&managed)
+        ));
+        assert!(!process_is_managed_mihomo(
+            &different_binary_process,
+            Some(&managed)
+        ));
     }
 
     fn test_request() -> ConnectRequest {
