@@ -1085,7 +1085,8 @@ textarea:focus {
 }
 
 .profileRow strong,
-.profileRow span {
+.profileRow span,
+.profileRow em {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1099,6 +1100,65 @@ textarea:focus {
 .profileRow span {
   color: var(--text-muted);
   font-size: 11px;
+}
+
+.profileRow em {
+  color: var(--text-muted);
+  font-size: 10px;
+  font-style: normal;
+}
+
+.profileRow em.profileRefreshError {
+  color: #fca5a5;
+}
+
+.profileFetchControls {
+  align-items: center;
+  display: flex;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.profileFetchControls select {
+  min-height: 26px;
+  min-width: 124px;
+  padding: 0 8px;
+}
+
+.profileFetchControls .textAction {
+  min-height: 26px;
+  padding-inline: 8px;
+}
+
+.profilePreview {
+  background: rgba(94, 224, 160, 0.08);
+  border: 1px solid rgba(94, 224, 160, 0.22);
+  border-radius: var(--radius-sm);
+  display: grid;
+  gap: 4px;
+  padding: 9px 10px;
+}
+
+.profilePreview.warning {
+  background: rgba(246, 192, 95, 0.08);
+  border-color: rgba(246, 192, 95, 0.25);
+}
+
+.profilePreview strong,
+.profilePreview span,
+.profilePreview small,
+.profilePreview em {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.profilePreview span,
+.profilePreview small,
+.profilePreview em {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-style: normal;
 }
 
 .subtleButton,
@@ -2989,7 +3049,7 @@ select:hover,
 }
 
 .profileRow {
-  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  grid-template-columns: minmax(0, 1fr) auto auto auto auto;
 }
 
 @media (max-width: 1180px) {
@@ -5550,5 +5610,2843 @@ body {
   .quickActionGrid,
   .dashboardPane .homeRouteSummary {
     grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* Clean desktop-only Premium Console pass. Keep this final in the cascade. */
+:root {
+  --pc-bg: #07090d;
+  --pc-shell: #0b0f16;
+  --pc-panel: #101722;
+  --pc-panel-soft: #151d2a;
+  --pc-panel-deep: #0d121b;
+  --pc-line: rgba(230, 237, 247, 0.11);
+  --pc-line-strong: rgba(230, 237, 247, 0.2);
+  --pc-text: #f4f7fb;
+  --pc-text-soft: #c7d0dc;
+  --pc-muted: #8795a8;
+  --pc-blue: #5f9cff;
+  --pc-cyan: #55d4dc;
+  --pc-green: #71d68d;
+  --pc-amber: #e7b95e;
+  --pc-red: #ee7d77;
+}
+
+html,
+body,
+#root {
+  max-width: 100%;
+  min-height: 0;
+  min-width: 0;
+}
+
+body {
+  background: var(--pc-bg);
+}
+
+.appWindow,
+.appWindow:not(.railExpanded) {
+  background:
+    radial-gradient(circle at 54% -16%, rgba(95, 156, 255, 0.12), transparent 35%),
+    linear-gradient(135deg, #07090d 0%, #0b1018 52%, #080b11 100%);
+  color: var(--pc-text);
+  grid-template-columns: 76px minmax(0, 1fr);
+  height: 100vh;
+  min-height: 0;
+  min-width: 0;
+}
+
+.appWindow.railExpanded {
+  grid-template-columns: 220px minmax(0, 1fr);
+}
+
+.rail {
+  background: rgba(8, 12, 18, 0.96);
+  border-right: 1px solid var(--pc-line);
+  gap: 16px;
+  padding: 16px 12px;
+}
+
+.railBrand,
+.railItem,
+.railToggle {
+  border-radius: 8px;
+  grid-template-columns: 38px minmax(0, 1fr);
+  min-width: 0;
+}
+
+.railBrand span,
+.railItem span,
+.railToggle span,
+.railStatusCard div {
+  display: none;
+}
+
+.appWindow.railExpanded .railBrand span,
+.appWindow.railExpanded .railItem span,
+.appWindow.railExpanded .railToggle span,
+.appWindow.railExpanded .railStatusCard div {
+  display: block;
+}
+
+.railBrand {
+  color: var(--pc-text);
+  height: 42px;
+}
+
+.railBrand svg {
+  background: linear-gradient(135deg, rgba(85, 212, 220, 0.16), rgba(95, 156, 255, 0.16));
+  border: 1px solid rgba(85, 212, 220, 0.22);
+  border-radius: 8px;
+  color: #bffaff;
+  padding: 7px;
+}
+
+.railBrand span {
+  font-size: 14px;
+  font-weight: 780;
+}
+
+.railItem,
+.railToggle {
+  color: var(--pc-muted);
+  height: 40px;
+}
+
+.railItem:hover,
+.railToggle:hover,
+.railItem.active {
+  background: rgba(255, 255, 255, 0.065);
+  color: var(--pc-text);
+}
+
+.railItem.active {
+  box-shadow: inset 3px 0 0 var(--pc-cyan);
+}
+
+.railStatusCard {
+  background: transparent;
+  border-color: var(--pc-line);
+  border-radius: 8px;
+  min-height: 54px;
+}
+
+.railStatusCard strong {
+  color: var(--pc-text-soft);
+}
+
+.railStatusCard span:last-child {
+  color: var(--pc-muted);
+  text-transform: capitalize;
+}
+
+.appPane {
+  gap: 12px;
+  grid-template-rows: 58px minmax(0, 1fr) 34px;
+  padding: 12px;
+}
+
+.appHeader,
+.statusBar {
+  background: rgba(16, 23, 34, 0.82);
+  border: 1px solid var(--pc-line);
+  border-radius: 8px;
+  min-width: 0;
+}
+
+.workspace.dashboardWorkspace {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr) 292px;
+  min-height: 0;
+  overflow: hidden;
+  padding: 0;
+}
+
+.connectionPane.dashboardPane {
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  overflow: auto;
+  padding: 0;
+  scrollbar-color: rgba(255, 255, 255, 0.24) transparent;
+  scrollbar-width: thin;
+}
+
+.dashboardPane .announceLine {
+  background: transparent;
+  border: 1px solid rgba(231, 185, 94, 0.22);
+  border-radius: 8px;
+  color: #f0d49b;
+  flex: 0 0 auto;
+  font-size: 12px;
+  min-height: 38px;
+}
+
+.consoleLayout {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr) 280px;
+  min-height: 398px;
+}
+
+.controlDeck,
+.profileDeck,
+.serverDeck,
+.dashboardCard,
+.dashboardInspector .panel {
+  background: linear-gradient(180deg, rgba(18, 25, 37, 0.98), rgba(12, 17, 26, 0.98));
+  border: 1px solid var(--pc-line);
+  border-radius: 8px;
+  box-shadow: none;
+  min-width: 0;
+}
+
+.controlDeck {
+  display: grid;
+  gap: 18px;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  padding: 20px;
+}
+
+.profileDeck {
+  align-content: start;
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+}
+
+.deckHeader,
+.serverDeckHeader,
+.cardTitleRow,
+.profileActions,
+.modeStack {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  min-width: 0;
+}
+
+.deckHeader,
+.serverDeckHeader,
+.cardTitleRow {
+  justify-content: space-between;
+}
+
+.serverIdentity {
+  align-items: center;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: auto minmax(0, 1fr);
+  min-width: 0;
+}
+
+.serverIdentity div,
+.serverDeckHeader div,
+.homeNodeText {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.serverIdentity span:not(.serverMedallion),
+.serverDeckHeader span,
+.cardTitleRow span,
+.powerConsole span,
+.profileMetaGrid .statusRow span {
+  color: var(--pc-muted);
+  font-size: 11px;
+  font-weight: 780;
+  text-transform: uppercase;
+}
+
+.serverIdentity strong,
+.profileDeck > strong,
+.serverDeckHeader strong,
+.dashboardCard > strong {
+  color: var(--pc-text);
+  font-size: 17px;
+  font-weight: 780;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.serverIdentity small {
+  color: var(--pc-muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.serverMedallion {
+  align-items: center;
+  background: rgba(85, 212, 220, 0.08);
+  border: 1px solid rgba(85, 212, 220, 0.18);
+  border-radius: 999px;
+  color: var(--pc-cyan);
+  display: inline-flex;
+  font-size: 30px;
+  height: 64px;
+  justify-content: center;
+  line-height: 1;
+  width: 64px;
+}
+
+.serverMedallion.hasFlag {
+  background: rgba(255, 255, 255, 0.055);
+  font-size: 40px;
+}
+
+.powerConsole {
+  align-items: center;
+  display: grid;
+  gap: 24px;
+  grid-template-columns: 150px minmax(0, 1fr);
+}
+
+.powerConsole .connectButton {
+  background: #141d2b;
+  border: 1px solid var(--pc-line-strong);
+  box-shadow: inset 0 0 0 12px rgba(255, 255, 255, 0.018);
+  height: 142px;
+  width: 142px;
+}
+
+.powerConsole .connectButton.connected {
+  background: linear-gradient(180deg, #159562, #0c5e42);
+  border-color: rgba(113, 214, 141, 0.62);
+  box-shadow: 0 0 0 10px rgba(113, 214, 141, 0.1), inset 0 0 0 12px rgba(255, 255, 255, 0.025);
+}
+
+.powerConsole .connectButton.pending {
+  background: #153847;
+  border-color: rgba(85, 212, 220, 0.48);
+}
+
+.powerConsole h1 {
+  color: var(--pc-text);
+  font-size: 34px;
+  font-weight: 780;
+  line-height: 1.08;
+}
+
+.powerConsole p {
+  color: var(--pc-text-soft);
+  font-size: 14px;
+  line-height: 1.45;
+  margin-top: 8px;
+  max-width: 58ch;
+}
+
+.consoleStats,
+.profileMetaGrid,
+.dashboardGrid {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.consoleStats {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.consoleStats .metric,
+.trafficSplit .metric {
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid var(--pc-line);
+  border-radius: 8px;
+  min-height: 72px;
+  padding: 11px;
+}
+
+.metric + .metric,
+.trafficSplit .metric + .metric {
+  border-left: 1px solid var(--pc-line);
+}
+
+.metric strong {
+  color: var(--pc-text);
+}
+
+.profileMetaGrid {
+  gap: 8px;
+}
+
+.profileMetaGrid .statusRow,
+.dashboardInspector .statusRow {
+  grid-template-columns: 78px minmax(0, 1fr);
+}
+
+.profileActions {
+  align-items: stretch;
+  flex-direction: column;
+}
+
+.subtleLink {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid var(--pc-line);
+  border-radius: 8px;
+  color: var(--pc-text-soft);
+  display: inline-flex;
+  font-size: 12px;
+  font-weight: 760;
+  height: 36px;
+  justify-content: center;
+  text-decoration: none;
+}
+
+.serverDeck {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 252px minmax(0, 1fr);
+  padding: 14px;
+}
+
+.serverDeckHeader {
+  grid-column: 1 / -1;
+}
+
+.homeGroupRail {
+  display: grid;
+  gap: 8px;
+  grid-auto-flow: row;
+  grid-auto-rows: minmax(58px, auto);
+  min-width: 0;
+  max-height: 220px;
+  overflow: auto;
+  padding-right: 2px;
+  scrollbar-color: rgba(255, 255, 255, 0.22) transparent;
+  scrollbar-width: thin;
+}
+
+.homeGroupButton,
+.homeNodeButton {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--pc-line);
+  border-radius: 8px;
+  color: var(--pc-text);
+  cursor: pointer;
+  min-width: 0;
+}
+
+.homeGroupButton {
+  align-items: center;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: auto minmax(0, 1fr);
+  min-height: 62px;
+  padding: 9px;
+  text-align: left;
+}
+
+.homeGroupButton:hover,
+.homeGroupButton.active,
+.homeNodeButton:hover,
+.homeNodeButton.selected {
+  background: rgba(95, 156, 255, 0.09);
+  border-color: rgba(95, 156, 255, 0.28);
+}
+
+.groupEmoji,
+.nodeFlag {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.055);
+  border: 1px solid var(--pc-line);
+  border-radius: 999px;
+  color: var(--pc-cyan);
+  display: inline-flex;
+  justify-content: center;
+  line-height: 1;
+}
+
+.groupEmoji {
+  font-size: 17px;
+  height: 34px;
+  width: 34px;
+}
+
+.nodeFlag {
+  font-size: 22px;
+  height: 42px;
+  width: 42px;
+}
+
+.groupEmoji.hasFlag {
+  font-size: 20px;
+}
+
+.nodeFlag.hasFlag {
+  font-size: 25px;
+}
+
+.homeGroupButton > span:nth-child(2),
+.homeGroupButton strong,
+.homeNodeText strong,
+.homeNodeText small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.homeGroupButton > span:nth-child(2) {
+  color: var(--pc-text);
+  font-size: 13px;
+  font-weight: 760;
+}
+
+.homeGroupButton strong {
+  color: var(--pc-muted);
+  font-size: 11px;
+  font-weight: 680;
+  grid-column: 2;
+}
+
+.homeNodeGrid {
+  display: grid;
+  gap: 9px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-content: start;
+  min-width: 0;
+}
+
+.homeNodeButton {
+  align-items: center;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  min-height: 64px;
+  padding: 10px;
+  text-align: left;
+}
+
+.homeNodeText strong {
+  color: var(--pc-text);
+  font-size: 13px;
+}
+
+.homeNodeText small,
+.nodeLatency {
+  color: var(--pc-muted);
+  font-size: 11px;
+}
+
+.nodeLatency {
+  font-weight: 780;
+}
+
+.nodeLatency.bad {
+  color: var(--pc-red);
+}
+
+.dashboardGrid {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.35fr);
+}
+
+.dashboardCard {
+  align-content: start;
+  display: grid;
+  gap: 12px;
+  min-height: 154px;
+  padding: 15px;
+}
+
+.trafficSplit {
+  display: grid;
+  gap: 9px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.routeMatrixCard {
+  grid-column: auto;
+}
+
+.dashboardPane .homeRouteSummary {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  max-width: none;
+  width: 100%;
+}
+
+.dashboardPane .homeRouteItem {
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid var(--pc-line);
+  border-radius: 8px;
+  min-width: 0;
+}
+
+.dashboardPane .homeRouteItem strong {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dashboardInspector {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) minmax(0, 0.85fr) minmax(0, 0.9fr);
+  min-height: 0;
+  overflow: hidden;
+}
+
+.dashboardInspector .panel {
+  padding: 14px;
+}
+
+/* Sloth-style flat desktop dashboard refinement. */
+:root {
+  --sloth-bg: #1b1a18;
+  --sloth-bg-deep: #141311;
+  --sloth-pane: #211f1d;
+  --sloth-pane-soft: #28231d;
+  --sloth-line: rgba(217, 202, 174, 0.12);
+  --sloth-line-strong: rgba(217, 202, 174, 0.22);
+  --sloth-text: #f5f1e9;
+  --sloth-text-soft: #d5cabc;
+  --sloth-muted: #a99d8d;
+  --sloth-gold: #b99a62;
+  --sloth-gold-deep: #4c3c27;
+  --sloth-green: #70c58a;
+  --sloth-blue: #5f9cff;
+}
+
+.appWindow,
+.appWindow.railExpanded {
+  background: var(--sloth-bg);
+  color: var(--sloth-text);
+  grid-template-columns: 276px minmax(0, 1fr);
+}
+
+.appWindow:not(.railExpanded) {
+  grid-template-columns: 76px minmax(0, 1fr);
+}
+
+.rail {
+  background: #1a1917;
+  border-right: 1px solid var(--sloth-line);
+  padding: 14px;
+}
+
+.railBrand,
+.railItem,
+.railToggle {
+  border-radius: 12px;
+  grid-template-columns: 38px minmax(0, 1fr);
+}
+
+.railBrand svg {
+  background: rgba(185, 154, 98, 0.14);
+  border-color: rgba(185, 154, 98, 0.22);
+  color: var(--sloth-text);
+}
+
+.railItem,
+.railToggle {
+  color: #c9c0b4;
+  height: 50px;
+}
+
+.railItem.active,
+.railItem:hover,
+.railToggle:hover {
+  background: rgba(185, 154, 98, 0.24);
+  box-shadow: none;
+  color: var(--sloth-text);
+}
+
+.railStatusCard {
+  background: transparent;
+  border-color: var(--sloth-line);
+  color: var(--sloth-muted);
+}
+
+.appWindow.railExpanded .railStatusCard div {
+  display: grid;
+  gap: 2px;
+}
+
+.railStatusCard strong,
+.railStatusCard span:last-child {
+  display: block;
+}
+
+.appPane {
+  background: var(--sloth-bg);
+  gap: 0;
+  grid-template-rows: 38px minmax(0, 1fr);
+  padding: 0;
+}
+
+.appPane.overviewPane {
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.overviewPane > .appHeader {
+  display: none;
+}
+
+.appHeader {
+  background: #232220;
+  border: 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  border-radius: 0;
+  padding: 0 28px;
+}
+
+.statusBar {
+  display: none;
+}
+
+.workspace.dashboardWorkspace {
+  display: block;
+  overflow: hidden;
+  padding: 0;
+}
+
+.dashboardInspector {
+  display: none;
+}
+
+.connectionPane.dashboardPane {
+  background: var(--sloth-bg);
+  border: 0;
+  border-radius: 0;
+  display: grid;
+  gap: 9px;
+  grid-template-rows: auto 150px auto auto auto auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 18px 30px 22px;
+}
+
+.slothProfileHeader {
+  align-items: start;
+  display: flex;
+  gap: 18px;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.slothProfileHeader > div:first-child {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.slothProfileHeader span,
+.slothSegmentBlock > span,
+.slothGroupHeader span {
+  color: var(--sloth-muted);
+  font-size: 12px;
+  font-weight: 760;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.slothProfileHeader strong {
+  color: var(--sloth-text);
+  font-size: 26px;
+  font-weight: 780;
+  line-height: 1.15;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.slothProfileHeader small {
+  color: var(--sloth-muted);
+  font-size: 15px;
+}
+
+.slothHeaderActions {
+  align-items: center;
+  display: flex;
+  flex-shrink: 0;
+  gap: 10px;
+}
+
+.slothGhostButton,
+.slothSupportButton,
+.slothTextButton {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid var(--sloth-line-strong);
+  border-radius: 14px;
+  color: var(--sloth-text);
+  cursor: pointer;
+  display: inline-flex;
+  font-weight: 760;
+  gap: 8px;
+  height: 42px;
+  justify-content: center;
+  padding: 0 18px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.slothSupportButton {
+  background: rgba(185, 154, 98, 0.16);
+  color: #f0d5a8;
+}
+
+.slothTextButton {
+  border-radius: 8px;
+  height: 32px;
+  padding: 0 10px;
+}
+
+.homeAlertStack:empty {
+  display: none;
+}
+
+.slothCenterControl {
+  align-content: center;
+  display: grid;
+  gap: 7px;
+  justify-items: center;
+  min-height: 0;
+}
+
+.slothCenterControl .connectButton {
+  background: linear-gradient(180deg, #c4a369, #a98953);
+  border: 0;
+  box-shadow: 0 22px 58px rgba(0, 0, 0, 0.34);
+  color: white;
+  height: 128px;
+  width: 128px;
+}
+
+.slothCenterControl .connectButton.connected {
+  background: linear-gradient(180deg, #10b369, #0a9654);
+}
+
+.slothCenterControl .connectButton.pending {
+  background: linear-gradient(180deg, #5f9cff, #3576ce);
+}
+
+.slothCenterControl > strong {
+  color: var(--sloth-text);
+  font-size: 19px;
+  font-weight: 780;
+}
+
+.slothStatusPill {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  color: var(--sloth-text-soft);
+  font-size: 16px;
+  padding: 5px 17px;
+}
+
+.slothControlRow {
+  align-items: end;
+  display: grid;
+  gap: 22px;
+  grid-template-columns: minmax(0, 270px) minmax(290px, 340px) minmax(0, 270px);
+  justify-content: center;
+}
+
+.slothSegmentBlock {
+  display: grid;
+  gap: 7px;
+}
+
+.slothSegmentBlock.alignEnd {
+  text-align: right;
+}
+
+.slothSegmented {
+  background: #0f0e0d;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 13px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  height: 40px;
+  padding: 3px;
+}
+
+.slothSegmented button {
+  background: transparent;
+  border-radius: 10px;
+  color: var(--sloth-muted);
+  cursor: pointer;
+  font-weight: 760;
+}
+
+.slothSegmented button.active {
+  background: var(--sloth-gold-deep);
+  border: 1px solid var(--sloth-gold);
+  color: var(--sloth-text);
+}
+
+.slothServerPill {
+  align-items: center;
+  background: #223044;
+  border: 1px solid rgba(135, 171, 220, 0.34);
+  border-radius: 999px;
+  color: var(--sloth-text);
+  cursor: pointer;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 36px minmax(0, 1fr) 16px;
+  height: 44px;
+  min-width: 0;
+  padding: 4px 12px 4px 5px;
+  text-align: left;
+}
+
+.slothServerPill .serverMedallion {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.1);
+  color: #ffd074;
+  font-size: 18px;
+  height: 34px;
+  width: 34px;
+}
+
+.slothServerPill strong {
+  display: block;
+  line-height: 1.1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.slothStatusGrid {
+  display: grid;
+  gap: 18px;
+  grid-template-columns: repeat(2, minmax(320px, 438px));
+  justify-content: center;
+}
+
+.slothInfoPanel,
+.slothGroupsPanel,
+.slothAnnouncement {
+  background: rgba(18, 17, 15, 0.62);
+  border: 1px solid var(--sloth-line);
+  border-radius: 18px;
+}
+
+.slothInfoPanel {
+  display: grid;
+  gap: 0;
+  padding: 7px 16px;
+}
+
+.slothInfoPanel .statusRow {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.045);
+  grid-template-columns: minmax(0, 1fr) minmax(100px, auto);
+  min-height: 32px;
+}
+
+.slothInfoPanel .statusRow:last-child {
+  border-bottom: 0;
+}
+
+.slothInfoPanel .statusRow span,
+.slothInfoPanel .statusRow strong {
+  color: var(--sloth-text-soft);
+  font-size: 14px;
+}
+
+.slothGroupsPanel {
+  display: grid;
+  gap: 10px 12px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  margin-inline: auto;
+  max-width: 900px;
+  padding: 12px;
+  width: 100%;
+}
+
+.slothGroupHeader {
+  align-items: center;
+  display: flex;
+  grid-column: 1 / -1;
+  justify-content: space-between;
+}
+
+.slothGroupList {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  min-width: 0;
+}
+
+.slothGroupChip {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid var(--sloth-line);
+  border-radius: 10px;
+  color: var(--sloth-text);
+  cursor: pointer;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: auto minmax(0, 1fr);
+  min-height: 54px;
+  padding: 8px 10px;
+  text-align: left;
+}
+
+.slothGroupChip.active {
+  background: rgba(185, 154, 98, 0.18);
+  border-color: rgba(185, 154, 98, 0.42);
+}
+
+.slothGroupChip strong,
+.slothGroupChip small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.slothGroupChip small {
+  color: var(--sloth-muted);
+  font-size: 11px;
+  grid-column: 2;
+}
+
+.slothNodeList {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  min-width: 0;
+}
+
+.slothNodeList .homeNodeButton {
+  background: rgba(255, 255, 255, 0.035);
+  border-color: var(--sloth-line);
+}
+
+.slothNodeList .homeNodeButton.selected {
+  background: rgba(95, 156, 255, 0.12);
+  border-color: rgba(95, 156, 255, 0.34);
+}
+
+.slothAnnouncement {
+  display: grid;
+  gap: 6px;
+  margin-inline: auto;
+  max-width: 900px;
+  padding: 10px 16px;
+  width: 100%;
+}
+
+.slothAnnouncement strong {
+  color: var(--sloth-muted);
+  font-size: 13px;
+  text-transform: uppercase;
+}
+
+.slothAnnouncementHeader {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.slothAnnouncementHeader a {
+  align-items: center;
+  color: #9fc5ff;
+  display: inline-flex;
+  flex-shrink: 0;
+  font-size: 12px;
+  font-weight: 760;
+  gap: 5px;
+  max-width: 45%;
+  min-width: 0;
+  overflow: hidden;
+  text-decoration: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.providerAnnouncementMeta {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.providerAnnouncementMeta small {
+  color: var(--sloth-muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.slothAnnouncement span {
+  color: var(--sloth-text);
+  font-size: 14px;
+  line-height: 1.35;
+}
+
+.bpnAnnouncementLine {
+  align-items: center;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  display: flex;
+  gap: 10px;
+  margin-top: 4px;
+  min-width: 0;
+  padding-top: 8px;
+}
+
+.bpnAnnouncementLine strong {
+  flex: 0 0 auto;
+}
+
+.bpnAnnouncementLine span {
+  color: var(--sloth-muted);
+  min-width: 0;
+}
+
+.slothNoticeGrid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr) 330px;
+  margin-inline: auto;
+  max-width: 900px;
+  width: 100%;
+}
+
+.slothNoticeGrid .slothAnnouncement {
+  margin: 0;
+  max-width: none;
+}
+
+.providerLinkList {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.providerLinkList a {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 8px;
+  color: var(--sloth-text);
+  display: grid;
+  gap: 7px;
+  grid-template-columns: 14px minmax(0, auto) minmax(0, 1fr);
+  min-height: 34px;
+  padding: 7px 9px;
+  text-decoration: none;
+}
+
+.providerLinkList span,
+.providerLinkList small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.providerLinkList small {
+  color: var(--sloth-muted);
+  text-align: right;
+}
+
+.slothAgentCard {
+  background: rgba(18, 17, 15, 0.62);
+  border: 1px solid var(--sloth-line);
+  border-radius: 18px;
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+}
+
+.slothAgentHeader {
+  align-items: center;
+  display: grid;
+  gap: 9px;
+  grid-template-columns: auto minmax(0, 1fr);
+  min-width: 0;
+}
+
+.slothAgentHeader svg {
+  color: #f0d5a8;
+}
+
+.slothAgentHeader div {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+.slothAgentHeader strong,
+.slothAgentHeader span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.slothAgentHeader strong {
+  color: var(--sloth-text);
+  font-size: 13px;
+  font-weight: 820;
+}
+
+.slothAgentHeader span {
+  color: var(--sloth-muted);
+  font-size: 11px;
+}
+
+.slothAgentRows {
+  display: grid;
+  gap: 0;
+}
+
+.slothAgentRows .statusRow {
+  grid-template-columns: minmax(0, 72px) minmax(0, 1fr);
+  min-height: 24px;
+  padding: 0;
+}
+
+.slothAgentRows .statusRow span,
+.slothAgentRows .statusRow strong {
+  font-size: 12px;
+}
+
+.slothAgentActions {
+  display: flex;
+  gap: 7px;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+.slothAgentActions .slothTextButton {
+  height: 28px;
+  padding: 0 9px;
+}
+
+.serverMedallion.countryFlag,
+.groupEmoji.countryFlag,
+.nodeFlag.countryFlag {
+  background: #f5f1e9;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.18);
+  overflow: hidden;
+  position: relative;
+}
+
+.serverMedallion.countryFlag::before,
+.serverMedallion.countryFlag::after,
+.groupEmoji.countryFlag::before,
+.groupEmoji.countryFlag::after,
+.nodeFlag.countryFlag::before,
+.nodeFlag.countryFlag::after {
+  content: "";
+  position: absolute;
+}
+
+.countryFlag.flag-nl {
+  background: linear-gradient(to bottom, #ae1c28 0 33.333%, #fff 33.333% 66.666%, #21468b 66.666% 100%);
+}
+
+.countryFlag.flag-de {
+  background: linear-gradient(to bottom, #111 0 33.333%, #dd0000 33.333% 66.666%, #ffce00 66.666% 100%);
+}
+
+.countryFlag.flag-ru {
+  background: linear-gradient(to bottom, #fff 0 33.333%, #1c57a7 33.333% 66.666%, #d52b1e 66.666% 100%);
+}
+
+.countryFlag.flag-fr {
+  background: linear-gradient(to right, #0055a4 0 33.333%, #fff 33.333% 66.666%, #ef4135 66.666% 100%);
+}
+
+.countryFlag.flag-it {
+  background: linear-gradient(to right, #009246 0 33.333%, #fff 33.333% 66.666%, #ce2b37 66.666% 100%);
+}
+
+.countryFlag.flag-se {
+  background:
+    linear-gradient(to right, transparent 0 30%, #fecc00 30% 43%, transparent 43%),
+    linear-gradient(to bottom, #006aa7 0 41%, #fecc00 41% 59%, #006aa7 59%);
+}
+
+.countryFlag.flag-fi {
+  background:
+    linear-gradient(to right, transparent 0 31%, #003580 31% 45%, transparent 45%),
+    linear-gradient(to bottom, #fff 0 40%, #003580 40% 58%, #fff 58%);
+}
+
+.countryFlag.flag-ch {
+  background: #d52b1e;
+}
+
+.countryFlag.flag-ch::before {
+  background: #fff;
+  height: 52%;
+  left: 40%;
+  top: 24%;
+  width: 20%;
+}
+
+.countryFlag.flag-ch::after {
+  background: #fff;
+  height: 20%;
+  left: 24%;
+  top: 40%;
+  width: 52%;
+}
+
+.countryFlag.flag-us {
+  background: repeating-linear-gradient(to bottom, #b22234 0 7.7%, #fff 7.7% 15.4%);
+}
+
+.countryFlag.flag-us::before {
+  background: #3c3b6e;
+  height: 54%;
+  left: 0;
+  top: 0;
+  width: 50%;
+}
+
+.countryFlag.flag-tr {
+  background: #e30a17;
+}
+
+.countryFlag.flag-tr::before {
+  background: #fff;
+  border-radius: 999px;
+  height: 54%;
+  left: 20%;
+  top: 23%;
+  width: 54%;
+}
+
+.countryFlag.flag-tr::after {
+  background: #e30a17;
+  border-radius: 999px;
+  height: 43%;
+  left: 33%;
+  top: 28.5%;
+  width: 43%;
+}
+
+.countryFlag.flag-gb {
+  background:
+    linear-gradient(to bottom, transparent 0 38%, #fff 38% 62%, transparent 62%),
+    linear-gradient(to right, transparent 0 38%, #fff 38% 62%, transparent 62%),
+    linear-gradient(to bottom, transparent 0 44%, #c8102e 44% 56%, transparent 56%),
+    linear-gradient(to right, transparent 0 44%, #c8102e 44% 56%, transparent 56%),
+    #012169;
+}
+
+.countryFlag.flag-pl {
+  background: linear-gradient(to bottom, #fff 0 50%, #dc143c 50% 100%);
+}
+
+.countryFlag.flag-jp {
+  background: #fff;
+}
+
+.countryFlag.flag-jp::before {
+  background: #bc002d;
+  border-radius: 999px;
+  height: 48%;
+  left: 26%;
+  top: 26%;
+  width: 48%;
+}
+
+.countryFlag.flag-sg {
+  background: linear-gradient(to bottom, #ef3340 0 50%, #fff 50% 100%);
+}
+
+.countryFlag.flag-ca {
+  background: linear-gradient(to right, #d80621 0 27%, #fff 27% 73%, #d80621 73% 100%);
+}
+
+/* Desktop interior pages: same flat shell as the Overview surface. */
+.appPane:not(.overviewPane) {
+  background: var(--sloth-bg);
+  grid-template-rows: 46px minmax(0, 1fr);
+  padding: 0;
+}
+
+.appPane:not(.overviewPane) .appHeader {
+  background: #1f1e1c;
+  border-bottom: 1px solid var(--sloth-line);
+  color: var(--sloth-text);
+  min-height: 46px;
+  padding: 0 24px;
+}
+
+.appPane:not(.overviewPane) .titleGroup strong {
+  color: var(--sloth-text);
+  font-size: 15px;
+}
+
+.appPane:not(.overviewPane) .titleGroup span {
+  color: var(--sloth-muted);
+}
+
+.workspace.pageWorkspace {
+  background: var(--sloth-bg);
+  display: block;
+  min-height: 0;
+  overflow: hidden;
+  padding: 18px 20px 20px;
+}
+
+.pagePanel,
+.settingsShell {
+  background: rgba(18, 17, 15, 0.76);
+  border: 1px solid var(--sloth-line);
+  border-radius: 18px;
+  box-shadow: none;
+  color: var(--sloth-text);
+  height: 100%;
+  min-height: 0;
+}
+
+.pagePanel {
+  gap: 12px;
+  padding: 14px;
+}
+
+.pageHeader {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.045);
+  min-height: 42px;
+  padding-bottom: 10px;
+}
+
+.pageHeader h1 {
+  color: var(--sloth-text);
+  font-size: 20px;
+  letter-spacing: 0;
+}
+
+.pageHeader p,
+.nodeHeader span,
+.groupButton strong,
+.nodeRow span,
+.connectionMain span,
+.connectionMeta,
+.chainLine,
+.connectionTail,
+.legendItem span {
+  color: var(--sloth-muted);
+}
+
+.subtleButton,
+.primarySmall,
+.iconSmall {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: var(--sloth-line-strong);
+  color: var(--sloth-text-soft);
+}
+
+.subtleButton:hover,
+.primarySmall:hover,
+.iconSmall:hover {
+  background: rgba(185, 154, 98, 0.16);
+  border-color: rgba(185, 154, 98, 0.36);
+  color: var(--sloth-text);
+}
+
+.pathLegend {
+  gap: 10px;
+}
+
+.legendItem,
+.connectionProcessGroup,
+.connectionRow,
+.nodeList,
+.groupButton,
+.providerItem,
+.resourceItem,
+.gameProfile,
+.backupGroup,
+.runtimeArtifact,
+.toggleRow,
+.detailItem,
+.policySummaryCard,
+.policyArtifact,
+.policyManagedGroup,
+.policyWarning {
+  background: rgba(255, 255, 255, 0.035);
+  border-color: var(--sloth-line);
+  border-radius: 12px;
+}
+
+.legendItem {
+  min-height: 66px;
+}
+
+.pathBadge.zapret,
+.policyPathBadge.zapret,
+.pathFilter button.active.zapret {
+  background: rgba(25, 111, 68, 0.22);
+  color: #9ff0bf;
+}
+
+.pathBadge.vpn,
+.policyPathBadge.vpn,
+.pathFilter button.active.vpn {
+  background: rgba(63, 105, 171, 0.28);
+  color: #b9d3ff;
+}
+
+.pathBadge.direct,
+.policyPathBadge.direct,
+.pathFilter button.active.direct {
+  background: rgba(185, 154, 98, 0.18);
+  color: #f0d5a8;
+}
+
+.connectionToolbar,
+.serverToolbar,
+.policyToolbar {
+  background: rgba(0, 0, 0, 0.14);
+  border: 1px solid var(--sloth-line);
+  border-radius: 14px;
+  padding: 10px;
+}
+
+.searchField input,
+.inputField input,
+.selectField select,
+.compactField select,
+.textAreaField textarea,
+.profileAddRow input {
+  background: #11100f;
+  border-color: var(--sloth-line);
+  color: var(--sloth-text);
+}
+
+.searchField span,
+.compactField span,
+.settingControl > span,
+.inputField span,
+.selectField span,
+.textAreaField span {
+  color: var(--sloth-muted);
+  letter-spacing: 0.06em;
+}
+
+.segmented,
+.pathFilter,
+.policyPathFilter,
+.policySourceFilter {
+  background: #0f0e0d;
+  border-color: rgba(255, 255, 255, 0.06);
+}
+
+.segmented button,
+.pathFilter button {
+  color: var(--sloth-muted);
+}
+
+.segmented button.active {
+  background: var(--sloth-gold-deep);
+  color: var(--sloth-text);
+}
+
+.serverGrid {
+  gap: 14px;
+  grid-template-columns: 286px minmax(0, 1fr);
+}
+
+.groupList,
+.nodeList,
+.connectionList,
+.policyTableWrap,
+.policyRuleList,
+.settingsContent {
+  scrollbar-color: rgba(185, 154, 98, 0.32) transparent;
+}
+
+.groupButton {
+  align-items: center;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: auto minmax(0, 1fr);
+  min-height: 58px;
+  padding: 9px 10px;
+}
+
+.groupButton > div,
+.nodeIdentity > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.groupButton span,
+.groupButton strong,
+.nodeIdentity strong,
+.nodeIdentity span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.groupButton span,
+.nodeIdentity strong,
+.nodeHeader strong,
+.connectionMain strong {
+  color: var(--sloth-text);
+}
+
+.groupButton.active,
+.groupButton:hover,
+.nodeRow.selected,
+.nodeRow:hover {
+  background: rgba(185, 154, 98, 0.15);
+  border-color: rgba(185, 154, 98, 0.38);
+}
+
+.nodeRow {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.nodeIdentity {
+  align-items: center;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: auto minmax(0, 1fr);
+  min-width: 0;
+}
+
+.nodeList .nodeFlag {
+  height: 36px;
+  width: 36px;
+}
+
+.connectionRow {
+  grid-template-columns: minmax(0, 1fr) minmax(210px, auto);
+}
+
+.settingsShell {
+  grid-template-columns: 206px minmax(0, 1fr);
+}
+
+.settingsSide {
+  background: #171614;
+  border-right-color: var(--sloth-line);
+  padding: 14px;
+}
+
+.settingsTab {
+  border-radius: 12px;
+  color: var(--sloth-muted);
+  height: 42px;
+}
+
+.settingsTab:hover,
+.settingsTab.active {
+  background: rgba(185, 154, 98, 0.2);
+  border-color: rgba(185, 154, 98, 0.34);
+  color: var(--sloth-text);
+}
+
+.settingsContent {
+  background: var(--sloth-bg);
+  padding: 14px;
+}
+
+.settingsPanels {
+  gap: 14px;
+}
+
+.settingsPanels .panel {
+  background: rgba(18, 17, 15, 0.72);
+  border-color: var(--sloth-line);
+  border-radius: 14px;
+}
+
+.policyPanel {
+  grid-template-rows: auto auto auto minmax(0, 1fr);
+}
+
+.policySummaryCards {
+  gap: 10px;
+}
+
+.policyTable {
+  color: var(--sloth-text-soft);
+}
+
+.policyTable thead {
+  background: rgba(185, 154, 98, 0.09);
+}
+
+.policyTable th {
+  color: var(--sloth-muted);
+}
+
+.policyTable td {
+  border-bottom-color: rgba(255, 255, 255, 0.045);
+}
+
+.serverToolbar {
+  align-items: stretch;
+  min-height: 72px;
+}
+
+.serverPanel {
+  grid-template-rows: auto 72px minmax(0, 1fr);
+}
+
+.serverPanel > .pageHeader {
+  grid-row: 1;
+}
+
+.serverPanel > .serverToolbar {
+  grid-row: 2;
+}
+
+.serverPanel > .serverGrid {
+  grid-row: 3;
+}
+
+.serverToolbar .searchField,
+.serverToolbar .compactField {
+  display: grid;
+  gap: 6px;
+  grid-template-rows: 14px 40px;
+}
+
+.serverToolbar input,
+.serverToolbar select {
+  height: 40px;
+  width: 100%;
+}
+
+.serverToolbar .searchField span,
+.serverToolbar .compactField span {
+  line-height: 14px;
+}
+
+.nodeRow {
+  background: rgba(255, 255, 255, 0.035);
+  border-color: var(--sloth-line);
+}
+
+.nodeRow.selected {
+  background: rgba(185, 154, 98, 0.17);
+  border-color: rgba(185, 154, 98, 0.45);
+}
+
+.policyToolbar {
+  align-items: end;
+  margin-bottom: 8px;
+}
+
+.policyQuickStats {
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.policySection {
+  gap: 12px;
+  padding-top: 4px;
+}
+
+.policySection h2 {
+  min-height: 24px;
+}
+
+/* Interior app polish pass. Keep the Overview identity intact, but make
+   work pages feel like a dense desktop control surface instead of a card deck. */
+.appPane:not(.overviewPane) {
+  --work-bg: #111417;
+  --work-surface: #171b20;
+  --work-surface-2: #1d2228;
+  --work-surface-3: #232831;
+  --work-line: rgba(228, 233, 240, 0.105);
+  --work-line-strong: rgba(228, 233, 240, 0.18);
+  --work-text: #f4f7fa;
+  --work-soft: #c8d2dd;
+  --work-muted: #8f9ba9;
+  --work-blue: #7bb7ff;
+  --work-green: #78d99a;
+  --work-amber: #e7bf73;
+  --work-red: #f08e85;
+  background: var(--work-bg);
+}
+
+.appPane:not(.overviewPane) .appHeader {
+  background: #171b20;
+  border-bottom-color: var(--work-line);
+  min-height: 48px;
+}
+
+.appPane:not(.overviewPane) .titleGroup strong,
+.appPane:not(.overviewPane) .titleGroup span {
+  color: var(--work-text);
+}
+
+.appPane:not(.overviewPane) .titleGroup span {
+  color: var(--work-muted);
+}
+
+.workspace.pageWorkspace {
+  background: var(--work-bg);
+  padding: 16px;
+}
+
+.pagePanel,
+.settingsShell {
+  background: var(--work-surface);
+  border: 1px solid var(--work-line);
+  border-radius: 8px;
+  box-shadow: none;
+  color: var(--work-text);
+}
+
+.pagePanel {
+  align-content: start;
+  display: grid;
+  gap: 10px;
+  grid-template-rows: none;
+  grid-auto-rows: max-content;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+}
+
+.pageHeader {
+  align-items: center;
+  background: var(--work-surface-2);
+  border: 1px solid var(--work-line);
+  border-radius: 7px;
+  display: flex;
+  justify-content: space-between;
+  min-height: 56px;
+  padding: 10px 12px;
+}
+
+.pageHeader h1 {
+  color: var(--work-text);
+  font-size: 18px;
+  line-height: 1.2;
+}
+
+.pageHeader p {
+  color: var(--work-muted);
+  font-size: 12px;
+  line-height: 1.35;
+  max-width: 760px;
+}
+
+.buttonRow,
+.headerActions {
+  gap: 7px;
+}
+
+.subtleButton,
+.primarySmall,
+.iconSmall,
+.iconAction {
+  background: #222832;
+  border: 1px solid var(--work-line-strong);
+  border-radius: 7px;
+  color: var(--work-soft);
+  min-height: 34px;
+}
+
+.primarySmall {
+  background: #24435e;
+  border-color: rgba(123, 183, 255, 0.42);
+  color: #e8f3ff;
+}
+
+.subtleButton:hover,
+.primarySmall:hover,
+.iconSmall:hover,
+.iconAction:hover {
+  background: #2b333e;
+  border-color: rgba(123, 183, 255, 0.4);
+  color: var(--work-text);
+}
+
+.subtleButton.danger,
+.iconSmall.danger {
+  color: #ffd8d5;
+}
+
+.subtleButton.danger:hover,
+.iconSmall.danger:hover {
+  background: rgba(240, 142, 133, 0.16);
+  border-color: rgba(240, 142, 133, 0.4);
+}
+
+.connectionToolbar,
+.serverToolbar,
+.policyToolbar,
+.compactToolbar {
+  align-items: end;
+  background: var(--work-surface-2);
+  border: 1px solid var(--work-line);
+  border-radius: 7px;
+  gap: 10px;
+  padding: 10px;
+}
+
+.connectionToolbar,
+.policyToolbar {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+
+.searchField input,
+.inputField input,
+.selectField select,
+.compactField select,
+.textAreaField textarea,
+.profileAddRow input,
+input,
+select,
+textarea {
+  background: #101317;
+  border-color: var(--work-line);
+  border-radius: 7px;
+  color: var(--work-text);
+}
+
+input,
+select {
+  height: 38px;
+}
+
+textarea {
+  line-height: 1.45;
+  min-height: 108px;
+}
+
+.searchField span,
+.compactField span,
+.settingControl > span,
+.inputField span,
+.selectField span,
+.textAreaField span {
+  color: var(--work-muted);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+}
+
+.segmented,
+.pathFilter,
+.policyPathFilter,
+.policySourceFilter {
+  background: #11151a;
+  border: 1px solid var(--work-line);
+  border-radius: 7px;
+}
+
+.segmented button,
+.pathFilter button {
+  border-radius: 6px;
+  color: var(--work-muted);
+  min-height: 32px;
+}
+
+.segmented button.active {
+  background: #2c4053;
+  color: #ecf6ff;
+}
+
+.pathFilter button.active.vpn,
+.pathBadge.vpn,
+.policyPathBadge.vpn {
+  background: rgba(123, 183, 255, 0.16);
+  border-color: rgba(123, 183, 255, 0.34);
+  color: #cfe6ff;
+}
+
+.pathFilter button.active.zapret,
+.pathBadge.zapret,
+.policyPathBadge.zapret {
+  background: rgba(120, 217, 154, 0.15);
+  border-color: rgba(120, 217, 154, 0.32);
+  color: #c7f2d6;
+}
+
+.pathFilter button.active.direct,
+.pathBadge.direct,
+.policyPathBadge.direct {
+  background: rgba(231, 191, 115, 0.15);
+  border-color: rgba(231, 191, 115, 0.32);
+  color: #f5dfb6;
+}
+
+.pathLegend {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.legendItem,
+.connectionProcessGroup,
+.connectionRow,
+.nodeList,
+.groupButton,
+.providerItem,
+.resourceItem,
+.gameProfile,
+.backupGroup,
+.runtimeArtifact,
+.toggleRow,
+.detailItem,
+.policySummaryCard,
+.policyArtifact,
+.policyManagedGroup,
+.policyWarning,
+.diagnosticItem {
+  background: var(--work-surface-2);
+  border: 1px solid var(--work-line);
+  border-radius: 7px;
+}
+
+.legendItem {
+  min-height: 58px;
+  padding: 9px;
+}
+
+.legendItem span,
+.connectionMeta,
+.chainLine,
+.connectionTail,
+.nodeHeader span,
+.nodeRow span,
+.groupButton strong,
+.resourceItem span,
+.runtimeArtifact span,
+.diagnosticItem span,
+.diagnosticItem em,
+.providerItem span,
+.providerItem em,
+.gameProfile span,
+.gameProfile em,
+.backupGroup span {
+  color: var(--work-muted);
+}
+
+.connectionList,
+.groupList,
+.nodeList,
+.policyTableWrap,
+.policyRuleList,
+.settingsContent,
+.diagnosticList,
+.resourceList,
+.gameProfileList,
+.logViewer,
+.runtimeArtifact pre {
+  scrollbar-color: rgba(123, 183, 255, 0.36) transparent;
+  scrollbar-width: thin;
+}
+
+.connectionList {
+  display: grid;
+  gap: 7px;
+}
+
+.connectionRow {
+  grid-template-columns: minmax(0, 1fr) minmax(220px, auto);
+  min-height: 62px;
+  padding: 10px;
+}
+
+.connectionRow:hover,
+.connectionProcessGroup:hover,
+.groupButton:hover,
+.groupButton.active,
+.nodeRow:hover,
+.nodeRow.selected {
+  background: #222a33;
+  border-color: rgba(123, 183, 255, 0.3);
+}
+
+.connectionMain strong,
+.nodeIdentity strong,
+.nodeHeader strong,
+.groupButton span,
+.policyTable strong,
+.resourceItem strong,
+.runtimeArtifact strong,
+.diagnosticItem strong,
+.providerItem strong,
+.gameProfile strong,
+.backupGroup strong {
+  color: var(--work-text);
+}
+
+.serverPanel {
+  grid-template-rows: auto auto minmax(0, 1fr);
+}
+
+.serverToolbar {
+  min-height: 64px;
+}
+
+.serverGrid {
+  gap: 10px;
+  grid-template-columns: minmax(220px, 280px) minmax(0, 1fr);
+  min-height: 0;
+}
+
+.groupList {
+  background: #11151a;
+  border: 1px solid var(--work-line);
+  border-radius: 7px;
+  display: grid;
+  gap: 6px;
+  min-height: 0;
+  overflow: auto;
+  padding: 8px;
+}
+
+.groupButton {
+  min-height: 54px;
+  padding: 8px 9px;
+}
+
+.nodeList {
+  background: #11151a;
+  min-height: 0;
+  overflow: auto;
+  padding: 8px;
+}
+
+.nodeHeader {
+  background: var(--work-surface-2);
+  border: 1px solid var(--work-line);
+  border-radius: 7px;
+  margin-bottom: 8px;
+  min-height: 52px;
+  padding: 8px 10px;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.nodeRow {
+  border: 1px solid var(--work-line);
+  border-radius: 7px;
+  min-height: 54px;
+  padding: 8px 9px;
+}
+
+.policyPanel {
+  grid-template-rows: auto auto auto minmax(0, 1fr);
+}
+
+.policySummaryCards {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(6, minmax(130px, 1fr));
+}
+
+.policySummaryCard {
+  min-height: 58px;
+  padding: 9px 10px;
+}
+
+.policySummaryCard.span2 {
+  grid-column: span 2;
+}
+
+.policySummaryLabel {
+  color: var(--work-muted);
+  font-size: 11px;
+}
+
+.policySummaryValue {
+  color: var(--work-text);
+  font-size: 15px;
+}
+
+.policySummaryValue.warn {
+  color: var(--work-amber);
+}
+
+.policyQuickStats {
+  gap: 6px;
+  justify-content: flex-start;
+  min-height: 28px;
+}
+
+.policyQuickStats span {
+  background: #20262e;
+  border: 1px solid var(--work-line);
+  border-radius: 999px;
+  color: var(--work-soft);
+  font-size: 11px;
+  padding: 4px 8px;
+}
+
+.policySection {
+  min-height: 0;
+}
+
+.policyTableWrap {
+  background: #11151a;
+  border: 1px solid var(--work-line);
+  border-radius: 7px;
+}
+
+.policyTable {
+  border-collapse: separate;
+  border-spacing: 0;
+  color: var(--work-soft);
+}
+
+.policyTable thead {
+  background: #1b222a;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.policyTable th {
+  color: var(--work-muted);
+  font-size: 11px;
+  letter-spacing: 0.03em;
+  padding: 8px 10px;
+}
+
+.policyTable td {
+  border-bottom-color: rgba(228, 233, 240, 0.055);
+  padding: 8px 10px;
+  vertical-align: top;
+}
+
+.settingsShell {
+  display: grid;
+  grid-template-columns: 192px minmax(0, 1fr);
+  overflow: hidden;
+}
+
+.settingsSide {
+  background: #14181d;
+  border-right: 1px solid var(--work-line);
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+}
+
+.settingsTab {
+  border: 1px solid transparent;
+  border-radius: 7px;
+  color: var(--work-muted);
+  height: 38px;
+  padding: 0 10px;
+}
+
+.settingsTab:hover,
+.settingsTab.active {
+  background: #222a33;
+  border-color: rgba(123, 183, 255, 0.28);
+  color: var(--work-text);
+}
+
+.settingsContent {
+  background: var(--work-bg);
+  display: block;
+  gap: 10px;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+}
+
+.settingsBanner {
+  background: rgba(231, 191, 115, 0.11);
+  border: 1px solid rgba(231, 191, 115, 0.32);
+  border-radius: 7px;
+}
+
+.settingsPanels {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(3, minmax(240px, 1fr));
+  grid-template-rows: none;
+  grid-auto-flow: row;
+  grid-auto-rows: auto;
+  align-content: start;
+  align-items: start;
+  min-height: max-content;
+  overflow: visible;
+}
+
+.settingsPanels .panel {
+  align-content: start;
+  background: var(--work-surface);
+  border: 1px solid var(--work-line);
+  border-radius: 7px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  height: auto;
+  max-height: none;
+  min-height: auto;
+  min-width: 0;
+  overflow: visible;
+  padding: 12px;
+}
+
+.panel h2 {
+  color: var(--work-text);
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.statusRow {
+  min-height: 27px;
+}
+
+.statusRow span {
+  color: var(--work-muted);
+}
+
+.statusRow strong,
+.statusRow b {
+  color: var(--work-text);
+}
+
+.toggleRow {
+  align-items: center;
+  min-height: 36px;
+  padding: 7px 9px;
+}
+
+.operatorPanels {
+  align-items: start;
+  grid-template-rows: none;
+  grid-auto-rows: auto;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+}
+
+.operatorPanels > .panel {
+  align-self: start;
+  grid-column: span 4;
+}
+
+.operatorPanels > .panel:nth-child(5),
+.operatorPanels > .panel:nth-child(6),
+.operatorPanels > .panel:nth-child(7),
+.operatorPanels > .panel:nth-child(8),
+.operatorPanels > .panel:nth-child(9) {
+  grid-column: span 6;
+}
+
+.operatorPanels > .panel:nth-child(6) {
+  grid-column: 1 / -1;
+}
+
+.profileAddRow {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.profileAddRow input {
+  min-width: 0;
+}
+
+.resourceList,
+.gameProfileList,
+.providerGrid,
+.backupList {
+  display: grid;
+  gap: 7px;
+}
+
+.resourceItem {
+  align-items: center;
+  grid-template-columns: minmax(0, 1fr) auto;
+  min-height: 70px;
+  padding: 10px;
+}
+
+.resourceItem.ok {
+  border-left: 3px solid var(--work-green);
+}
+
+.resourceItem.warning {
+  border-left: 3px solid var(--work-amber);
+}
+
+.resourceItem code,
+.runtimeArtifact pre,
+.logViewer {
+  background: #0e1115;
+  border: 1px solid var(--work-line);
+  border-radius: 6px;
+  color: #dce7f3;
+}
+
+.runtimeArtifact {
+  min-width: 0;
+  padding: 10px;
+}
+
+.runtimeArtifact pre,
+.logViewer {
+  max-height: 420px;
+}
+
+.diagnosticItem {
+  min-height: 56px;
+  padding: 8px 9px;
+}
+
+.diagnosticItem.ok {
+  border-left: 3px solid var(--work-green);
+}
+
+.diagnosticItem.warning {
+  border-left: 3px solid var(--work-amber);
+}
+
+.diagnosticItem.error {
+  border-left: 3px solid var(--work-red);
+}
+
+.dropZone {
+  background: #11151a;
+  border: 1px dashed rgba(123, 183, 255, 0.36);
+  border-radius: 7px;
+}
+
+.profilePreview {
+  background: rgba(120, 217, 154, 0.1);
+  border: 1px solid rgba(120, 217, 154, 0.3);
+  border-radius: 7px;
+}
+
+.profilePreview.warning {
+  background: rgba(231, 191, 115, 0.1);
+  border-color: rgba(231, 191, 115, 0.34);
+}
+
+@media (max-width: 1280px) {
+  body {
+    min-width: 860px;
+  }
+
+  .policySummaryCards {
+    grid-template-columns: repeat(3, minmax(130px, 1fr));
+  }
+
+  .settingsPanels {
+    grid-template-columns: repeat(2, minmax(240px, 1fr));
+  }
+
+  .operatorPanels > .panel {
+    grid-column: span 6;
+  }
+
+  .operatorPanels > .panel:nth-child(6),
+  .operatorPanels > .panel:nth-child(9) {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 980px) {
+  body {
+    min-width: 0;
+  }
+
+  .workspace.pageWorkspace {
+    padding: 10px;
+  }
+
+  .pageHeader,
+  .connectionToolbar,
+  .serverToolbar,
+  .policyToolbar {
+    align-items: stretch;
+    display: grid;
+  }
+
+  .pathLegend,
+  .settingsPanels,
+  .serverGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .settingsShell {
+    grid-template-columns: 1fr;
+  }
+
+  .settingsSide {
+    border-bottom: 1px solid var(--work-line);
+    border-right: 0;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .operatorPanels {
+    grid-template-columns: 1fr;
+  }
+
+  .operatorPanels > .panel,
+  .operatorPanels > .panel:nth-child(5),
+  .operatorPanels > .panel:nth-child(6),
+  .operatorPanels > .panel:nth-child(7),
+  .operatorPanels > .panel:nth-child(8),
+  .operatorPanels > .panel:nth-child(9) {
+    grid-column: auto;
+  }
+}
+
+/* Browser viewport safety: never force the web preview wider than the window. */
+html,
+body,
+#root {
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+}
+
+body {
+  min-width: 0;
+}
+
+.appWindow,
+.appWindow:not(.railExpanded),
+.appWindow.railExpanded {
+  height: 100dvh;
+  max-width: 100vw;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.appPane,
+.workspace,
+.workspace.pageWorkspace,
+.pagePanel,
+.settingsShell,
+.connectionPane.dashboardPane {
+  min-width: 0;
+}
+
+.policyTableWrap,
+.policyRuleList,
+.runtimeConfigGrid,
+.runtimeArtifact,
+.logViewer {
+  overflow-x: auto;
+}
+
+@media (max-width: 1180px) {
+  .appWindow:not(.railExpanded) {
+    grid-template-columns: 76px minmax(0, 1fr);
+  }
+
+  .appWindow.railExpanded {
+    grid-template-columns: 220px minmax(0, 1fr);
+  }
+
+  .appWindow:not(.railExpanded) .railBrand span,
+  .appWindow:not(.railExpanded) .railItem span,
+  .appWindow:not(.railExpanded) .railToggle span,
+  .appWindow:not(.railExpanded) .railStatusCard div {
+    display: none;
+  }
+
+  .appWindow.railExpanded .railBrand span,
+  .appWindow.railExpanded .railItem span,
+  .appWindow.railExpanded .railToggle span {
+    display: block;
+  }
+
+  .appWindow.railExpanded .railStatusCard div {
+    display: grid;
+  }
+
+  .rail {
+    padding: 12px 10px;
+  }
+
+  .slothControlRow {
+    grid-template-columns: minmax(0, 1fr);
+    justify-items: stretch;
+  }
+
+  .slothSegmentBlock,
+  .slothSegmentBlock.alignEnd {
+    text-align: left;
+  }
+
+  .slothStatusGrid,
+  .slothNoticeGrid,
+  .dashboardGrid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .serverDeck {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 900px) {
+  .appHeader {
+    padding: 0 12px;
+  }
+
+  .workspace.pageWorkspace,
+  .connectionPane.dashboardPane {
+    padding: 10px;
+  }
+
+  .pageHeader,
+  .slothProfileHeader,
+  .slothHeaderActions,
+  .connectionToolbar,
+  .serverToolbar,
+  .policyToolbar,
+  .compactToolbar,
+  .profileAddRow,
+  .runtimeConfigGrid,
+  .advancedOverrideGrid,
+  .overrideGrid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .pageHeader,
+  .slothProfileHeader,
+  .slothHeaderActions {
+    align-items: stretch;
+  }
+
+  .pathLegend,
+  .policySummaryCards,
+  .settingsPanels,
+  .operatorPanels,
+  .serverGrid,
+  .homeNodeGrid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .policySummaryCard.span2,
+  .operatorPanels > .panel,
+  .operatorPanels > .panel:nth-child(5),
+  .operatorPanels > .panel:nth-child(6),
+  .operatorPanels > .panel:nth-child(7),
+  .operatorPanels > .panel:nth-child(8),
+  .operatorPanels > .panel:nth-child(9) {
+    grid-column: auto;
+  }
+
+  .settingsShell {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .settingsSide {
+    border-bottom: 1px solid var(--work-line);
+    border-right: 0;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    overflow-x: auto;
+  }
+
+  .settingsTab {
+    min-width: 124px;
+  }
+
+  .connectionRow,
+  .resourceItem,
+  .homeNodeButton {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 640px) {
+  .appWindow,
+  .appWindow.railExpanded,
+  .appWindow:not(.railExpanded) {
+    grid-template-columns: 54px minmax(0, 1fr);
+  }
+
+  .rail {
+    gap: 10px;
+    padding: 10px 5px;
+  }
+
+  .railBrand,
+  .railItem,
+  .railToggle {
+    grid-template-columns: 1fr;
+    height: 40px;
+    justify-items: center;
+  }
+
+  .railStatusCard {
+    min-height: 42px;
+    padding: 8px;
+  }
+
+  .railToggle,
+  .appWindow.railExpanded .railToggle {
+    display: none;
+  }
+
+  .appWindow.railExpanded .railBrand span,
+  .appWindow.railExpanded .railItem span,
+  .appWindow.railExpanded .railStatusCard div {
+    display: none;
+  }
+
+  .appPane:not(.overviewPane) {
+    grid-template-rows: 44px minmax(0, 1fr);
+  }
+
+  .titleGroup span,
+  .headerActions {
+    display: none;
+  }
+
+  .workspace.pageWorkspace,
+  .connectionPane.dashboardPane {
+    padding: 8px;
+  }
+
+  .pagePanel,
+  .settingsContent {
+    padding: 8px;
+  }
+
+  .settingsSide {
+    grid-template-columns: repeat(2, minmax(120px, 1fr));
+  }
+
+  .slothProfileHeader {
+    gap: 10px;
+  }
+
+  .slothProfileHeader strong {
+    white-space: normal;
+  }
+
+  .slothGroupList,
+  .slothNodeList,
+  .slothGroupsPanel,
+  .slothNoticeGrid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .slothAnnouncementHeader,
+  .bpnAnnouncementLine,
+  .slothAgentActions {
+    align-items: stretch;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .slothAnnouncementHeader a {
+    max-width: none;
+  }
+
+  .providerLinkList a {
+    grid-template-columns: 14px minmax(0, 1fr);
+  }
+
+  .providerLinkList small {
+    grid-column: 2;
+    text-align: left;
+  }
+
+  .slothCenterControl .connectButton {
+    height: 104px;
+    width: 104px;
+  }
+}
+
+@media (max-width: 420px) {
+  .appWindow,
+  .appWindow.railExpanded,
+  .appWindow:not(.railExpanded) {
+    grid-template-columns: 44px minmax(0, 1fr);
+  }
+
+  .rail {
+    padding-inline: 4px;
+  }
+
+  .railBrand,
+  .railItem,
+  .railToggle {
+    height: 36px;
+  }
+
+  .railBrand svg,
+  .railItem svg,
+  .railToggle svg {
+    height: 32px;
+    width: 32px;
+  }
+
+  .railStatusCard {
+    display: none;
+  }
+
+  .connectionPane.dashboardPane {
+    gap: 8px;
+    padding: 8px 6px;
+  }
+
+  .slothProfileHeader strong {
+    font-size: 24px;
+  }
+
+  .slothGhostButton,
+  .slothSupportButton,
+  .slothTextButton,
+  .subtleButton,
+  .primarySmall {
+    min-width: 0;
+    padding-inline: 10px;
+    white-space: normal;
+  }
+
+  .slothSegmented {
+    min-width: 0;
+  }
+
+  .slothSegmented button {
+    min-width: 0;
+    padding-inline: 4px;
+  }
+
+  .slothServerPill {
+    grid-template-columns: 34px minmax(0, 1fr) 12px;
+    padding-right: 8px;
+  }
+
+  .slothStatusGrid,
+  .slothInfoPanel,
+  .slothGroupsPanel,
+  .slothAnnouncement,
+  .slothAgentCard {
+    min-width: 0;
+  }
+
+  .slothInfoPanel,
+  .slothAnnouncement,
+  .slothAgentCard {
+    padding-inline: 10px;
+  }
+
+  .slothAgentRows .statusRow,
+  .slothInfoPanel .statusRow {
+    grid-template-columns: minmax(0, 1fr);
+    justify-items: start;
   }
 }
