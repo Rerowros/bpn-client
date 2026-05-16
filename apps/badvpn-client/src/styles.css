@@ -8146,17 +8146,29 @@ body {
 }
 
 @media (max-width: 1180px) {
-  .appWindow,
-  .appWindow.railExpanded,
   .appWindow:not(.railExpanded) {
     grid-template-columns: 76px minmax(0, 1fr);
   }
 
-  .railBrand span,
-  .railItem span,
-  .railToggle span,
-  .railStatusCard div {
+  .appWindow.railExpanded {
+    grid-template-columns: 220px minmax(0, 1fr);
+  }
+
+  .appWindow:not(.railExpanded) .railBrand span,
+  .appWindow:not(.railExpanded) .railItem span,
+  .appWindow:not(.railExpanded) .railToggle span,
+  .appWindow:not(.railExpanded) .railStatusCard div {
     display: none;
+  }
+
+  .appWindow.railExpanded .railBrand span,
+  .appWindow.railExpanded .railItem span,
+  .appWindow.railExpanded .railToggle span {
+    display: block;
+  }
+
+  .appWindow.railExpanded .railStatusCard div {
+    display: grid;
   }
 
   .rail {
@@ -8279,6 +8291,17 @@ body {
   .railStatusCard {
     min-height: 42px;
     padding: 8px;
+  }
+
+  .railToggle,
+  .appWindow.railExpanded .railToggle {
+    display: none;
+  }
+
+  .appWindow.railExpanded .railBrand span,
+  .appWindow.railExpanded .railItem span,
+  .appWindow.railExpanded .railStatusCard div {
+    display: none;
   }
 
   .appPane:not(.overviewPane) {

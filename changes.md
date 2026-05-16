@@ -54,7 +54,7 @@
 - Provider announcement/account/support links отображаются как безопасные read-only external links.
 - Добавлена отдельная provider announcement card с source label и timestamp.
 - Канал BPN signed product announcements отделен от provider subscription announcements.
-- Добавлены тесты, что provider links редактируются/редактируются в support summary без утечки токенов.
+- Добавлены тесты, что provider links маскируются в support summary без утечки токенов.
 - Mock subscription data обновлен на санитизированные provider links с `panel.example`.
 
 ## Lifecycle профилей подписки
@@ -234,10 +234,12 @@
 ### `add-zapret-operator-tools`
 
 - Manual Windows QA с реальным `.exe`.
-- Manual provider update action только если его можно validated and rolled back.
+- Manual provider update action только после проверки, что обновление можно провалидировать и откатить через rollback.
 - Manual Windows QA для `.exe` override, zapret health checks, resource update rollback и support bundle redaction.
 
-## Измененные пути
+## Измененные пути в стеке PR #17-#19
+
+Список ниже описывает весь текущий стек изменений, а не только дизайн-PR.
 
 - `Cargo.lock`
 - `apps/badvpn-client/package-lock.json`
