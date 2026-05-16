@@ -202,6 +202,7 @@ pub struct RuntimeGameProfile {
     pub filter_mode: String,
     pub risk_level: String,
     pub detected: bool,
+    pub enabled: bool,
 }
 
 impl Default for RuntimeGameProfile {
@@ -217,6 +218,7 @@ impl Default for RuntimeGameProfile {
             filter_mode: "udp_first".to_string(),
             risk_level: "normal".to_string(),
             detected: false,
+            enabled: true,
         }
     }
 }
@@ -343,6 +345,7 @@ pub enum AgentCommand {
     SetDpiProfile { profile: String },
     RunDiagnostics,
     CleanupLegacyZapret,
+    RepairWindowsNetwork,
     VerifyInstalledAgent,
     UpdateComponents,
     RollbackComponent { component: String },

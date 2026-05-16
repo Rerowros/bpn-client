@@ -1,0 +1,6 @@
+{
+  "panel": "remnawave",
+  "code": "HWID_DEVICE_LIMIT",
+  "message": "Device limit exceeded for this subscription profile",
+  "support_url": "https://panel.example/support"
+}

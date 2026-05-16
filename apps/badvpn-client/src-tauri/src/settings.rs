@@ -1,5 +1,6 @@
 use badvpn_common::{MihomoConfigOptions, RouteMode, RoutingPolicySettings};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -9,6 +10,7 @@ pub struct AppSettings {
     pub core: CoreSettings,
     pub tun: TunSettings,
     pub dns: DnsSettings,
+    pub sniffer: SnifferSettings,
     pub zapret: ZapretSettings,
     pub routing_policy: RoutingPolicySettings,
     pub updates: UpdateSettings,
@@ -21,6 +23,7 @@ impl Default for AppSettings {
             core: CoreSettings::default(),
             tun: TunSettings::default(),
             dns: DnsSettings::default(),
+            sniffer: SnifferSettings::default(),
             zapret: ZapretSettings::default(),
             routing_policy: RoutingPolicySettings::default(),
             updates: UpdateSettings::default(),
@@ -30,18 +33,40 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
+    pub fn migrate_legacy_local_overrides(&mut self) {
+        self.routing_policy.migrate_legacy_local_overrides();
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.core.route_mode == RouteMode::Smart && !self.zapret.enabled {
             return Err("Smart requires zapret; disable zapret by using VPN Only.".into());
         }
         validate_port("mixed proxy port", self.core.mixed_port)?;
         validate_port("controller port", self.core.controller_port)?;
+        if self.tun.enabled {
+            if !(1280..=9000).contains(&self.tun.mtu) {
+                return Err("TUN MTU must be between 1280 and 9000.".into());
+            }
+            if self.tun.dns_hijack.is_empty() {
+                return Err(
+                    "At least one DNS hijack target is required when TUN is enabled.".into(),
+                );
+            }
+        }
+        if self.dns.mode == DnsMode::FakeIp && self.dns.fake_ip_range.trim().is_empty() {
+            return Err("Fake-IP range is required.".into());
+        }
         if self.core.mixed_port == self.core.controller_port {
             return Err("Mixed proxy port and controller port must be different.".into());
         }
         if self.core.mixed_port == 1053 || self.core.controller_port == 1053 {
             return Err(
                 "Ports 7890/9090 can be changed, but 1053 is reserved for BadVpn DNS.".into(),
+            );
+        }
+        if !(1..=168).contains(&self.updates.safe_resource_auto_update_interval_hours) {
+            return Err(
+                "Safe resource auto-update interval must be between 1 and 168 hours.".into(),
             );
         }
         Ok(())
@@ -68,8 +93,20 @@ impl AppSettings {
             tun_strict_route: self.tun.strict_route,
             tun_auto_route: self.tun.auto_route,
             tun_auto_detect_interface: self.tun.auto_detect_interface,
+            tun_mtu: self.tun.mtu,
+            tun_dns_hijack: self.tun.dns_hijack.clone(),
+            tun_excluded_routes: self.tun.excluded_routes.clone(),
             dns_mode: self.dns.mode.as_mihomo_str().to_string(),
             dns_nameservers: self.dns.preset.nameservers(),
+            dns_fake_ip_range: self.dns.fake_ip_range.clone(),
+            dns_fake_ip_filter: self.dns.fake_ip_filter.clone(),
+            dns_nameserver_policy: self.dns.nameserver_policy_map(),
+            sniffer_enabled: self.sniffer.enabled,
+            sniffer_protocols: self.sniffer.enabled_protocols(),
+            sniffer_force_domains: self.sniffer.force_domains.clone(),
+            sniffer_skip_domains: self.sniffer.skip_domains.clone(),
+            sniffer_skip_src_cidrs: self.sniffer.skip_src_cidrs.clone(),
+            sniffer_skip_dst_cidrs: self.sniffer.skip_dst_cidrs.clone(),
             zapret_direct_domains: Vec::new(),
             zapret_direct_cidrs: Vec::new(),
             zapret_direct_processes: Vec::new(),
@@ -139,6 +176,9 @@ pub struct TunSettings {
     pub strict_route: bool,
     pub auto_route: bool,
     pub auto_detect_interface: bool,
+    pub mtu: u16,
+    pub dns_hijack: Vec<String>,
+    pub excluded_routes: Vec<String>,
 }
 
 impl Default for TunSettings {
@@ -149,6 +189,9 @@ impl Default for TunSettings {
             strict_route: true,
             auto_route: true,
             auto_detect_interface: true,
+            mtu: 1500,
+            dns_hijack: vec!["any:53".to_string(), "tcp://any:53".to_string()],
+            excluded_routes: Vec::new(),
         }
     }
 }
@@ -182,6 +225,9 @@ impl TunStack {
 pub struct DnsSettings {
     pub mode: DnsMode,
     pub preset: DnsPreset,
+    pub fake_ip_range: String,
+    pub fake_ip_filter: Vec<String>,
+    pub nameserver_policy: Vec<NameServerPolicySetting>,
 }
 
 impl Default for DnsSettings {
@@ -189,7 +235,84 @@ impl Default for DnsSettings {
         Self {
             mode: DnsMode::FakeIp,
             preset: DnsPreset::CloudflareGoogle,
+            fake_ip_range: "198.18.0.1/16".to_string(),
+            fake_ip_filter: vec![
+                "+.lan".to_string(),
+                "+.local".to_string(),
+                "localhost.ptlogin2.qq.com".to_string(),
+            ],
+            nameserver_policy: Vec::new(),
         }
+    }
+}
+
+impl DnsSettings {
+    fn nameserver_policy_map(&self) -> BTreeMap<String, Vec<String>> {
+        self.nameserver_policy
+            .iter()
+            .filter(|rule| !rule.pattern.trim().is_empty() && !rule.nameservers.is_empty())
+            .map(|rule| (rule.pattern.trim().to_string(), rule.nameservers.clone()))
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NameServerPolicySetting {
+    pub pattern: String,
+    pub nameservers: Vec<String>,
+}
+
+impl Default for NameServerPolicySetting {
+    fn default() -> Self {
+        Self {
+            pattern: String::new(),
+            nameservers: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SnifferSettings {
+    pub enabled: bool,
+    pub http: bool,
+    pub tls: bool,
+    pub quic: bool,
+    pub force_domains: Vec<String>,
+    pub skip_domains: Vec<String>,
+    pub skip_src_cidrs: Vec<String>,
+    pub skip_dst_cidrs: Vec<String>,
+}
+
+impl Default for SnifferSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            http: true,
+            tls: true,
+            quic: true,
+            force_domains: Vec::new(),
+            skip_domains: Vec::new(),
+            skip_src_cidrs: Vec::new(),
+            skip_dst_cidrs: Vec::new(),
+        }
+    }
+}
+
+impl SnifferSettings {
+    fn enabled_protocols(&self) -> Vec<String> {
+        let mut protocols = Vec::new();
+        if self.http {
+            protocols.push("HTTP".to_string());
+        }
+        if self.tls {
+            protocols.push("TLS".to_string());
+        }
+        if self.quic {
+            protocols.push("QUIC".to_string());
+        }
+        protocols
     }
 }
 
@@ -385,6 +508,7 @@ pub struct GameProfileSettings {
     pub filter_mode: GameFilterMode,
     pub risk_level: String,
     pub detected: bool,
+    pub enabled: bool,
 }
 
 impl Default for GameProfileSettings {
@@ -400,6 +524,7 @@ impl Default for GameProfileSettings {
             filter_mode: GameFilterMode::UdpFirst,
             risk_level: "normal".to_string(),
             detected: false,
+            enabled: true,
         }
     }
 }
@@ -422,12 +547,14 @@ impl Default for ZapretIpSetFilter {
 #[serde(default)]
 pub struct UpdateSettings {
     pub auto_flowseal_list_refresh: bool,
+    pub safe_resource_auto_update_interval_hours: u64,
 }
 
 impl Default for UpdateSettings {
     fn default() -> Self {
         Self {
             auto_flowseal_list_refresh: true,
+            safe_resource_auto_update_interval_hours: 24,
         }
     }
 }
@@ -452,7 +579,8 @@ pub fn read_settings_from_path(path: &Path) -> AppSettings {
     let Ok(content) = fs::read_to_string(path) else {
         return AppSettings::default();
     };
-    let settings = serde_json::from_str::<AppSettings>(&content).unwrap_or_default();
+    let mut settings = serde_json::from_str::<AppSettings>(&content).unwrap_or_default();
+    settings.migrate_legacy_local_overrides();
     if settings.validate().is_ok() {
         settings
     } else {
@@ -461,12 +589,14 @@ pub fn read_settings_from_path(path: &Path) -> AppSettings {
 }
 
 pub fn write_settings_to_path(path: &Path, settings: &AppSettings) -> Result<(), String> {
+    let mut settings = settings.clone();
+    settings.migrate_legacy_local_overrides();
     settings.validate()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("Failed to create settings directory: {error}"))?;
     }
-    let content = serde_json::to_string_pretty(settings)
+    let content = serde_json::to_string_pretty(&settings)
         .map_err(|error| format!("Failed to serialize settings: {error}"))?;
     fs::write(path, content).map_err(|error| format!("Failed to write settings: {error}"))
 }
@@ -475,6 +605,7 @@ pub fn settings_require_restart(previous: &AppSettings, next: &AppSettings) -> b
     previous.core != next.core
         || previous.tun != next.tun
         || previous.dns != next.dns
+        || previous.sniffer != next.sniffer
         || previous.zapret != next.zapret
         || previous.routing_policy != next.routing_policy
 }
@@ -537,6 +668,33 @@ mod tests {
     }
 
     #[test]
+    fn old_routing_policy_defaults_local_overrides_enabled() {
+        let settings = serde_json::from_str::<AppSettings>(
+            r#"{
+                "routing_policy": {
+                    "force_direct_processes": ["Game.exe"],
+                    "force_zapret_tcp_ports": ["443"]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(settings.routing_policy.local_overrides_enabled);
+        let mut migrated = settings.clone();
+        migrated.migrate_legacy_local_overrides();
+        assert_eq!(migrated.routing_policy.local_overrides.version, 1);
+        assert_eq!(migrated.routing_policy.local_overrides.rules.len(), 2);
+        assert_eq!(
+            settings.routing_policy.force_direct_processes,
+            vec!["Game.exe".to_string()]
+        );
+        assert_eq!(
+            settings.routing_policy.force_zapret_tcp_ports,
+            vec!["443".to_string()]
+        );
+    }
+
+    #[test]
     fn smart_requires_zapret_enabled_and_vpn_only_allows_disabled_zapret() {
         let mut settings = AppSettings::default();
         settings.core.route_mode = RouteMode::Smart;
@@ -547,5 +705,47 @@ mod tests {
         settings.core.route_mode = RouteMode::VpnOnly;
         assert!(settings.validate().is_ok());
         assert_eq!(settings.effective_route_mode(), RouteMode::VpnOnly);
+    }
+
+    #[test]
+    fn tun_and_fake_ip_validation_follow_enabled_modes() {
+        let mut settings = AppSettings::default();
+        settings.tun.enabled = false;
+        settings.tun.mtu = 1000;
+        settings.tun.dns_hijack.clear();
+        settings.dns.mode = DnsMode::RedirHost;
+        settings.dns.fake_ip_range.clear();
+        assert!(settings.validate().is_ok());
+
+        settings.tun.enabled = true;
+        assert!(settings.validate().is_err());
+
+        settings = AppSettings::default();
+        settings.dns.fake_ip_range.clear();
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn update_settings_default_interval_and_validation() {
+        let settings = serde_json::from_str::<AppSettings>(
+            r#"{
+                "updates": {
+                    "auto_flowseal_list_refresh": true
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            settings.updates.safe_resource_auto_update_interval_hours,
+            24
+        );
+        assert!(settings.validate().is_ok());
+
+        let mut invalid = AppSettings::default();
+        invalid.updates.safe_resource_auto_update_interval_hours = 0;
+        assert!(invalid.validate().is_err());
+
+        invalid.updates.safe_resource_auto_update_interval_hours = 169;
+        assert!(invalid.validate().is_err());
     }
 }

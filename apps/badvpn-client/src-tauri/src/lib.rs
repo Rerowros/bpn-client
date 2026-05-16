@@ -44,7 +44,27 @@ pub fn run() {
             commands::clear_closed_connections,
             commands::proxy_catalog,
             commands::select_proxy,
-            commands::policy_summary
+            commands::policy_summary,
+            commands::operator_snapshot,
+            commands::pick_executable_path,
+            commands::run_zapret_health_checks,
+            commands::repair_windows_network,
+            commands::update_operator_resource,
+            commands::update_all_operator_resources,
+            commands::rollback_operator_resource,
+            commands::preview_local_profile_from_text,
+            commands::preview_local_profile_from_path,
+            commands::import_local_profile_from_text,
+            commands::import_local_profile_from_path,
+            commands::import_profile_deep_link,
+            commands::refresh_all_subscription_profiles,
+            commands::refresh_due_subscription_profiles,
+            commands::update_subscription_profile_metadata,
+            commands::update_subscription_profile_fetch_options,
+            commands::export_backup_bundle,
+            commands::restore_backup_bundle_from_path,
+            commands::export_support_bundle,
+            commands::open_operator_directory
         ])
         .run(tauri::generate_context!())
         .expect("failed to run BadVpn Tauri application");

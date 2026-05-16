@@ -282,6 +282,8 @@ fn is_valid_zapret_ip_or_cidr(value: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RoutingPolicySettings {
+    pub local_overrides_enabled: bool,
+    pub local_overrides: LocalOverridesSettings,
     pub force_vpn_domains: Vec<String>,
     pub force_vpn_cidrs: Vec<String>,
     pub force_zapret_domains: Vec<String>,
@@ -299,6 +301,8 @@ pub struct RoutingPolicySettings {
 impl Default for RoutingPolicySettings {
     fn default() -> Self {
         Self {
+            local_overrides_enabled: true,
+            local_overrides: LocalOverridesSettings::default(),
             force_vpn_domains: Vec::new(),
             force_vpn_cidrs: Vec::new(),
             force_zapret_domains: Vec::new(),
@@ -312,6 +316,170 @@ impl Default for RoutingPolicySettings {
             smart_presets: SmartPresetSettings::default(),
             coverage: ZapretCoverage::Curated,
         }
+    }
+}
+
+impl RoutingPolicySettings {
+    pub fn migrate_legacy_local_overrides(&mut self) {
+        if !self.local_overrides.rules.is_empty() {
+            return;
+        }
+        self.local_overrides.rules = legacy_local_override_rules(self);
+    }
+
+    fn compile_ready(&self) -> Self {
+        let mut next = self.clone();
+        next.merge_enabled_local_override_rules();
+        next
+    }
+
+    fn merge_enabled_local_override_rules(&mut self) {
+        for rule in self
+            .local_overrides
+            .rules
+            .iter()
+            .filter(|rule| rule.enabled)
+        {
+            let value = local_override_compile_value(rule);
+            if value.trim().is_empty() {
+                continue;
+            }
+            match (rule.path, rule.target_kind) {
+                (LocalOverridePath::Vpn, LocalOverrideTargetKind::Domain) => {
+                    push_unique(&mut self.force_vpn_domains, value)
+                }
+                (LocalOverridePath::Vpn, LocalOverrideTargetKind::Cidr) => {
+                    push_unique(&mut self.force_vpn_cidrs, value)
+                }
+                (LocalOverridePath::Zapret, LocalOverrideTargetKind::Domain) => {
+                    push_unique(&mut self.force_zapret_domains, value)
+                }
+                (LocalOverridePath::Zapret, LocalOverrideTargetKind::Cidr) => {
+                    push_unique(&mut self.force_zapret_cidrs, value)
+                }
+                (
+                    LocalOverridePath::Zapret,
+                    LocalOverrideTargetKind::Process | LocalOverrideTargetKind::App,
+                ) => push_unique(&mut self.force_zapret_processes, value),
+                (LocalOverridePath::Zapret, LocalOverrideTargetKind::TcpPort) => {
+                    push_unique(&mut self.force_zapret_tcp_ports, value)
+                }
+                (LocalOverridePath::Zapret, LocalOverrideTargetKind::UdpPort) => {
+                    push_unique(&mut self.force_zapret_udp_ports, value)
+                }
+                (LocalOverridePath::Direct, LocalOverrideTargetKind::Domain) => {
+                    push_unique(&mut self.force_direct_domains, value)
+                }
+                (LocalOverridePath::Direct, LocalOverrideTargetKind::Cidr) => {
+                    push_unique(&mut self.force_direct_cidrs, value)
+                }
+                (
+                    LocalOverridePath::Direct,
+                    LocalOverrideTargetKind::Process | LocalOverrideTargetKind::App,
+                ) => push_unique(&mut self.force_direct_processes, value),
+                _ => {}
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LocalOverridesSettings {
+    pub version: u16,
+    pub rules: Vec<LocalOverrideRule>,
+}
+
+impl Default for LocalOverridesSettings {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            rules: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LocalOverrideRule {
+    pub id: String,
+    pub enabled: bool,
+    pub title: String,
+    pub path: LocalOverridePath,
+    pub target_kind: LocalOverrideTargetKind,
+    pub value: String,
+    pub executable_path: Option<String>,
+    pub process_name: Option<String>,
+    pub source: LocalOverrideSource,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub last_applied_at: Option<u64>,
+    pub last_policy_trace_id: Option<String>,
+}
+
+impl Default for LocalOverrideRule {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            enabled: true,
+            title: String::new(),
+            path: LocalOverridePath::Direct,
+            target_kind: LocalOverrideTargetKind::Domain,
+            value: String::new(),
+            executable_path: None,
+            process_name: None,
+            source: LocalOverrideSource::User,
+            created_at: 0,
+            updated_at: 0,
+            last_applied_at: None,
+            last_policy_trace_id: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalOverridePath {
+    Direct,
+    Vpn,
+    Zapret,
+}
+
+impl Default for LocalOverridePath {
+    fn default() -> Self {
+        Self::Direct
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalOverrideTargetKind {
+    Domain,
+    Cidr,
+    Process,
+    App,
+    TcpPort,
+    UdpPort,
+}
+
+impl Default for LocalOverrideTargetKind {
+    fn default() -> Self {
+        Self::Domain
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalOverrideSource {
+    User,
+    MigratedForceList,
+    LearnedGame,
+    Preset,
+}
+
+impl Default for LocalOverrideSource {
+    fn default() -> Self {
+        Self::User
     }
 }
 
@@ -435,6 +603,7 @@ struct CompileContext {
 }
 
 pub fn compile_policy(input: PolicyCompileInput) -> Result<CompiledPolicy, String> {
+    let routing = input.routing.compile_ready();
     let provider_rules = input
         .provider_rules
         .iter()
@@ -449,7 +618,7 @@ pub fn compile_policy(input: PolicyCompileInput) -> Result<CompiledPolicy, Strin
     let dns_nameservers = trusted_dns_nameservers();
     let mut ctx = CompileContext {
         mode: input.mode,
-        coverage: input.routing.coverage,
+        coverage: routing.coverage,
         main_proxy_group: resolution.main_proxy_group.clone(),
         dns_nameservers: dns_nameservers.clone(),
         mihomo_rules: Vec::new(),
@@ -464,7 +633,7 @@ pub fn compile_policy(input: PolicyCompileInput) -> Result<CompiledPolicy, Strin
         dns_nameserver_policy: BTreeMap::new(),
         seen_targets: BTreeMap::new(),
     };
-    if input.mode == AppRouteMode::Smart && input.routing.coverage == ZapretCoverage::Broad {
+    if input.mode == AppRouteMode::Smart && routing.coverage == ZapretCoverage::Broad {
         ctx.diagnostics_messages.push(
             "Broad coverage is experimental; VPN proxy targets are excluded via hostlist-exclude/ipset-exclude where concrete domains or CIDRs are available."
                 .to_string(),
@@ -472,11 +641,11 @@ pub fn compile_policy(input: PolicyCompileInput) -> Result<CompiledPolicy, Strin
     }
 
     emit_safety_rules(&mut ctx);
-    emit_user_overrides(&mut ctx, &input.routing);
+    emit_user_overrides(&mut ctx, &routing);
     if input.mode == AppRouteMode::Smart {
-        emit_smart_presets(&mut ctx, &input.routing.smart_presets, &resolution);
+        emit_smart_presets(&mut ctx, &routing.smart_presets, &resolution);
     }
-    emit_provider_rules(&mut ctx, &provider_rules, &input.routing, &resolution);
+    emit_provider_rules(&mut ctx, &provider_rules, &routing, &resolution);
     emit_runtime_excludes(&mut ctx, &input.runtime_facts);
     ctx.dns_nameserver_policy
         .entry("+.badvpn.pro".to_string())
@@ -765,6 +934,10 @@ fn emit_safety_rules(ctx: &mut CompileContext) {
 }
 
 fn emit_user_overrides(ctx: &mut CompileContext, settings: &RoutingPolicySettings) {
+    if !settings.local_overrides_enabled {
+        return;
+    }
+
     for domain in normalize_domain_list(settings.force_vpn_domains.iter().cloned()) {
         emit_domain_override(
             ctx,
@@ -1579,6 +1752,7 @@ fn expected_zapret_for_rule(rule: &PolicyRule) -> bool {
         PolicyTargetKind::Domain | PolicyTargetKind::DomainSuffix => true,
         PolicyTargetKind::GeoSite => !hostlist_values_for_target(&rule.target).is_empty(),
         PolicyTargetKind::Cidr | PolicyTargetKind::Cidr6 => true,
+        PolicyTargetKind::TcpPort | PolicyTargetKind::UdpPort => true,
         _ => false,
     }
 }
@@ -1645,6 +1819,186 @@ fn normalize_domain_list(values: impl IntoIterator<Item = String>) -> Vec<String
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+fn legacy_local_override_rules(settings: &RoutingPolicySettings) -> Vec<LocalOverrideRule> {
+    let mut rules = Vec::new();
+    for value in &settings.force_vpn_domains {
+        rules.push(legacy_local_override_rule(
+            LocalOverridePath::Vpn,
+            LocalOverrideTargetKind::Domain,
+            value,
+        ));
+    }
+    for value in &settings.force_vpn_cidrs {
+        rules.push(legacy_local_override_rule(
+            LocalOverridePath::Vpn,
+            LocalOverrideTargetKind::Cidr,
+            value,
+        ));
+    }
+    for value in &settings.force_zapret_domains {
+        rules.push(legacy_local_override_rule(
+            LocalOverridePath::Zapret,
+            LocalOverrideTargetKind::Domain,
+            value,
+        ));
+    }
+    for value in &settings.force_zapret_cidrs {
+        rules.push(legacy_local_override_rule(
+            LocalOverridePath::Zapret,
+            LocalOverrideTargetKind::Cidr,
+            value,
+        ));
+    }
+    for value in &settings.force_zapret_processes {
+        rules.push(legacy_local_override_rule(
+            LocalOverridePath::Zapret,
+            LocalOverrideTargetKind::Process,
+            value,
+        ));
+    }
+    for value in &settings.force_zapret_tcp_ports {
+        rules.push(legacy_local_override_rule(
+            LocalOverridePath::Zapret,
+            LocalOverrideTargetKind::TcpPort,
+            value,
+        ));
+    }
+    for value in &settings.force_zapret_udp_ports {
+        rules.push(legacy_local_override_rule(
+            LocalOverridePath::Zapret,
+            LocalOverrideTargetKind::UdpPort,
+            value,
+        ));
+    }
+    for value in &settings.force_direct_domains {
+        rules.push(legacy_local_override_rule(
+            LocalOverridePath::Direct,
+            LocalOverrideTargetKind::Domain,
+            value,
+        ));
+    }
+    for value in &settings.force_direct_cidrs {
+        rules.push(legacy_local_override_rule(
+            LocalOverridePath::Direct,
+            LocalOverrideTargetKind::Cidr,
+            value,
+        ));
+    }
+    for value in &settings.force_direct_processes {
+        rules.push(legacy_local_override_rule(
+            LocalOverridePath::Direct,
+            LocalOverrideTargetKind::Process,
+            value,
+        ));
+    }
+    dedupe_local_override_rules(rules)
+}
+
+fn legacy_local_override_rule(
+    path: LocalOverridePath,
+    target_kind: LocalOverrideTargetKind,
+    value: &str,
+) -> LocalOverrideRule {
+    let value = value.trim().to_string();
+    let process_name = matches!(
+        target_kind,
+        LocalOverrideTargetKind::Process | LocalOverrideTargetKind::App
+    )
+    .then(|| normalize_process_list([value.clone()]).into_iter().next())
+    .flatten();
+    let value = process_name.clone().unwrap_or(value);
+    let id = local_override_id(path, target_kind, &value);
+    LocalOverrideRule {
+        id,
+        enabled: true,
+        title: local_override_title(path, target_kind, &value),
+        path,
+        target_kind,
+        value,
+        executable_path: None,
+        process_name,
+        source: LocalOverrideSource::MigratedForceList,
+        created_at: 0,
+        updated_at: 0,
+        last_applied_at: None,
+        last_policy_trace_id: None,
+    }
+}
+
+fn local_override_compile_value(rule: &LocalOverrideRule) -> String {
+    match rule.target_kind {
+        LocalOverrideTargetKind::Process | LocalOverrideTargetKind::App => rule
+            .process_name
+            .clone()
+            .or_else(|| {
+                normalize_process_list([rule.value.clone()])
+                    .into_iter()
+                    .next()
+            })
+            .unwrap_or_default(),
+        _ => rule.value.clone(),
+    }
+}
+
+fn dedupe_local_override_rules(rules: Vec<LocalOverrideRule>) -> Vec<LocalOverrideRule> {
+    let mut seen = BTreeSet::new();
+    let mut deduped = Vec::new();
+    for mut rule in rules {
+        let value = local_override_compile_value(&rule);
+        if value.trim().is_empty() {
+            continue;
+        }
+        rule.value = value;
+        if rule.id.trim().is_empty() {
+            rule.id = local_override_id(rule.path, rule.target_kind, &rule.value);
+        }
+        let key = format!(
+            "{:?}:{:?}:{}",
+            rule.path,
+            rule.target_kind,
+            rule.value.to_ascii_lowercase()
+        );
+        if seen.insert(key) {
+            deduped.push(rule);
+        }
+    }
+    deduped
+}
+
+fn local_override_title(
+    path: LocalOverridePath,
+    target_kind: LocalOverrideTargetKind,
+    value: &str,
+) -> String {
+    format!("{path:?} {target_kind:?} {value}")
+}
+
+fn local_override_id(
+    path: LocalOverridePath,
+    target_kind: LocalOverrideTargetKind,
+    value: &str,
+) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in format!("{path:?}:{target_kind:?}:{}", value.to_ascii_lowercase()).as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("local-{hash:016x}")
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if value.trim().is_empty() {
+        return;
+    }
+    if values
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(&value))
+    {
+        return;
+    }
+    values.push(value);
 }
 
 fn normalize_cidr_list(values: impl IntoIterator<Item = String>) -> Vec<String> {
@@ -2479,6 +2833,207 @@ mod tests {
         assert!(policy
             .mihomo_rules
             .contains(&"DOMAIN-SUFFIX,perplexity.ai,DIRECT".to_string()));
+    }
+
+    #[test]
+    fn local_force_direct_process_is_preserved_as_user_override() {
+        let mut routing = RoutingPolicySettings::default();
+        routing.force_direct_processes = vec!["Game.exe".to_string()];
+        let policy = compile_policy(PolicyCompileInput {
+            mode: AppRouteMode::Smart,
+            provider_rules: fixture_rules(),
+            proxy_groups: groups(),
+            proxy_count: 2,
+            routing,
+            runtime_facts: RuntimeFacts::default(),
+        })
+        .unwrap();
+
+        assert!(policy
+            .mihomo_rules
+            .contains(&"PROCESS-NAME,Game.exe,DIRECT".to_string()));
+        assert!(!policy.zapret_hostlist.contains(&"Game.exe".to_string()));
+        assert!(policy.policy_rules.iter().any(|rule| {
+            rule.target.kind == PolicyTargetKind::ProcessName
+                && rule.target.value == "Game.exe"
+                && rule.path == PolicyPath::DirectSafe
+                && rule.source == PolicySource::LocalUserOverride
+                && rule.tags == vec!["force_direct".to_string()]
+        }));
+    }
+
+    #[test]
+    fn local_force_zapret_ports_emit_direct_rules_and_expectations() {
+        let mut routing = RoutingPolicySettings::default();
+        routing.force_zapret_tcp_ports = vec!["443".to_string()];
+        routing.force_zapret_udp_ports = vec!["50000-50100".to_string()];
+        let policy = compile_policy(PolicyCompileInput {
+            mode: AppRouteMode::Smart,
+            provider_rules: fixture_rules(),
+            proxy_groups: groups(),
+            proxy_count: 2,
+            routing,
+            runtime_facts: RuntimeFacts::default(),
+        })
+        .unwrap();
+
+        assert!(policy
+            .mihomo_rules
+            .contains(&"AND,((NETWORK,TCP),(DST-PORT,443)),DIRECT".to_string()));
+        assert!(policy
+            .mihomo_rules
+            .contains(&"AND,((NETWORK,UDP),(DST-PORT,50000-50100)),DIRECT".to_string()));
+        assert!(policy.diagnostics_expectations.iter().any(|expectation| {
+            expectation.target == "DST-PORT,443"
+                && expectation.expected_path == PolicyPath::ZapretDirect
+                && expectation.expected_zapret
+        }));
+        assert!(policy.diagnostics_expectations.iter().any(|expectation| {
+            expectation.target == "DST-PORT,50000-50100"
+                && expectation.expected_path == PolicyPath::ZapretDirect
+                && expectation.expected_zapret
+        }));
+    }
+
+    #[test]
+    fn versioned_local_overrides_compile_with_rule_fields() {
+        let mut routing = RoutingPolicySettings::default();
+        routing.local_overrides.rules = vec![
+            LocalOverrideRule {
+                id: "rule-app".to_string(),
+                enabled: true,
+                title: "Game app".to_string(),
+                path: LocalOverridePath::Zapret,
+                target_kind: LocalOverrideTargetKind::App,
+                value: r"C:\Games\Game.exe".to_string(),
+                executable_path: Some(r"C:\Games\Game.exe".to_string()),
+                process_name: Some("Game.exe".to_string()),
+                source: LocalOverrideSource::User,
+                created_at: 1,
+                updated_at: 2,
+                last_applied_at: None,
+                last_policy_trace_id: None,
+            },
+            LocalOverrideRule {
+                id: "rule-disabled".to_string(),
+                enabled: false,
+                title: "Disabled direct".to_string(),
+                path: LocalOverridePath::Direct,
+                target_kind: LocalOverrideTargetKind::Domain,
+                value: "disabled.example".to_string(),
+                source: LocalOverrideSource::User,
+                ..LocalOverrideRule::default()
+            },
+        ];
+        let policy = compile_policy(PolicyCompileInput {
+            mode: AppRouteMode::Smart,
+            provider_rules: fixture_rules(),
+            proxy_groups: groups(),
+            proxy_count: 2,
+            routing,
+            runtime_facts: RuntimeFacts::default(),
+        })
+        .unwrap();
+
+        assert!(policy
+            .mihomo_rules
+            .contains(&"PROCESS-NAME,Game.exe,DIRECT".to_string()));
+        assert!(!policy
+            .mihomo_rules
+            .iter()
+            .any(|rule| rule.contains("disabled.example")));
+    }
+
+    #[test]
+    fn legacy_force_lists_migrate_to_versioned_local_overrides() {
+        let mut routing = RoutingPolicySettings::default();
+        routing.force_direct_processes = vec!["Game.exe".to_string()];
+        routing.force_zapret_tcp_ports = vec!["443".to_string()];
+        routing.migrate_legacy_local_overrides();
+
+        assert_eq!(routing.local_overrides.version, 1);
+        assert_eq!(routing.local_overrides.rules.len(), 2);
+        assert!(routing.local_overrides.rules.iter().any(|rule| {
+            rule.path == LocalOverridePath::Direct
+                && rule.target_kind == LocalOverrideTargetKind::Process
+                && rule.process_name.as_deref() == Some("Game.exe")
+                && rule.source == LocalOverrideSource::MigratedForceList
+        }));
+    }
+
+    #[test]
+    fn local_override_processes_and_ports_are_normalized_and_deduped() {
+        let mut routing = RoutingPolicySettings::default();
+        routing.force_direct_processes = vec![
+            "  Game.exe  ".to_string(),
+            "\"Game.exe\"".to_string(),
+            r"C:\Games\Game.exe".to_string(),
+            "bad,process.exe".to_string(),
+        ];
+        routing.force_zapret_tcp_ports = vec![
+            "443".to_string(),
+            " 443 ".to_string(),
+            "70000".to_string(),
+            "bad".to_string(),
+        ];
+        let policy = compile_policy(PolicyCompileInput {
+            mode: AppRouteMode::Smart,
+            provider_rules: fixture_rules(),
+            proxy_groups: groups(),
+            proxy_count: 2,
+            routing,
+            runtime_facts: RuntimeFacts::default(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            policy
+                .mihomo_rules
+                .iter()
+                .filter(|rule| *rule == "PROCESS-NAME,Game.exe,DIRECT")
+                .count(),
+            1
+        );
+        assert_eq!(
+            policy
+                .mihomo_rules
+                .iter()
+                .filter(|rule| *rule == "AND,((NETWORK,TCP),(DST-PORT,443)),DIRECT")
+                .count(),
+            1
+        );
+        assert!(!policy
+            .mihomo_rules
+            .iter()
+            .any(|rule| rule.contains("70000") || rule.contains("bad")));
+    }
+
+    #[test]
+    fn disabled_local_overrides_are_preserved_but_not_emitted() {
+        let mut routing = RoutingPolicySettings::default();
+        routing.local_overrides_enabled = false;
+        routing.force_direct_processes = vec!["Game.exe".to_string()];
+        routing.force_zapret_tcp_ports = vec!["443".to_string()];
+        let policy = compile_policy(PolicyCompileInput {
+            mode: AppRouteMode::Smart,
+            provider_rules: fixture_rules(),
+            proxy_groups: groups(),
+            proxy_count: 2,
+            routing,
+            runtime_facts: RuntimeFacts::default(),
+        })
+        .unwrap();
+
+        assert!(!policy
+            .mihomo_rules
+            .contains(&"PROCESS-NAME,Game.exe,DIRECT".to_string()));
+        assert!(!policy
+            .mihomo_rules
+            .contains(&"AND,((NETWORK,TCP),(DST-PORT,443)),DIRECT".to_string()));
+        assert!(!policy
+            .policy_rules
+            .iter()
+            .any(|rule| rule.source == PolicySource::LocalUserOverride));
     }
 
     // ---------------------------------------------------------------
