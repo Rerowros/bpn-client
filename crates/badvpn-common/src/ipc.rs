@@ -345,6 +345,7 @@ pub enum AgentCommand {
     SetDpiProfile { profile: String },
     RunDiagnostics,
     CleanupLegacyZapret,
+    RepairWindowsNetwork,
     VerifyInstalledAgent,
     UpdateComponents,
     RollbackComponent { component: String },

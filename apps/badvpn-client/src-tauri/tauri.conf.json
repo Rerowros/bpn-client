@@ -15,8 +15,8 @@
         "title": "BadVpn",
         "width": 1120,
         "height": 760,
-        "minWidth": 960,
-        "minHeight": 640
+        "minWidth": 1120,
+        "minHeight": 720
       }
     ],
     "security": {

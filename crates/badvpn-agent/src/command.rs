@@ -8,7 +8,10 @@ use std::{
 };
 
 use crate::{
-    runtime::{cleanup_legacy_zapret_service, snapshot_to_agent_state, RuntimeManager},
+    runtime::{
+        cleanup_legacy_zapret_service, repair_windows_network_state, snapshot_to_agent_state,
+        RuntimeManager,
+    },
     security::redact_url,
     service,
     state::AgentRuntimeState,
@@ -38,6 +41,7 @@ impl AgentController {
             AgentCommand::RefreshSubscription => self.refresh_subscription().await,
             AgentCommand::RunDiagnostics => self.run_diagnostics().await,
             AgentCommand::CleanupLegacyZapret => self.cleanup_legacy_zapret().await,
+            AgentCommand::RepairWindowsNetwork => self.repair_windows_network().await,
             AgentCommand::VerifyInstalledAgent => self.verify_installed_agent().await,
             AgentCommand::SelectProxy { .. }
             | AgentCommand::SetRouteMode { .. }
@@ -179,6 +183,34 @@ impl AgentController {
         }
     }
 
+    async fn repair_windows_network(&mut self) -> BadVpnResult<AgentState> {
+        let stop_snapshot = self
+            .manager
+            .stop()
+            .await
+            .map_err(|error| BadVpnError::OperationFailed(error.to_string()))?;
+        self.runtime = AgentRuntimeState::from_agent_state(snapshot_to_agent_state(
+            &stop_snapshot,
+            self.runtime.subscription.clone(),
+        ));
+        match repair_windows_network_state() {
+            Ok(message) => {
+                self.runtime.diagnostics = DiagnosticSummary {
+                    mihomo_healthy: false,
+                    zapret_healthy: false,
+                    message: Some(message),
+                };
+                self.runtime.clear_error();
+                Ok(self.runtime.snapshot())
+            }
+            Err(error) => {
+                let message = format!("failed to repair Windows network state: {error}");
+                self.runtime.set_error(message.clone());
+                Err(BadVpnError::OperationFailed(message))
+            }
+        }
+    }
+
     async fn verify_installed_agent(&mut self) -> BadVpnResult<AgentState> {
         let status = service::status();
         self.runtime.installed = status.installed;
@@ -256,6 +288,7 @@ fn command_kind(command: &AgentCommand) -> &'static str {
         AgentCommand::SetDpiProfile { .. } => "set_dpi_profile",
         AgentCommand::RunDiagnostics => "run_diagnostics",
         AgentCommand::CleanupLegacyZapret => "cleanup_legacy_zapret",
+        AgentCommand::RepairWindowsNetwork => "repair_windows_network",
         AgentCommand::VerifyInstalledAgent => "verify_installed_agent",
         AgentCommand::UpdateComponents => "update_components",
         AgentCommand::RollbackComponent { .. } => "rollback_component",

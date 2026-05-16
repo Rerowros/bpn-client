@@ -64,6 +64,11 @@ impl AppSettings {
                 "Ports 7890/9090 can be changed, but 1053 is reserved for BadVpn DNS.".into(),
             );
         }
+        if !(1..=168).contains(&self.updates.safe_resource_auto_update_interval_hours) {
+            return Err(
+                "Safe resource auto-update interval must be between 1 and 168 hours.".into(),
+            );
+        }
         Ok(())
     }
 
@@ -542,12 +547,14 @@ impl Default for ZapretIpSetFilter {
 #[serde(default)]
 pub struct UpdateSettings {
     pub auto_flowseal_list_refresh: bool,
+    pub safe_resource_auto_update_interval_hours: u64,
 }
 
 impl Default for UpdateSettings {
     fn default() -> Self {
         Self {
             auto_flowseal_list_refresh: true,
+            safe_resource_auto_update_interval_hours: 24,
         }
     }
 }
@@ -716,5 +723,29 @@ mod tests {
         settings = AppSettings::default();
         settings.dns.fake_ip_range.clear();
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn update_settings_default_interval_and_validation() {
+        let settings = serde_json::from_str::<AppSettings>(
+            r#"{
+                "updates": {
+                    "auto_flowseal_list_refresh": true
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            settings.updates.safe_resource_auto_update_interval_hours,
+            24
+        );
+        assert!(settings.validate().is_ok());
+
+        let mut invalid = AppSettings::default();
+        invalid.updates.safe_resource_auto_update_interval_hours = 0;
+        assert!(invalid.validate().is_err());
+
+        invalid.updates.safe_resource_auto_update_interval_hours = 169;
+        assert!(invalid.validate().is_err());
     }
 }
