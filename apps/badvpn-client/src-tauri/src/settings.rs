@@ -43,13 +43,17 @@ impl AppSettings {
         }
         validate_port("mixed proxy port", self.core.mixed_port)?;
         validate_port("controller port", self.core.controller_port)?;
-        if !(1280..=9000).contains(&self.tun.mtu) {
-            return Err("TUN MTU must be between 1280 and 9000.".into());
+        if self.tun.enabled {
+            if !(1280..=9000).contains(&self.tun.mtu) {
+                return Err("TUN MTU must be between 1280 and 9000.".into());
+            }
+            if self.tun.dns_hijack.is_empty() {
+                return Err(
+                    "At least one DNS hijack target is required when TUN is enabled.".into(),
+                );
+            }
         }
-        if self.tun.dns_hijack.is_empty() {
-            return Err("At least one DNS hijack target is required when TUN is enabled.".into());
-        }
-        if self.dns.fake_ip_range.trim().is_empty() {
+        if self.dns.mode == DnsMode::FakeIp && self.dns.fake_ip_range.trim().is_empty() {
             return Err("Fake-IP range is required.".into());
         }
         if self.core.mixed_port == self.core.controller_port {
@@ -694,5 +698,23 @@ mod tests {
         settings.core.route_mode = RouteMode::VpnOnly;
         assert!(settings.validate().is_ok());
         assert_eq!(settings.effective_route_mode(), RouteMode::VpnOnly);
+    }
+
+    #[test]
+    fn tun_and_fake_ip_validation_follow_enabled_modes() {
+        let mut settings = AppSettings::default();
+        settings.tun.enabled = false;
+        settings.tun.mtu = 1000;
+        settings.tun.dns_hijack.clear();
+        settings.dns.mode = DnsMode::RedirHost;
+        settings.dns.fake_ip_range.clear();
+        assert!(settings.validate().is_ok());
+
+        settings.tun.enabled = true;
+        assert!(settings.validate().is_err());
+
+        settings = AppSettings::default();
+        settings.dns.fake_ip_range.clear();
+        assert!(settings.validate().is_err());
     }
 }

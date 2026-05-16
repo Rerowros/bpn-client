@@ -2679,9 +2679,10 @@ pub async fn refresh_all_subscription_profiles() -> Result<SubscriptionProfilesA
     let mut store = read_persisted_subscription_profiles()?;
     let mut refreshed = 0_usize;
     let mut failed = 0_usize;
+    let mut skipped = 0_usize;
     for profile in &mut store.profiles {
         let Some(url) = profile.subscription.url.clone() else {
-            failed += 1;
+            skipped += 1;
             continue;
         };
         match fetch_subscription(&url).await {
@@ -2725,7 +2726,9 @@ pub async fn refresh_all_subscription_profiles() -> Result<SubscriptionProfilesA
     Ok(SubscriptionProfilesApplyResult {
         profiles: build_subscription_profiles_state()?,
         state,
-        message: format!("{refreshed} profile(s) refreshed; {failed} preserved from cache."),
+        message: format!(
+            "{refreshed} profile(s) refreshed; {failed} preserved from cache; {skipped} local profile(s) skipped."
+        ),
     })
 }
 
@@ -2735,7 +2738,7 @@ pub fn export_backup_bundle() -> Result<BackupActionResult, String> {
         schema: 1,
         generated_at: current_unix_timestamp(),
         settings: load_app_settings(),
-        subscription_profiles: build_subscription_profiles_state()?,
+        subscription_profiles: subscription_profiles_backup_snapshot()?,
         proxy_selections: read_proxy_selections().unwrap_or_default(),
     };
     let dir = data_dir()?.join("backups");
@@ -2764,9 +2767,27 @@ pub fn restore_backup_bundle_from_path(path: String) -> Result<BackupActionResul
         return Err("Unsupported backup schema.".to_string());
     }
     write_settings_to_path(&settings_file_path()?, &backup.settings)?;
+    write_persisted_subscription_profiles(&backup.subscription_profiles)?;
+    if let Some(active_id) = backup.subscription_profiles.active_id.as_deref() {
+        if let Some(active) = backup
+            .subscription_profiles
+            .profiles
+            .iter()
+            .find(|profile| profile.id == active_id)
+        {
+            persist_subscription_state_with_body(
+                &active.subscription,
+                active
+                    .protected_body
+                    .as_deref()
+                    .and_then(|value| unprotect_secret(value).ok())
+                    .as_deref(),
+            )?;
+        }
+    }
     persist_proxy_selections(&backup.proxy_selections)?;
     Ok(BackupActionResult {
-        message: "Backup settings restored. Reconnect to apply runtime settings.".to_string(),
+        message: "Backup settings and subscription profiles restored. Reconnect to apply runtime settings.".to_string(),
         path: Some(path.to_string_lossy().to_string()),
         history: backup_history_snapshot()?,
     })
@@ -2942,7 +2963,7 @@ struct BackupBundle {
     schema: u16,
     generated_at: u64,
     settings: AppSettings,
-    subscription_profiles: SubscriptionProfilesState,
+    subscription_profiles: PersistedSubscriptionProfiles,
     proxy_selections: BTreeMap<String, String>,
 }
 
@@ -3108,8 +3129,8 @@ fn operator_resource_catalog() -> Result<ResourceCatalog, String> {
                 .map(|metadata| format!("{} bytes", metadata.len()))
         };
         let verification_status = if installed {
-            let body = fs::read_to_string(&def.path).unwrap_or_default();
-            format!("content-hash={}", stable_config_hash(&body))
+            let body = fs::read(&def.path).unwrap_or_default();
+            format!("content-hash={}", stable_bytes_hash(&body))
         } else if def.url.is_some() {
             "missing; update can stage a checked copy".to_string()
         } else {
@@ -5438,8 +5459,12 @@ fn powershell_single_quote(value: &str) -> String {
 }
 
 fn stable_config_hash(value: &str) -> String {
+    stable_bytes_hash(value.as_bytes())
+}
+
+fn stable_bytes_hash(value: &[u8]) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in value.as_bytes() {
+    for byte in value {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
@@ -8756,6 +8781,14 @@ fn write_persisted_subscription_profiles(
         .map_err(|error| format!("Failed to serialize subscription profiles: {error}"))?;
     fs::write(&path, content)
         .map_err(|error| format!("Failed to write subscription profiles: {error}"))
+}
+
+fn subscription_profiles_backup_snapshot() -> Result<PersistedSubscriptionProfiles, String> {
+    let mut store = read_persisted_subscription_profiles()?;
+    for profile in &mut store.profiles {
+        profile.subscription.url = None;
+    }
+    Ok(store)
 }
 
 fn write_subscription_profiles_backup(
