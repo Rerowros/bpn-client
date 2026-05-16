@@ -2950,7 +2950,7 @@ async fn refresh_subscription_profiles(
     let mut skipped = 0_usize;
     let now = current_unix_timestamp();
     for profile in &mut store.profiles {
-        if only_due && profile.next_refresh_at.is_some_and(|due_at| due_at > now) {
+        if only_due && !subscription_profile_is_due_for_refresh(profile, now) {
             skipped += 1;
             continue;
         }
@@ -3018,6 +3018,16 @@ async fn refresh_subscription_profiles(
             )
         },
     })
+}
+
+fn subscription_profile_is_due_for_refresh(
+    profile: &PersistedSubscriptionProfile,
+    now: u64,
+) -> bool {
+    match profile.next_refresh_at {
+        Some(due_at) => due_at <= now,
+        None => profile.last_successful_refresh_at.is_none(),
+    }
 }
 
 #[tauri::command]
@@ -10391,6 +10401,42 @@ sniffer:
             ),
             None
         );
+    }
+
+    #[test]
+    fn due_refresh_skips_unscheduled_profiles_after_success() {
+        let mut profile = PersistedSubscriptionProfile {
+            id: "profile-1".to_string(),
+            name: "Profile".to_string(),
+            description: None,
+            subscription: SubscriptionState {
+                url: Some("https://example.com/sub/secret-token".to_string()),
+                is_valid: Some(true),
+                node_count: 1,
+                format: SubscriptionFormat::ClashYaml,
+                ..SubscriptionState::default()
+            },
+            protected_url: Some("protected-url".to_string()),
+            protected_body: Some("cached-body".to_string()),
+            last_successful_refresh_at: None,
+            last_failed_refresh_at: None,
+            last_refresh_error: None,
+            next_refresh_at: None,
+            fetch_options: PersistedSubscriptionFetchOptions::default(),
+            created_at: 1,
+            updated_at: 1,
+        };
+
+        assert!(subscription_profile_is_due_for_refresh(&profile, 100));
+
+        profile.last_successful_refresh_at = Some(10);
+        assert!(!subscription_profile_is_due_for_refresh(&profile, 100));
+
+        profile.next_refresh_at = Some(101);
+        assert!(!subscription_profile_is_due_for_refresh(&profile, 100));
+
+        profile.next_refresh_at = Some(100);
+        assert!(subscription_profile_is_due_for_refresh(&profile, 100));
     }
 }
 
