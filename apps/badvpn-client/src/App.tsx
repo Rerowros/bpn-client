@@ -4789,7 +4789,7 @@ function localOverrideSummaryItems(policy: AppSettings["routing_policy"]): Local
     ...policy.force_direct_cidrs.map((value) => ({ route: "direct", kind: "cidr", value })),
     ...policy.force_direct_processes.map((value) => ({ route: "direct", kind: "process", value })),
   ].filter((item) => !typed.some((rule) => rule.route === item.route && rule.kind === item.kind && rule.value.toLocaleLowerCase() === item.value.toLocaleLowerCase()));
-  return [...typed, ...legacy].slice(0, 24);
+  return [...typed, ...legacy];
 }
 
 function localOverrideConflictLabel(
