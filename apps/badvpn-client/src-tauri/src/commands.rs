@@ -2810,22 +2810,28 @@ pub fn restore_backup_bundle_from_path(path: String) -> Result<BackupActionResul
     }
     write_settings_to_path(&settings_file_path()?, &backup.settings)?;
     write_persisted_subscription_profiles(&backup.subscription_profiles)?;
-    if let Some(active_id) = backup.subscription_profiles.active_id.as_deref() {
-        if let Some(active) = backup
-            .subscription_profiles
-            .profiles
-            .iter()
-            .find(|profile| profile.id == active_id)
-        {
-            persist_subscription_state_with_body(
-                &active.subscription,
-                active
-                    .protected_body
-                    .as_deref()
-                    .and_then(|value| unprotect_secret(value).ok())
-                    .as_deref(),
-            )?;
-        }
+    let restored_active = backup
+        .subscription_profiles
+        .active_id
+        .as_deref()
+        .and_then(|active_id| {
+            backup
+                .subscription_profiles
+                .profiles
+                .iter()
+                .find(|profile| profile.id == active_id)
+        });
+    if let Some(active) = restored_active {
+        persist_subscription_state_with_body(
+            &active.subscription,
+            active
+                .protected_body
+                .as_deref()
+                .and_then(|value| unprotect_secret(value).ok())
+                .as_deref(),
+        )?;
+    } else {
+        clear_legacy_subscription_state()?;
     }
     persist_proxy_selections(&backup.proxy_selections)?;
     Ok(BackupActionResult {
@@ -4100,27 +4106,35 @@ fn redact_urls_in_line(line: &str) -> String {
     let mut out = String::new();
     let mut rest = line;
     loop {
-        let http = rest.find("http://");
-        let https = rest.find("https://");
-        let Some(index) = (match (http, https) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        }) else {
+        let Some(index) = sensitive_uri_index(rest) else {
             out.push_str(rest);
             break;
         };
         out.push_str(&rest[..index]);
         let tail = &rest[index..];
         let end = tail
-            .find(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '<' | '>' | ')'))
+            .find(|ch: char| {
+                ch.is_whitespace() || matches!(ch, '"' | '\'' | '<' | '>' | ')' | ']' | '}')
+            })
             .unwrap_or(tail.len());
         let (url, next) = tail.split_at(end);
         out.push_str(&redact_url(url));
         rest = next;
     }
     out
+}
+
+fn sensitive_uri_index(value: &str) -> Option<usize> {
+    const SCHEMES: [&str; 7] = [
+        "http://",
+        "https://",
+        "vmess://",
+        "vless://",
+        "trojan://",
+        "ss://",
+        "ssr://",
+    ];
+    SCHEMES.iter().filter_map(|scheme| value.find(scheme)).min()
 }
 
 fn redact_path(path: &Path) -> String {
@@ -9060,6 +9074,9 @@ fn redact_url(url: &str) -> String {
     let Some((scheme, rest)) = trimmed.split_once("://") else {
         return "subscription".to_string();
     };
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+        return format!("{scheme}://<redacted>/...");
+    }
     let authority = rest.split('/').next().unwrap_or(rest);
     let host = authority.rsplit('@').next().unwrap_or(authority);
     format!("{scheme}://{host}/...")
@@ -9092,6 +9109,21 @@ mod redaction_tests {
     #[test]
     fn invalid_subscription_url_redaction_uses_generic_label() {
         assert_eq!(redact_url("not-a-url-with-token-secret"), "subscription");
+    }
+
+    #[test]
+    fn proxy_uri_redaction_masks_embedded_credentials() {
+        let redacted = redact_sensitive_text(
+            "vless://uuid-secret@example.com:443?security=reality\nvmess://eyJhZGQiOiJzZWNyZXQifQ==\ntrojan://password-secret@example.com:443\nss://method:password-secret@example.com:443",
+        );
+
+        assert!(redacted.contains("vless://<redacted>/..."));
+        assert!(redacted.contains("vmess://<redacted>/..."));
+        assert!(redacted.contains("trojan://<redacted>/..."));
+        assert!(redacted.contains("ss://<redacted>/..."));
+        assert!(!redacted.contains("uuid-secret"));
+        assert!(!redacted.contains("password-secret"));
+        assert!(!redacted.contains("eyJhZGQi"));
     }
 
     #[test]
