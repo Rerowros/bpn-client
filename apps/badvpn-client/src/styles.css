@@ -5635,9 +5635,9 @@ body {
 html,
 body,
 #root {
-  min-width: 1120px;
-  min-height: 720px;
-  overflow: hidden;
+  max-width: 100%;
+  min-height: 0;
+  min-width: 0;
 }
 
 body {
@@ -5652,8 +5652,8 @@ body {
   color: var(--pc-text);
   grid-template-columns: 76px minmax(0, 1fr);
   height: 100vh;
-  min-height: 720px;
-  min-width: 1120px;
+  min-height: 0;
+  min-width: 0;
 }
 
 .appWindow.railExpanded {
@@ -8060,7 +8060,7 @@ textarea {
 
 @media (max-width: 980px) {
   body {
-    min-width: 720px;
+    min-width: 0;
   }
 
   .workspace.pageWorkspace {
