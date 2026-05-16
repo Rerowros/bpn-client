@@ -4990,7 +4990,7 @@ function formatProfileRefreshStatus(profile: SubscriptionProfileView) {
   if (profile.last_successful_refresh_at) {
     return `Last refreshed ${new Date(profile.last_successful_refresh_at * 1000).toLocaleString()}`;
   }
-  return `Added ${new Date(profile.created_at).toLocaleString()}`;
+  return `Added ${new Date(profile.created_at * 1000).toLocaleString()}`;
 }
 
 function formatProfileFetchOptions(profile: SubscriptionProfileView) {

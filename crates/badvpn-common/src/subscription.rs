@@ -238,6 +238,8 @@ pub fn classify_subscription_failure(
         && count_yaml_proxies(body) == 0
     {
         SubscriptionFailureKind::InvalidFormat
+    } else if status_is_provider_error(status_code) {
+        SubscriptionFailureKind::ProviderError
     } else {
         return None;
     };
@@ -252,6 +254,12 @@ fn status_allows_profile_format_validation(status_code: Option<u16>) -> bool {
     status_code
         .map(|code| (200..300).contains(&code))
         .unwrap_or(true)
+}
+
+fn status_is_provider_error(status_code: Option<u16>) -> bool {
+    status_code
+        .map(|code| !(200..300).contains(&code))
+        .unwrap_or(false)
 }
 
 pub fn detect_subscription_provider_hint(
@@ -318,20 +326,26 @@ pub fn subscription_body_to_text(body: &str) -> Option<String> {
 }
 
 fn normalized_failure_text(body: &str) -> String {
+    const FAILURE_TEXT_LIMIT: usize = 4096;
+    const FAILURE_JSON_PARSE_LIMIT_BYTES: usize = 16 * 1024;
+
     let trimmed = body.trim();
     if trimmed.is_empty() {
         return String::new();
     }
 
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
-        let mut parts = Vec::new();
-        collect_json_strings(&value, &mut parts);
-        if !parts.is_empty() {
-            return parts.join(" ");
+    let bounded: String = trimmed.chars().take(FAILURE_TEXT_LIMIT).collect();
+    if trimmed.len() <= FAILURE_JSON_PARSE_LIMIT_BYTES {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            let mut parts = Vec::new();
+            collect_json_strings(&value, &mut parts);
+            if !parts.is_empty() {
+                return parts.join(" ");
+            }
         }
     }
 
-    trimmed.chars().take(4096).collect()
+    bounded
 }
 
 fn collect_json_strings(value: &serde_json::Value, parts: &mut Vec<String>) {
@@ -493,10 +507,11 @@ proxies:
     }
 
     #[test]
-    fn does_not_classify_http_error_body_as_invalid_format() {
-        let failure = classify_subscription_failure(Some(500), "<html>server error</html>");
+    fn classifies_unknown_http_error_body_as_provider_error() {
+        let failure =
+            classify_subscription_failure(Some(500), "<html>server error</html>").unwrap();
 
-        assert!(failure.is_none());
+        assert_eq!(failure.kind, SubscriptionFailureKind::ProviderError);
     }
 
     #[test]

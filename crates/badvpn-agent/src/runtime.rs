@@ -2864,12 +2864,22 @@ pub fn repair_windows_network_state() -> Result<String> {
     #[cfg(windows)]
     {
         let mut messages = Vec::new();
+        let mut succeeded = 0_usize;
         for plan in windows_network_recovery_plan() {
             match run_recovery_command(plan) {
-                Ok(message) => messages.push(message),
+                Ok(message) => {
+                    succeeded += 1;
+                    messages.push(message);
+                }
                 Err(error) if plan.required => return Err(error),
                 Err(error) => messages.push(format!("{} warning: {error}", plan.label)),
             }
+        }
+        if succeeded == 0 {
+            return Err(anyhow!(
+                "Windows network recovery failed; no recovery command succeeded: {}",
+                messages.join("; ")
+            ));
         }
         Ok(format!(
             "Windows network recovery completed via badvpn-agent: {}",
