@@ -2641,8 +2641,49 @@ pub async fn import_profile_deep_link(
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect::<BTreeMap<_, _>>();
     if let Some(url) = pairs.get("url") {
-        let imported = fetch_subscription(url).await?;
+        let trimmed = validate_subscription_url(url)?;
+        let imported = fetch_subscription(trimmed).await?;
         write_mihomo_config(&imported.body)?;
+        let reload_message =
+            maybe_reload_mihomo_after_subscription_change("subscription deep-link import").await;
+        let mut store = read_persisted_subscription_profiles()?;
+        let now = current_unix_timestamp();
+        let existing_index = store.profiles.iter().position(|profile| {
+            profile
+                .subscription
+                .url
+                .as_deref()
+                .map(|stored| stored.eq_ignore_ascii_case(trimmed))
+                .unwrap_or(false)
+        });
+        let display_name = subscription_profile_display_name(
+            pairs.get("name").map(String::as_str),
+            &imported.subscription,
+            store.profiles.len() + 1,
+        );
+        let active_id = if let Some(index) = existing_index {
+            let profile = &mut store.profiles[index];
+            profile.name = display_name;
+            profile.subscription = imported.subscription.clone();
+            profile.protected_url = Some(protect_secret(trimmed)?);
+            profile.protected_body = Some(protect_secret(&imported.body)?);
+            profile.updated_at = now;
+            profile.id.clone()
+        } else {
+            let id = subscription_profile_id(trimmed, now);
+            store.profiles.push(PersistedSubscriptionProfile {
+                id: id.clone(),
+                name: display_name,
+                subscription: imported.subscription.clone(),
+                protected_url: Some(protect_secret(trimmed)?),
+                protected_body: Some(protect_secret(&imported.body)?),
+                created_at: now,
+                updated_at: now,
+            });
+            id
+        };
+        store.active_id = Some(active_id);
+        write_persisted_subscription_profiles(&store)?;
         persist_subscription_state_with_body(&imported.subscription, Some(&imported.body))?;
         let state = apply_active_subscription_state(
             imported.subscription,
@@ -2651,7 +2692,8 @@ pub async fn import_profile_deep_link(
         return Ok(SubscriptionProfilesApplyResult {
             profiles: build_subscription_profiles_state()?,
             state,
-            message: "Deep link subscription imported.".to_string(),
+            message: reload_message
+                .unwrap_or_else(|| "Deep link subscription imported and selected.".to_string()),
         });
     }
     if let Some(data) = pairs.get("data") {

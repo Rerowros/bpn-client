@@ -4808,18 +4808,29 @@ function removeLegacyOverrideValue(
   kind: string,
   value: string,
 ): Partial<AppSettings["routing_policy"]> {
-  const remove = (values: string[]) => values.filter((item) => item.toLocaleLowerCase() !== value.toLocaleLowerCase());
+  const remove = (values: string[], compareKind = kind) => {
+    const target = comparableLegacyOverrideValue(value, compareKind);
+    return values.filter((item) => comparableLegacyOverrideValue(item, compareKind) !== target);
+  };
   if (route === "vpn" && kind === "domain") return { force_vpn_domains: remove(policy.force_vpn_domains) };
   if (route === "vpn" && kind === "cidr") return { force_vpn_cidrs: remove(policy.force_vpn_cidrs) };
   if (route === "zapret" && kind === "domain") return { force_zapret_domains: remove(policy.force_zapret_domains) };
   if (route === "zapret" && kind === "cidr") return { force_zapret_cidrs: remove(policy.force_zapret_cidrs) };
-  if (route === "zapret" && (kind === "process" || kind === "app")) return { force_zapret_processes: remove(policy.force_zapret_processes) };
+  if (route === "zapret" && (kind === "process" || kind === "app")) return { force_zapret_processes: remove(policy.force_zapret_processes, "process") };
   if (route === "zapret" && kind === "tcp_port") return { force_zapret_tcp_ports: remove(policy.force_zapret_tcp_ports) };
   if (route === "zapret" && kind === "udp_port") return { force_zapret_udp_ports: remove(policy.force_zapret_udp_ports) };
   if (route === "direct" && kind === "domain") return { force_direct_domains: remove(policy.force_direct_domains) };
   if (route === "direct" && kind === "cidr") return { force_direct_cidrs: remove(policy.force_direct_cidrs) };
-  if (route === "direct" && (kind === "process" || kind === "app")) return { force_direct_processes: remove(policy.force_direct_processes) };
+  if (route === "direct" && (kind === "process" || kind === "app")) return { force_direct_processes: remove(policy.force_direct_processes, "process") };
   return {};
+}
+
+function comparableLegacyOverrideValue(value: string, kind: string) {
+  const normalized = value.trim().toLocaleLowerCase();
+  if (kind === "process" || kind === "app") {
+    return normalized.split(/[\\/]/).pop() ?? normalized;
+  }
+  return normalized;
 }
 
 function localOverrideDraftFromPolicyRule(rule: PolicyRuleView): {
