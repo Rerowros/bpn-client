@@ -1435,11 +1435,24 @@ export function App() {
   async function handleProfileFetchProxyMode(profile: SubscriptionProfileView, proxyMode: SubscriptionFetchProxyMode) {
     let customProxyUrl: string | undefined;
     if (proxyMode === "custom") {
-      const value = window.prompt("Custom HTTP(S) proxy URL", profile.fetch_options.custom_proxy_redacted ?? "http://127.0.0.1:8080");
-      if (!value?.trim()) {
+      const hasStoredCustomProxy = Boolean(profile.fetch_options.custom_proxy_redacted);
+      const value = window.prompt(
+        hasStoredCustomProxy
+          ? "Custom HTTP(S) proxy URL (leave empty to keep saved proxy)"
+          : "Custom HTTP(S) proxy URL",
+        hasStoredCustomProxy ? "" : "http://127.0.0.1:8080",
+      );
+      if (value === null) {
         return;
       }
-      customProxyUrl = value.trim();
+      const trimmed = value.trim();
+      if (!trimmed) {
+        if (!hasStoredCustomProxy) {
+          return;
+        }
+      } else {
+        customProxyUrl = trimmed;
+      }
     }
     await applyProfileFetchOptions(profile, profile.fetch_options.timeout_seconds, proxyMode, customProxyUrl);
   }

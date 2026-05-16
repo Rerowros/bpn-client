@@ -232,7 +232,10 @@ pub fn classify_subscription_failure(
         )
     {
         SubscriptionFailureKind::Unauthorized
-    } else if !body.trim().is_empty() && count_uri_nodes(body) == 0 && count_yaml_proxies(body) == 0
+    } else if status_allows_profile_format_validation(status_code)
+        && !body.trim().is_empty()
+        && count_uri_nodes(body) == 0
+        && count_yaml_proxies(body) == 0
     {
         SubscriptionFailureKind::InvalidFormat
     } else {
@@ -243,6 +246,12 @@ pub fn classify_subscription_failure(
         kind,
         message: subscription_failure_message(kind),
     })
+}
+
+fn status_allows_profile_format_validation(status_code: Option<u16>) -> bool {
+    status_code
+        .map(|code| (200..300).contains(&code))
+        .unwrap_or(true)
 }
 
 pub fn detect_subscription_provider_hint(
@@ -481,6 +490,13 @@ proxies:
         let failure = classify_subscription_failure(None, "<html>login required</html>").unwrap();
 
         assert_eq!(failure.kind, SubscriptionFailureKind::InvalidFormat);
+    }
+
+    #[test]
+    fn does_not_classify_http_error_body_as_invalid_format() {
+        let failure = classify_subscription_failure(Some(500), "<html>server error</html>");
+
+        assert!(failure.is_none());
     }
 
     #[test]
