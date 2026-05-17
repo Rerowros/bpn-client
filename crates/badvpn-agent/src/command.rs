@@ -27,8 +27,8 @@ impl AgentController {
     pub async fn handle(&mut self, command: AgentCommand) -> BadVpnResult<AgentState> {
         tracing::debug!(command = ?command_kind(&command), "agent command received");
         match command {
-            AgentCommand::Status => Ok(self.runtime_status()),
-            AgentCommand::RuntimeStatus => Ok(self.runtime_status()),
+            AgentCommand::Status => self.runtime_status().await,
+            AgentCommand::RuntimeStatus => self.runtime_status().await,
             AgentCommand::Connect { request } => self.connect(*request).await,
             AgentCommand::Start => {
                 self.runtime
@@ -56,13 +56,13 @@ impl AgentController {
         }
     }
 
-    fn runtime_status(&mut self) -> AgentState {
-        let snapshot = self.manager.snapshot();
+    async fn runtime_status(&mut self) -> BadVpnResult<AgentState> {
+        let snapshot = self.manager.status_snapshot().await;
         self.runtime = AgentRuntimeState::from_agent_state(snapshot_to_agent_state(
             &snapshot,
             self.runtime.subscription.clone(),
         ));
-        self.runtime.snapshot()
+        Ok(self.runtime.snapshot())
     }
 
     pub fn policy_summary(&self) -> anyhow::Result<badvpn_common::ipc::PolicySummaryResponse> {
@@ -101,6 +101,16 @@ impl AgentController {
         ));
         self.runtime.clear_error();
         Ok(self.runtime.snapshot())
+    }
+
+    pub async fn shutdown_cleanup(&mut self) -> anyhow::Result<()> {
+        let snapshot = self.manager.stop().await?;
+        self.runtime = AgentRuntimeState::from_agent_state(snapshot_to_agent_state(
+            &snapshot,
+            self.runtime.subscription.clone(),
+        ));
+        self.runtime.clear_error();
+        Ok(())
     }
 
     async fn restart(&mut self) -> BadVpnResult<AgentState> {

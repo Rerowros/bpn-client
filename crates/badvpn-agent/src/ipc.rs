@@ -117,6 +117,9 @@ async fn serve_agent_tcp_ipc(shutdown: Arc<AtomicBool>) -> anyhow::Result<()> {
         }
     }
 
+    if let Err(error) = controller.shutdown_cleanup().await {
+        tracing::warn!(%error, "failed to clean up runtime processes during IPC shutdown");
+    }
     tracing::info!("BadVpn agent IPC server stopped");
     Ok(())
 }
@@ -208,7 +211,7 @@ async fn serve_agent_named_pipe_ipc(shutdown: Arc<AtomicBool>) -> anyhow::Result
                 unsafe {
                     CloseHandle(handle);
                 }
-                return Ok(());
+                break false;
             }
 
             if unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) } != 0 {
@@ -305,6 +308,9 @@ async fn serve_agent_named_pipe_ipc(shutdown: Arc<AtomicBool>) -> anyhow::Result
         }
     }
 
+    if let Err(error) = controller.shutdown_cleanup().await {
+        tracing::warn!(%error, "failed to clean up runtime processes during IPC shutdown");
+    }
     tracing::info!("BadVpn agent named pipe IPC server stopped");
     Ok(())
 }

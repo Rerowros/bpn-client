@@ -570,7 +570,7 @@ impl Default for DiagnosticsSettings {
     fn default() -> Self {
         Self {
             runtime_checks_after_connect: true,
-            discord_youtube_probes: true,
+            discord_youtube_probes: false,
         }
     }
 }
@@ -627,6 +627,11 @@ mod tests {
         let path = std::env::temp_dir().join("badvpn-missing-settings-test.json");
         let _ = fs::remove_file(&path);
         assert_eq!(read_settings_from_path(&path), AppSettings::default());
+    }
+
+    #[test]
+    fn blocking_network_probes_default_to_off() {
+        assert!(!DiagnosticsSettings::default().discord_youtube_probes);
     }
 
     #[test]

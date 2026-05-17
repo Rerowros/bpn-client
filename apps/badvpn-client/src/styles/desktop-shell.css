@@ -1,0 +1,475 @@
+:root {
+  --desktop-bg: #090b10;
+  --desktop-bg-elevated: #0d1117;
+  --desktop-rail: #0e1218;
+  --desktop-panel: #12171f;
+  --desktop-panel-soft: #171d26;
+  --desktop-control: #1b222d;
+  --desktop-control-hover: #232c38;
+  --desktop-line: rgba(231, 238, 248, 0.1);
+  --desktop-line-strong: rgba(231, 238, 248, 0.17);
+  --desktop-text: #eef3f8;
+  --desktop-muted: #9da9b8;
+  --desktop-faint: #6f7a89;
+  --desktop-accent: #6da8ff;
+  --desktop-accent-soft: rgba(109, 168, 255, 0.13);
+  --desktop-success: #63d7a1;
+  --desktop-warning: #eac35f;
+  --desktop-danger: #ff8277;
+  --desktop-radius: 8px;
+  --desktop-radius-lg: 10px;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  width: 100%;
+}
+
+body {
+  background: var(--desktop-bg);
+  color: var(--desktop-text);
+  min-height: 0;
+  min-width: 0;
+}
+
+button,
+input,
+select,
+textarea {
+  min-width: 0;
+}
+
+button {
+  letter-spacing: 0;
+}
+
+.appWindow,
+.appWindow:not(.railExpanded),
+.appWindow.railExpanded {
+  background: var(--desktop-bg);
+  color: var(--desktop-text);
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr);
+  height: 100dvh;
+  max-height: 100dvh;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  width: 100vw;
+}
+
+.appWindow.railExpanded,
+.appWindow.railExpanded:has(.rail:hover),
+.appWindow.railExpanded:has(.rail:focus-within) {
+  grid-template-columns: 236px minmax(0, 1fr);
+}
+
+.appWindow::before {
+  display: none;
+}
+
+.rail {
+  align-content: start;
+  align-items: stretch;
+  background: var(--desktop-rail);
+  border-right: 1px solid var(--desktop-line);
+  display: grid;
+  gap: 10px;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  padding: 12px;
+}
+
+.railBrand,
+.railToggle,
+.railItem {
+  align-items: center;
+  background: transparent;
+  border-radius: var(--desktop-radius);
+  color: var(--desktop-muted);
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 32px minmax(0, 1fr);
+  height: 42px;
+  justify-content: initial;
+  justify-items: start;
+  margin: 0;
+  min-width: 0;
+  padding: 0 10px 0 6px;
+  text-align: left;
+  width: 100%;
+}
+
+.railBrand {
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--desktop-text);
+}
+
+.railBrand svg,
+.railToggle svg,
+.railItem svg {
+  background: transparent;
+  color: currentColor;
+  height: 32px;
+  padding: 6px;
+  width: 32px;
+}
+
+.railBrand span,
+.railToggle span,
+.railItem span {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.railBrand span {
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.railToggle {
+  background: rgba(255, 255, 255, 0.025);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.railToggle:hover,
+.railItem:hover {
+  background: var(--desktop-control-hover);
+  color: var(--desktop-text);
+}
+
+.railNav {
+  align-content: start;
+  display: grid;
+  gap: 6px;
+  min-height: 0;
+  overflow: hidden;
+  width: 100%;
+}
+
+.railItem {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 650;
+  position: relative;
+}
+
+.railItem::before {
+  background: transparent;
+  border-radius: 999px;
+  content: "";
+  height: 18px;
+  left: 0;
+  position: absolute;
+  top: 12px;
+  width: 3px;
+}
+
+.railItem.active {
+  background: var(--desktop-accent-soft);
+  color: var(--desktop-text);
+}
+
+.railItem.active::before {
+  background: var(--desktop-accent);
+}
+
+.appWindow:not(.railExpanded) .railBrand,
+.appWindow:not(.railExpanded) .railToggle,
+.appWindow:not(.railExpanded) .railItem {
+  gap: 0;
+  grid-template-columns: 1fr;
+  justify-items: center;
+  padding: 0;
+}
+
+.appWindow:not(.railExpanded) .railBrand span,
+.appWindow:not(.railExpanded) .railToggle span,
+.appWindow:not(.railExpanded) .railItem span,
+.appWindow:not(.railExpanded) .railStatusCard div {
+  display: none;
+}
+
+.railStatusCard {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid var(--desktop-line);
+  border-radius: var(--desktop-radius);
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 10px minmax(0, 1fr);
+  min-height: 58px;
+  min-width: 0;
+  overflow: hidden;
+  padding: 10px;
+  width: 100%;
+}
+
+.railStatusCard strong,
+.railStatusCard span:last-child {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.railStatusCard strong {
+  color: var(--desktop-text);
+  font-size: 12px;
+}
+
+.railStatusCard span:last-child {
+  color: var(--desktop-muted);
+  font-size: 11px;
+  margin-top: 2px;
+}
+
+.railLed {
+  background: var(--desktop-faint);
+  border-radius: 999px;
+  display: block;
+  height: 10px;
+  width: 10px;
+}
+
+.railLed.on {
+  background: var(--desktop-success);
+  box-shadow: 0 0 0 4px rgba(99, 215, 161, 0.14);
+}
+
+.appPane {
+  background: var(--desktop-bg);
+  display: grid;
+  grid-template-rows: 48px minmax(0, 1fr) 30px;
+  max-width: 100%;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.appPane.overviewPane {
+  grid-template-rows: minmax(0, 1fr) 30px;
+}
+
+.overviewPane .appHeader {
+  border: 0;
+  min-height: 0;
+  overflow: hidden;
+  padding: 0;
+  visibility: hidden;
+}
+
+.appHeader {
+  align-items: center;
+  background: var(--desktop-bg-elevated);
+  border-bottom: 1px solid var(--desktop-line);
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  min-height: 0;
+  min-width: 0;
+  padding: 0 14px;
+}
+
+.titleGroup {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+.titleGroup strong,
+.titleGroup span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.titleGroup strong {
+  color: var(--desktop-text);
+  font-size: 14px;
+  font-weight: 760;
+}
+
+.titleGroup span {
+  color: var(--desktop-muted);
+  font-size: 12px;
+}
+
+.headerActions {
+  align-items: center;
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
+  min-width: 0;
+}
+
+.workspace {
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.statusBar {
+  align-items: center;
+  background: var(--desktop-bg-elevated);
+  border-top: 1px solid var(--desktop-line);
+  color: var(--desktop-muted);
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  padding: 0 14px;
+}
+
+.statusBar > span {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.statusBar > div {
+  align-items: center;
+  display: flex;
+  flex: 0 0 auto;
+  gap: 10px;
+  min-width: 0;
+}
+
+.textAction,
+.iconAction,
+.subtleButton,
+.primarySmall,
+.slothGhostButton,
+.slothSupportButton,
+.slothTextButton,
+.iconSmall {
+  border-radius: var(--desktop-radius);
+  min-width: 0;
+}
+
+.iconAction,
+.iconSmall {
+  align-items: center;
+  display: inline-grid;
+  flex: 0 0 auto;
+  justify-items: center;
+  place-items: center;
+}
+
+.iconAction,
+.iconSmall {
+  height: 32px;
+  width: 32px;
+}
+
+.subtleButton,
+.primarySmall,
+.slothGhostButton,
+.slothSupportButton,
+.slothTextButton {
+  align-items: center;
+  display: inline-flex;
+  gap: 7px;
+  justify-content: center;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subtleButton,
+.slothGhostButton,
+.slothSupportButton,
+.slothTextButton,
+.iconAction,
+.iconSmall {
+  background: var(--desktop-control);
+  color: var(--desktop-text);
+}
+
+.subtleButton:hover,
+.slothGhostButton:hover,
+.slothSupportButton:hover,
+.slothTextButton:hover,
+.iconAction:hover,
+.iconSmall:hover {
+  background: var(--desktop-control-hover);
+}
+
+.primarySmall {
+  background: var(--desktop-accent);
+  color: #07111f;
+}
+
+.danger {
+  color: var(--desktop-danger);
+}
+
+.good {
+  color: var(--desktop-success);
+}
+
+@media (max-width: 900px) {
+  .appWindow.railExpanded,
+  .appWindow.railExpanded:has(.rail:hover),
+  .appWindow.railExpanded:has(.rail:focus-within) {
+    grid-template-columns: 76px minmax(0, 1fr);
+  }
+
+  .appWindow.railExpanded .railBrand,
+  .appWindow.railExpanded .railToggle,
+  .appWindow.railExpanded .railItem {
+    gap: 0;
+    grid-template-columns: 1fr;
+    justify-items: center;
+    padding: 0;
+  }
+
+  .appWindow.railExpanded .railBrand span,
+  .appWindow.railExpanded .railToggle span,
+  .appWindow.railExpanded .railItem span,
+  .appWindow.railExpanded .railStatusCard div {
+    display: none;
+  }
+}
+
+@media (max-width: 640px) {
+  .appWindow,
+  .appWindow:not(.railExpanded),
+  .appWindow.railExpanded {
+    grid-template-columns: 58px minmax(0, 1fr);
+  }
+
+  .rail {
+    padding: 8px;
+  }
+
+  .appPane,
+  .appPane:not(.overviewPane) {
+    grid-template-rows: 44px minmax(0, 1fr) 0;
+  }
+
+  .appPane.overviewPane {
+    grid-template-rows: minmax(0, 1fr) 0;
+  }
+
+  .statusBar {
+    display: none;
+  }
+}

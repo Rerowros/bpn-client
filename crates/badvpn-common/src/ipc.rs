@@ -266,7 +266,7 @@ impl Default for RuntimeDiagnosticsSettings {
     fn default() -> Self {
         Self {
             runtime_checks_after_connect: true,
-            discord_youtube_probes: true,
+            discord_youtube_probes: false,
         }
     }
 }
@@ -711,5 +711,15 @@ impl From<&CompiledPolicy> for PolicySummaryResponse {
             warnings_count,
             zapret_domain_count,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_network_probes_default_to_off() {
+        assert!(!RuntimeDiagnosticsSettings::default().discord_youtube_probes);
     }
 }

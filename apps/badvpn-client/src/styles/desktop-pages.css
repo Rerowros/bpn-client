@@ -1,0 +1,926 @@
+.workspace.pageWorkspace {
+  background: var(--desktop-bg);
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  padding: 12px;
+}
+
+.pagePanel,
+.settingsShell,
+.connectionPane.dashboardPane,
+.inspector.dashboardInspector {
+  background: var(--desktop-panel);
+  border: 1px solid var(--desktop-line);
+  border-radius: var(--desktop-radius-lg);
+  box-shadow: none;
+  color: var(--desktop-text);
+  min-height: 0;
+  min-width: 0;
+}
+
+.pagePanel,
+.settingsShell {
+  height: 100%;
+  max-height: 100%;
+}
+
+.pagePanel {
+  align-content: start;
+  display: grid;
+  gap: 12px;
+  grid-auto-rows: max-content;
+  overflow: auto;
+  padding: 14px;
+  scrollbar-color: rgba(109, 168, 255, 0.34) transparent;
+  scrollbar-width: thin;
+}
+
+.pagePanel::before,
+.settingsShell::before,
+.connectionPane.dashboardPane::before {
+  display: none;
+}
+
+.pageHeader {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.pageHeader > div:first-child {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.pageHeader h1,
+.pageHeader p {
+  margin: 0;
+  min-width: 0;
+}
+
+.pageHeader h1 {
+  color: var(--desktop-text);
+  font-size: 19px;
+  font-weight: 780;
+  line-height: 1.15;
+}
+
+.pageHeader p,
+.diagnosticText,
+.emptyList p,
+.panel p {
+  color: var(--desktop-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.buttonRow {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
+.searchField,
+.selectField,
+.compactField,
+.inputField,
+.textAreaField {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.searchField > span,
+.selectField > span,
+.compactField > span,
+.inputField > span,
+.textAreaField > span {
+  color: var(--desktop-muted);
+  font-size: 11px;
+  font-weight: 720;
+  letter-spacing: 0;
+}
+
+.searchField input,
+.inputField input,
+.selectField select,
+.compactField select,
+.textAreaField textarea,
+.profileAddRow input,
+.profileAddRow textarea,
+.advancedOverrideGrid input,
+.advancedOverrideGrid select,
+.overrideGrid input,
+.overrideGrid select {
+  background: var(--desktop-control);
+  border: 1px solid var(--desktop-line);
+  border-radius: var(--desktop-radius);
+  color: var(--desktop-text);
+  min-height: 36px;
+  min-width: 0;
+  padding: 8px 10px;
+  width: 100%;
+}
+
+.searchField input:focus,
+.inputField input:focus,
+.selectField select:focus,
+.compactField select:focus,
+.textAreaField textarea:focus {
+  border-color: rgba(109, 168, 255, 0.55);
+  box-shadow: 0 0 0 3px rgba(109, 168, 255, 0.15);
+  outline: 0;
+}
+
+.segmented,
+.slothSegmented,
+.pathFilter {
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid var(--desktop-line);
+  border-radius: var(--desktop-radius);
+  display: flex;
+  gap: 3px;
+  min-width: 0;
+  overflow: hidden;
+  padding: 3px;
+}
+
+.segmented button,
+.slothSegmented button,
+.pathFilter button {
+  border-radius: 6px;
+  color: var(--desktop-muted);
+  min-height: 30px;
+  min-width: 0;
+  overflow: hidden;
+  padding: 5px 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.segmented button.active,
+.slothSegmented button.active,
+.pathFilter button.active {
+  background: var(--desktop-accent-soft);
+  color: var(--desktop-text);
+}
+
+.panel,
+.policySummaryCard,
+.slothInfoPanel,
+.slothAnnouncement,
+.slothAgentCard,
+.connectionProcessGroup,
+.policySection,
+.policyArtifact,
+.policyManagedGroup,
+.runtimeArtifact,
+.resourceItem,
+.providerItem,
+.profileRow,
+.overrideRule,
+.diagnosticItem {
+  background: var(--desktop-panel-soft);
+  border: 1px solid var(--desktop-line);
+  border-radius: var(--desktop-radius);
+  min-width: 0;
+}
+
+.panel {
+  padding: 12px;
+}
+
+.metric,
+.statusRow,
+.detailItem,
+.legendItem,
+.emptyList {
+  min-width: 0;
+}
+
+.statusRow {
+  align-items: center;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: minmax(90px, 0.7fr) minmax(0, 1.3fr);
+}
+
+.statusRow span,
+.statusRow strong,
+.metric span,
+.metric strong,
+.detailItem span,
+.detailItem strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.workspace.dashboardWorkspace {
+  background: var(--desktop-bg);
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr) minmax(286px, 320px);
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  padding: 12px;
+}
+
+.connectionPane.dashboardPane {
+  align-content: start;
+  display: grid;
+  gap: 12px;
+  grid-auto-rows: max-content;
+  overflow: auto;
+  padding: 14px;
+  scrollbar-color: rgba(109, 168, 255, 0.34) transparent;
+  scrollbar-width: thin;
+}
+
+.inspector.dashboardInspector {
+  align-content: start;
+  display: grid;
+  gap: 10px;
+  overflow: auto;
+  padding: 10px;
+  scrollbar-color: rgba(109, 168, 255, 0.28) transparent;
+  scrollbar-width: thin;
+}
+
+.slothProfileHeader {
+  align-items: start;
+  border-bottom: 1px solid var(--desktop-line);
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  min-width: 0;
+  padding-bottom: 10px;
+}
+
+.slothProfileHeader > div:first-child {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.slothProfileHeader span,
+.slothProfileHeader small,
+.slothSegmentBlock span,
+.slothGroupHeader span {
+  color: var(--desktop-muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.slothProfileHeader strong {
+  color: var(--desktop-text);
+  font-size: 22px;
+  font-weight: 820;
+  line-height: 1.1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.slothHeaderActions {
+  align-items: center;
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
+  min-width: 0;
+}
+
+.homeAlertStack {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.connectionProgress,
+.connectionNotice {
+  background: var(--desktop-panel-soft);
+  border: 1px solid var(--desktop-line);
+  border-radius: var(--desktop-radius);
+  min-width: 0;
+  padding: 10px;
+}
+
+.connectionNotice {
+  align-items: center;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+}
+
+.connectionNotice span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.connectionNotice.warning {
+  border-color: rgba(234, 195, 95, 0.32);
+}
+
+.connectionNotice.error {
+  border-color: rgba(255, 130, 119, 0.34);
+}
+
+.slothCenterControl {
+  align-items: center;
+  background: var(--desktop-panel-soft);
+  border: 1px solid var(--desktop-line);
+  border-radius: var(--desktop-radius-lg);
+  display: grid;
+  gap: 8px;
+  justify-items: center;
+  min-width: 0;
+  padding: 14px;
+}
+
+.slothCenterControl .connectButton {
+  align-items: center;
+  background: var(--desktop-control);
+  border: 1px solid var(--desktop-line-strong);
+  border-radius: 999px;
+  color: var(--desktop-text);
+  display: grid;
+  height: 124px;
+  justify-items: center;
+  width: 124px;
+}
+
+.slothCenterControl .connectButton:hover {
+  background: var(--desktop-control-hover);
+}
+
+.slothCenterControl .connectButton.connected {
+  background: rgba(99, 215, 161, 0.16);
+  border-color: rgba(99, 215, 161, 0.34);
+  color: var(--desktop-success);
+}
+
+.slothCenterControl .connectButton.pending {
+  background: rgba(234, 195, 95, 0.14);
+  border-color: rgba(234, 195, 95, 0.32);
+  color: var(--desktop-warning);
+}
+
+.slothCenterControl > strong {
+  font-size: 16px;
+}
+
+.slothStatusPill,
+.statusBadge,
+.pathBadge,
+.nodeTypeChip,
+.groupTypeBadge,
+.policyPathBadge,
+.policyCount,
+.groupCountBadge {
+  border-radius: 999px;
+  display: inline-flex;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.slothStatusPill,
+.statusBadge {
+  background: var(--desktop-accent-soft);
+  color: var(--desktop-text);
+  font-size: 11px;
+  padding: 4px 9px;
+}
+
+.slothControlRow,
+.slothNoticeGrid,
+.slothStatusGrid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  min-width: 0;
+}
+
+.slothNoticeGrid,
+.slothStatusGrid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.slothSegmentBlock {
+  align-content: center;
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.slothSegmentBlock.alignEnd {
+  justify-items: end;
+}
+
+.slothServerPill {
+  align-items: center;
+  background: var(--desktop-panel-soft);
+  border: 1px solid var(--desktop-line);
+  border-radius: var(--desktop-radius);
+  display: grid;
+  gap: 9px;
+  grid-template-columns: 30px minmax(0, 1fr) auto;
+  min-width: 0;
+  padding: 8px 10px;
+}
+
+.slothServerPill strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.slothAnnouncement,
+.slothAgentCard,
+.slothInfoPanel,
+.slothGroupsPanel {
+  padding: 12px;
+}
+
+.slothAnnouncementHeader,
+.slothAgentHeader,
+.slothAgentActions,
+.slothGroupHeader {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.slothAnnouncement > span,
+.bpnAnnouncementLine,
+.slothAgentHeader div,
+.slothAgentRows,
+.slothInfoPanel {
+  min-width: 0;
+}
+
+.bpnAnnouncementLine {
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: var(--desktop-radius);
+  display: grid;
+  gap: 3px;
+  margin-top: 10px;
+  padding: 8px;
+}
+
+.slothAgentRows,
+.slothInfoPanel {
+  display: grid;
+  gap: 7px;
+}
+
+.slothGroupsPanel {
+  background: var(--desktop-panel-soft);
+  border: 1px solid var(--desktop-line);
+  border-radius: var(--desktop-radius-lg);
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.slothGroupList,
+.slothNodeList {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  min-width: 0;
+}
+
+.slothGroupChip,
+.homeNodeButton {
+  background: var(--desktop-control);
+  border: 1px solid var(--desktop-line);
+  border-radius: var(--desktop-radius);
+  min-width: 0;
+}
+
+.slothGroupChip {
+  align-items: center;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: 24px minmax(0, 1fr);
+  padding: 8px;
+  text-align: left;
+}
+
+.slothGroupChip strong,
+.slothGroupChip small,
+.homeNodeText strong,
+.homeNodeText span {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.slothGroupChip.active,
+.homeNodeButton.selected {
+  background: var(--desktop-accent-soft);
+  border-color: rgba(109, 168, 255, 0.32);
+}
+
+.homeNodeButton {
+  align-items: center;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  min-height: 48px;
+  padding: 8px;
+  text-align: left;
+}
+
+.nodeLatency,
+.nodeDelay,
+.policySummaryValue,
+.mono {
+  font-variant-numeric: tabular-nums;
+}
+
+.nodeLatency.bad,
+.nodeDelay.bad,
+.policySummaryValue.warn,
+.policyCount.warn {
+  color: var(--desktop-danger);
+}
+
+.nodeDelay.good {
+  color: var(--desktop-success);
+}
+
+.nodeDelay.warn {
+  color: var(--desktop-warning);
+}
+
+.settingsShell {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  overflow: hidden;
+}
+
+.settingsSide {
+  align-content: start;
+  background: rgba(255, 255, 255, 0.02);
+  border-right: 1px solid var(--desktop-line);
+  display: grid;
+  gap: 6px;
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+  padding: 10px;
+}
+
+.settingsTab {
+  align-items: center;
+  background: transparent;
+  border-radius: var(--desktop-radius);
+  color: var(--desktop-muted);
+  display: flex;
+  gap: 8px;
+  min-height: 38px;
+  min-width: 0;
+  padding: 8px 10px;
+  text-align: left;
+}
+
+.settingsTab.active,
+.settingsTab:hover {
+  background: var(--desktop-control);
+  color: var(--desktop-text);
+}
+
+.settingsContent {
+  align-content: start;
+  display: grid;
+  gap: 12px;
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+  padding: 14px;
+}
+
+.settingsBanner,
+.inlineNotice,
+.overridePreview,
+.profilePreview {
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid var(--desktop-line);
+  border-radius: var(--desktop-radius);
+  min-width: 0;
+  padding: 10px;
+}
+
+.settingsPanels,
+.operatorPanels,
+.policySummaryCards,
+.policyArtifactGrid,
+.providerGrid,
+.runtimeConfigGrid,
+.advancedOverrideGrid,
+.overrideGrid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  min-width: 0;
+}
+
+.policyPanel {
+  grid-template-rows: none;
+}
+
+.policySummaryCards {
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+
+.policySummaryCard {
+  display: grid;
+  gap: 5px;
+  min-height: 68px;
+  padding: 10px;
+}
+
+.policySummaryCard.span2 {
+  grid-column: span 2;
+}
+
+.policySummaryLabel {
+  color: var(--desktop-muted);
+  font-size: 11px;
+}
+
+.policySummaryValue {
+  color: var(--desktop-text);
+  font-size: 15px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.policyToolbar,
+.connectionToolbar,
+.serverToolbar {
+  align-items: end;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: minmax(220px, 1fr) auto auto;
+  min-width: 0;
+}
+
+.connectionToolbar {
+  grid-template-columns: minmax(220px, 1fr) minmax(190px, auto) minmax(220px, auto) auto minmax(160px, auto);
+}
+
+.serverToolbar {
+  grid-template-columns: minmax(220px, 1fr) minmax(160px, 220px);
+}
+
+.pathLegend,
+.policyQuickStats {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  min-width: 0;
+}
+
+.legendItem {
+  background: var(--desktop-panel-soft);
+  border: 1px solid var(--desktop-line);
+  border-radius: var(--desktop-radius);
+  padding: 9px;
+}
+
+.connectionList,
+.policyRuleList,
+.diagnosticList,
+.resourceList,
+.profileList,
+.backupList,
+.gameProfileList {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.connectionList {
+  overflow: visible;
+}
+
+.connectionProcessGroup {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+}
+
+.connectionProcessHeader,
+.connectionRow {
+  min-width: 0;
+}
+
+.connectionProcessHeader {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.connectionRow {
+  align-items: start;
+  background: rgba(255, 255, 255, 0.028);
+  border: 1px solid var(--desktop-line);
+  border-radius: var(--desktop-radius);
+  display: grid;
+  gap: 10px;
+  grid-template-columns: minmax(190px, 1.15fr) minmax(128px, 0.7fr) minmax(170px, 1fr) minmax(150px, 0.9fr) auto;
+  padding: 10px;
+}
+
+.connectionMain,
+.connectionMeta,
+.chainLine,
+.connectionTraceLine,
+.connectionDetails,
+.connectionTail {
+  min-width: 0;
+}
+
+.connectionMain strong,
+.connectionProcessLine,
+.chainLine,
+.connectionTraceLine,
+.connectionTail span {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.policySection {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+}
+
+.policySection h2,
+.policyArtifact h3 {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  margin: 0;
+}
+
+.policyTableWrap {
+  border: 1px solid var(--desktop-line);
+  border-radius: var(--desktop-radius);
+  max-width: 100%;
+  min-width: 0;
+  overflow: auto;
+}
+
+.policyTable {
+  border-collapse: collapse;
+  min-width: 860px;
+  width: 100%;
+}
+
+.policyTable th,
+.policyTable td {
+  border-bottom: 1px solid var(--desktop-line);
+  max-width: 360px;
+  padding: 8px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.policyTable th {
+  color: var(--desktop-muted);
+  font-size: 11px;
+}
+
+.policyTable td {
+  color: var(--desktop-text);
+  font-size: 12px;
+}
+
+.wrap {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.policyRuleLine {
+  align-items: start;
+  background: rgba(255, 255, 255, 0.028);
+  border: 1px solid var(--desktop-line);
+  border-radius: var(--desktop-radius);
+  display: grid;
+  gap: 8px;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
+  min-width: 0;
+  padding: 8px;
+}
+
+.policyRuleLine code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 1180px) {
+  .workspace.dashboardWorkspace {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .inspector.dashboardInspector {
+    display: none;
+  }
+
+  .connectionToolbar {
+    grid-template-columns: minmax(0, 1fr) minmax(190px, auto) minmax(190px, auto);
+  }
+}
+
+@media (max-width: 980px) {
+  .settingsShell {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .settingsSide {
+    border-bottom: 1px solid var(--desktop-line);
+    border-right: 0;
+    display: flex;
+    overflow-x: auto;
+  }
+
+  .settingsTab {
+    flex: 0 0 auto;
+    min-width: 132px;
+  }
+
+  .slothControlRow,
+  .slothNoticeGrid,
+  .slothStatusGrid,
+  .policyToolbar,
+  .connectionToolbar,
+  .serverToolbar {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .connectionRow {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 640px) {
+  .workspace.pageWorkspace,
+  .workspace.dashboardWorkspace {
+    padding: 8px;
+  }
+
+  .pagePanel,
+  .settingsContent,
+  .connectionPane.dashboardPane {
+    padding: 10px;
+  }
+
+  .slothProfileHeader,
+  .pageHeader,
+  .connectionProcessHeader {
+    align-items: stretch;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .slothHeaderActions,
+  .buttonRow {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .slothCenterControl .connectButton {
+    height: 110px;
+    width: 110px;
+  }
+
+  .policySummaryCard.span2 {
+    grid-column: auto;
+  }
+}
