@@ -166,8 +166,9 @@ struct AgentWireResponse {
 pub async fn status() -> Result<AgentState, String> {
     log_event("status", "refresh requested");
     if should_use_agent_runtime() {
-        if let Ok(agent_state) = send_agent_command(AgentCommand::RuntimeStatus, false) {
-            return apply_agent_state(agent_state);
+        match send_agent_command(AgentCommand::RuntimeStatus, false) {
+            Ok(agent_state) => return apply_agent_state(agent_state),
+            Err(error) => return apply_agent_unreachable_state(error),
         }
     }
     refresh_runtime_state(false).await
@@ -634,6 +635,41 @@ fn apply_agent_state(agent_state: AgentState) -> Result<AgentState, String> {
         next_state.phase = AppPhase::Ready;
     }
     *state = next_state;
+    Ok(state.clone())
+}
+
+fn apply_agent_unreachable_state(error: String) -> Result<AgentState, String> {
+    let service = read_badvpn_agent_service_status();
+    let mut state = state()
+        .lock()
+        .map_err(|_| "agent state lock is poisoned".to_string())?;
+    let message = if service.installed {
+        format!("badvpn-agent IPC failed: {error}")
+    } else {
+        "badvpn-agent is not installed; install or repair the service before connecting."
+            .to_string()
+    };
+    state.installed = service.installed;
+    state.running = false;
+    state.connection.connected = false;
+    state.connection.status = if service.installed {
+        ConnectionStatus::Error
+    } else {
+        ConnectionStatus::Idle
+    };
+    state.phase = if service.installed {
+        AppPhase::Error
+    } else if subscription_is_present(&state.subscription) {
+        AppPhase::Ready
+    } else {
+        AppPhase::Onboarding
+    };
+    state.diagnostics = DiagnosticSummary {
+        mihomo_healthy: false,
+        zapret_healthy: false,
+        message: Some(message.clone()),
+    };
+    state.last_error = service.installed.then_some(message);
     Ok(state.clone())
 }
 
@@ -2051,21 +2087,30 @@ pub fn runtime_readiness() -> Result<RuntimeReadinessResponse, String> {
     let needs_zapret =
         settings.effective_route_mode() == RouteMode::Smart && settings.zapret.enabled;
     let agent = read_badvpn_agent_service_status();
-    let mihomo_ready = resolve_mihomo_bin().is_ok()
-        || programdata_mihomo_bin()
-            .map(|path| path.exists())
-            .unwrap_or(false);
-    let zapret_ready = !needs_zapret
-        || zapret_runtime_assets_ready().is_ok()
-        || programdata_zapret_runtime_assets_ready().is_ok();
+    let service_runtime = agent.installed;
+    let mihomo_ready = if service_runtime {
+        programdata_mihomo_ready()
+    } else {
+        user_mihomo_ready() || programdata_mihomo_ready()
+    };
+    let zapret_ready = if !needs_zapret {
+        true
+    } else if service_runtime {
+        programdata_zapret_runtime_assets_ready().is_ok()
+    } else {
+        zapret_runtime_assets_ready().is_ok() || programdata_zapret_runtime_assets_ready().is_ok()
+    };
     let components_ready = mihomo_ready && zapret_ready;
     let ready = agent.installed && agent.ipc_ready && components_ready;
+    let user_components_ready = user_runtime_components_ready(needs_zapret);
     let message = if ready {
         "Ready to connect.".to_string()
     } else if !agent.installed {
         "Install badvpn-agent before connecting.".to_string()
     } else if !agent.ipc_ready {
         "badvpn-agent is installed but not reachable yet.".to_string()
+    } else if user_components_ready && !components_ready {
+        "Runtime components are present in the user cache but not staged to ProgramData for badvpn-agent; prepare or repair runtime components.".to_string()
     } else if !mihomo_ready {
         "Mihomo runtime is missing; prepare runtime components.".to_string()
     } else if !zapret_ready {
@@ -6356,40 +6401,64 @@ fn uppercase_or_unknown(value: &str) -> String {
 async fn ensure_agent_runtime_components(settings: &AppSettings) -> Result<(), String> {
     let needs_zapret =
         settings.effective_route_mode() == RouteMode::Smart && settings.zapret.enabled;
-    if agent_runtime_components_ready(needs_zapret) {
-        return Ok(());
-    }
-
-    log_event(
-        "components",
-        "first-run runtime component preparation requested for badvpn-agent",
-    );
-    install_components(false).await?;
-
-    if read_badvpn_agent_service_status().installed {
+    let service_installed = read_badvpn_agent_service_status().installed;
+    if service_installed {
+        if programdata_runtime_components_ready(needs_zapret) {
+            return Ok(());
+        }
+        if !user_runtime_components_ready(needs_zapret) {
+            log_event(
+                "components",
+                "first-run runtime component preparation requested for badvpn-agent",
+            );
+            install_components(false).await?;
+        }
         stage_runtime_assets_to_programdata()?;
         log_event(
             "components",
             "first-run runtime components staged to ProgramData for badvpn-agent",
         );
+        return if programdata_runtime_components_ready(needs_zapret) {
+            Ok(())
+        } else {
+            Err("Runtime components are still missing from ProgramData after staging.".to_string())
+        };
     }
 
-    if agent_runtime_components_ready(needs_zapret) {
+    if user_runtime_components_ready(needs_zapret) {
+        return Ok(());
+    }
+
+    log_event(
+        "components",
+        "first-run user runtime component preparation requested",
+    );
+    install_components(false).await?;
+
+    if user_runtime_components_ready(needs_zapret) {
         Ok(())
     } else {
         Err("Runtime components are still missing after first-run preparation.".to_string())
     }
 }
 
-fn agent_runtime_components_ready(needs_zapret: bool) -> bool {
-    let mihomo_ready = resolve_mihomo_bin().is_ok()
-        || programdata_mihomo_bin()
-            .map(|path| path.exists())
-            .unwrap_or(false);
-    let zapret_ready = !needs_zapret
-        || zapret_runtime_assets_ready().is_ok()
-        || programdata_zapret_runtime_assets_ready().is_ok();
-    mihomo_ready && zapret_ready
+fn user_mihomo_ready() -> bool {
+    resolve_mihomo_bin().is_ok()
+}
+
+fn programdata_mihomo_ready() -> bool {
+    programdata_mihomo_bin()
+        .map(|path| path.exists())
+        .unwrap_or(false)
+}
+
+fn user_runtime_components_ready(needs_zapret: bool) -> bool {
+    user_mihomo_ready() && (!needs_zapret || zapret_runtime_assets_ready().is_ok())
+}
+
+fn programdata_runtime_components_ready(needs_zapret: bool) -> bool {
+    programdata_mihomo_ready()
+        && (!needs_zapret || programdata_zapret_runtime_assets_ready().is_ok())
 }
 
 async fn install_components(force: bool) -> Result<(), String> {

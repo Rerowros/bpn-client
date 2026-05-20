@@ -17,6 +17,7 @@ target-next/
 **/target-tauri-check/
 **/target-tauri-check/**
 **/target-hotcheck/
+tmp/
 
 *.log
 *.tmp

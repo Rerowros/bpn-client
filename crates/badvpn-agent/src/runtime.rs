@@ -1,5 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
+    io::Read,
     net::{TcpListener, UdpSocket},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -17,6 +18,8 @@ use serde_yaml::Value as YamlValue;
 use tokio::time::sleep;
 
 const MIHOMO_READY_TIMEOUT: Duration = Duration::from_secs(12);
+const MIHOMO_VALIDATE_TIMEOUT: Duration = Duration::from_secs(15);
+const MIHOMO_CONTROLLER_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const LOCALHOST: &str = "127.0.0.1";
 const BADVPN_DNS_PORT: u16 = 1053;
 const POLICY_DIAGNOSTIC_SAMPLE_LIMIT: usize = 5;
@@ -48,6 +51,20 @@ impl RuntimeManager {
 
     pub fn snapshot(&mut self) -> AgentRuntimeSnapshot {
         self.refresh_process_state();
+        self.record_late_zapret_death_if_needed();
+        self.snapshot.clone()
+    }
+
+    pub async fn status_snapshot(&mut self) -> AgentRuntimeSnapshot {
+        self.refresh_process_state();
+        if self.late_zapret_death_requires_fallback() {
+            if let Err(error) = self.fallback_to_vpn_only_after_late_zapret_death().await {
+                tracing::error!(%error, "failed to apply VPN-only fallback after late zapret death");
+                self.set_error(format!(
+                    "Late zapret death fallback failed; Smart DIRECT rules may still be active: {error}"
+                ));
+            }
+        }
         self.record_late_zapret_death_if_needed();
         self.snapshot.clone()
     }
@@ -143,10 +160,12 @@ impl RuntimeManager {
             let _ = self.zapret.stop();
             effective_mode = RuntimeMode::VpnOnly;
             self.snapshot.effective_mode = effective_mode;
-            self.snapshot.zapret = RuntimeComponentSnapshot::new(
-                RuntimeComponentState::Stopped,
-                Some("zapret is disabled for VPN Only.".to_string()),
-            );
+            if !preflight.force_vpn_only {
+                self.snapshot.zapret = RuntimeComponentSnapshot::new(
+                    RuntimeComponentState::Stopped,
+                    Some("zapret is disabled for VPN Only.".to_string()),
+                );
+            }
         }
 
         self.snapshot.phase = RuntimePhase::Preparing;
@@ -215,8 +234,10 @@ impl RuntimeManager {
                     self.prepare_runtime_config_for_local_mihomo(&mut runtime_config)?;
                     ensure_vpn_only_fallback_policy(&runtime_config.policy)
                         .context("VPN-only fallback policy violated invariants")?;
-                    write_compiled_zapret_lists(&self.component_store, &runtime_config.policy)
-                        .context("failed to write empty VPN-only zapret policy lists")?;
+                    self.write_zapret_lists_best_effort(
+                        &runtime_config.policy,
+                        "winws-start VPN-only fallback",
+                    );
                     self.record_policy_diagnostics(&runtime_config.policy);
                     let fallback_draft = self
                         .config_store
@@ -288,14 +309,15 @@ impl RuntimeManager {
                     .diagnostics
                     .push(format!("Smart probe warning: {error}"));
                 let zapret_still_running = self.zapret.is_running();
-                if request.settings.zapret.fallback_to_vpn_on_failed_probe {
-                    let fallback_reason = if zapret_still_running {
-                        "Smart probes failed while winws was running; falling back to VPN-only."
-                    } else {
+                if request.settings.zapret.fallback_to_vpn_on_failed_probe && !zapret_still_running
+                {
+                    self.snapshot.diagnostics.push(
                         "Smart probes failed and winws is not running; falling back to VPN-only."
-                    };
-                    self.snapshot.diagnostics.push(fallback_reason.to_string());
+                            .to_string(),
+                    );
                     effective_mode = RuntimeMode::VpnOnly;
+                    self.snapshot.effective_mode = effective_mode;
+                    self.snapshot.phase = RuntimePhase::DegradedVpnOnly;
                     let mut fallback = self.build_runtime_config_with_secret(
                         &request,
                         effective_mode,
@@ -304,8 +326,10 @@ impl RuntimeManager {
                     self.prepare_runtime_config_for_local_mihomo(&mut fallback)?;
                     ensure_vpn_only_fallback_policy(&fallback.policy)
                         .context("VPN-only probe fallback policy violated invariants")?;
-                    write_compiled_zapret_lists(&self.component_store, &fallback.policy)
-                        .context("failed to write empty VPN-only zapret policy lists")?;
+                    self.write_zapret_lists_best_effort(
+                        &fallback.policy,
+                        "probe VPN-only fallback",
+                    );
                     self.record_policy_diagnostics(&fallback.policy);
                     let fallback_draft = self.config_store.write_draft(&fallback.yaml)?;
                     self.mihomo
@@ -325,19 +349,36 @@ impl RuntimeManager {
                             "Mihomo reload failed during fallback; restarting: {reload_error}"
                         ));
                         let _ = self.mihomo.stop();
-                        self.mihomo.start(
+                        if let Err(start_error) = self.mihomo.start(
                             &mihomo_bin,
                             &fallback_run,
                             self.config_store.home_dir(),
                             request.settings.mihomo.controller_port,
-                        )?;
-                        self.mihomo
+                        ) {
+                            let _ = self.config_store.rollback_run();
+                            let _ = self.zapret.stop();
+                            self.set_error(format!(
+                                "Mihomo restart failed during VPN-only fallback: {start_error}"
+                            ));
+                            return Ok(self.snapshot.clone());
+                        }
+                        if let Err(ready_error) = self
+                            .mihomo
                             .wait_ready(
                                 request.settings.mihomo.controller_port,
                                 MIHOMO_READY_TIMEOUT,
                                 &fallback.secret,
                             )
-                            .await?;
+                            .await
+                        {
+                            let _ = self.mihomo.stop();
+                            let _ = self.config_store.rollback_run();
+                            let _ = self.zapret.stop();
+                            self.set_error(format!(
+                                "Mihomo controller did not recover during VPN-only fallback: {ready_error}"
+                            ));
+                            return Ok(self.snapshot.clone());
+                        }
                     }
                     if let Err(close_error) = self
                         .mihomo
@@ -358,10 +399,12 @@ impl RuntimeManager {
                     );
                     runtime_config = fallback;
                 } else {
-                    self.snapshot.diagnostics.push(
+                    let reason = if zapret_still_running {
+                        "Keeping Smart because winws is still running; endpoint probes are diagnostics-only."
+                    } else {
                         "Keeping Smart because VPN fallback on failed probes is disabled."
-                            .to_string(),
-                    );
+                    };
+                    self.snapshot.diagnostics.push(reason.to_string());
                 }
             }
         }
@@ -761,6 +804,15 @@ impl RuntimeManager {
         ));
     }
 
+    fn write_zapret_lists_best_effort(&mut self, policy: &CompiledPolicy, context: &str) {
+        if let Err(error) = write_compiled_zapret_lists(&self.component_store, policy) {
+            tracing::warn!(%error, context, "failed to update zapret policy lists");
+            self.snapshot.diagnostics.push(format!(
+                "zapret policy list cleanup warning during {context}: {error}"
+            ));
+        }
+    }
+
     fn set_error(&mut self, message: String) {
         tracing::error!(message, "runtime entered error state");
         self.snapshot.phase = RuntimePhase::Error;
@@ -797,6 +849,113 @@ impl RuntimeManager {
         } else {
             RuntimeComponentState::Stopped
         };
+    }
+
+    fn late_zapret_death_requires_fallback(&self) -> bool {
+        self.snapshot.effective_mode == RuntimeMode::Smart
+            && self.snapshot.mihomo.state == RuntimeComponentState::Running
+            && self.snapshot.zapret.state != RuntimeComponentState::Running
+    }
+
+    async fn fallback_to_vpn_only_after_late_zapret_death(&mut self) -> Result<()> {
+        let request = self
+            .last_request
+            .clone()
+            .context("Connect request is required for late zapret fallback")?;
+        let mihomo_bin = self.component_store.mihomo_bin()?;
+        let secret = self.config_store.controller_secret().unwrap_or_default();
+        self.snapshot.diagnostics.push(
+            "Smart requires zapret, but winws is not running; reloading Mihomo in VPN-only fallback."
+                .to_string(),
+        );
+
+        let mut fallback =
+            self.build_runtime_config_with_secret(&request, RuntimeMode::VpnOnly, secret.clone())?;
+        self.prepare_runtime_config_for_local_mihomo(&mut fallback)?;
+        ensure_vpn_only_fallback_policy(&fallback.policy)
+            .context("late zapret VPN-only fallback policy violated invariants")?;
+        self.write_zapret_lists_best_effort(&fallback.policy, "late zapret VPN-only fallback");
+        self.record_policy_diagnostics(&fallback.policy);
+        let fallback_draft = self.config_store.write_draft(&fallback.yaml)?;
+        self.mihomo
+            .validate(&mihomo_bin, &fallback_draft, self.config_store.home_dir())
+            .context("Mihomo rejected late zapret VPN-only fallback config")?;
+        let fallback_run = self.config_store.promote_draft_to_run(&fallback_draft)?;
+        if let Err(reload_error) = self
+            .mihomo
+            .reload(
+                fallback_run.as_path(),
+                request.settings.mihomo.controller_port,
+                &secret,
+            )
+            .await
+        {
+            self.snapshot.diagnostics.push(format!(
+                "Mihomo reload failed during late zapret fallback; restarting: {reload_error}"
+            ));
+            let _ = self.mihomo.stop();
+            if let Err(start_error) = self.mihomo.start(
+                &mihomo_bin,
+                &fallback_run,
+                self.config_store.home_dir(),
+                request.settings.mihomo.controller_port,
+            ) {
+                let _ = self.config_store.rollback_run();
+                let _ = self.zapret.stop();
+                return Err(anyhow!(
+                    "Mihomo restart failed during late zapret fallback: {start_error}"
+                ));
+            }
+            if let Err(ready_error) = self
+                .mihomo
+                .wait_ready(
+                    request.settings.mihomo.controller_port,
+                    MIHOMO_READY_TIMEOUT,
+                    &secret,
+                )
+                .await
+            {
+                let _ = self.mihomo.stop();
+                let _ = self.config_store.rollback_run();
+                let _ = self.zapret.stop();
+                return Err(anyhow!(
+                    "Mihomo controller did not recover during late zapret fallback: {ready_error}"
+                ));
+            }
+        }
+
+        if let Err(close_error) = self
+            .mihomo
+            .close_connections(request.settings.mihomo.controller_port, &secret)
+            .await
+        {
+            self.snapshot.diagnostics.push(format!(
+                "Mihomo connection cleanup warning after late zapret fallback: {close_error}"
+            ));
+        }
+        let _ = self.zapret.stop();
+        self.config_store.commit_last_working()?;
+        self.snapshot.phase = RuntimePhase::DegradedVpnOnly;
+        self.snapshot.effective_mode = RuntimeMode::VpnOnly;
+        self.snapshot.mihomo = RuntimeComponentSnapshot::new(
+            RuntimeComponentState::Running,
+            Some(format!(
+                "Mihomo is running with VPN-only fallback on {}",
+                fallback_run.display()
+            )),
+        );
+        self.snapshot.zapret = RuntimeComponentSnapshot::new(
+            RuntimeComponentState::Unhealthy,
+            Some("winws stopped after Smart start; VPN-only fallback is active".to_string()),
+        );
+        self.snapshot.windivert = RuntimeComponentSnapshot::default();
+        self.snapshot.active_config_id = Some(fallback.config_id);
+        self.snapshot.last_error = None;
+        self.active_policy = Some(fallback.policy.clone());
+        if let Err(error) = self.config_store.write_policy_summary(&fallback.policy) {
+            tracing::warn!(%error, "failed to write late zapret fallback policy summary JSON");
+        }
+        Ok(())
     }
 
     fn record_late_zapret_death_if_needed(&mut self) {
@@ -1100,27 +1259,55 @@ impl MihomoManager {
             home = %home_dir.display(),
             "validating Mihomo config"
         );
-        let output = Command::new(mihomo_bin)
+        let mut child = Command::new(mihomo_bin)
             .arg("-t")
             .arg("-d")
             .arg(home_dir)
             .arg("-f")
             .arg(config_path)
             .stdin(Stdio::null())
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .with_context(|| format!("failed to run {}", mihomo_bin.display()))?;
-        if output.status.success() {
+        let stdout_reader = child.stdout.take().map(read_output_pipe);
+        let stderr_reader = child.stderr.take().map(read_output_pipe);
+        let started = Instant::now();
+        let timed_out;
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                timed_out = false;
+                break status;
+            }
+            if started.elapsed() >= MIHOMO_VALIDATE_TIMEOUT {
+                let _ = child.kill();
+                timed_out = true;
+                break child.wait()?;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let stdout = join_output_reader(stdout_reader)?;
+        let stderr = join_output_reader(stderr_reader)?;
+        if timed_out {
+            return Err(anyhow!(
+                "Mihomo config validation timed out after {}s{}{}",
+                MIHOMO_VALIDATE_TIMEOUT.as_secs(),
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr)
+            ));
+        }
+        if status.success() {
             tracing::debug!("Mihomo config validation succeeded");
             Ok(())
         } else {
             tracing::warn!(
-                status = %output.status,
+                status = %status,
                 "Mihomo config validation failed"
             );
             Err(anyhow!(
                 "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr)
             ))
         }
     }
@@ -1172,7 +1359,9 @@ impl MihomoManager {
         secret: &str,
     ) -> Result<()> {
         tracing::debug!(controller_port, ?timeout, "waiting for Mihomo controller");
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(MIHOMO_CONTROLLER_REQUEST_TIMEOUT)
+            .build()?;
         let started = SystemTime::now();
         loop {
             let mut request = client.get(format!("http://{LOCALHOST}:{controller_port}/version"));
@@ -1220,7 +1409,9 @@ impl MihomoManager {
             controller_port,
             "reloading Mihomo config"
         );
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(MIHOMO_CONTROLLER_REQUEST_TIMEOUT)
+            .build()?;
         let mut request = client
             .put(format!(
                 "http://{LOCALHOST}:{controller_port}/configs?force=true"
@@ -1248,7 +1439,9 @@ impl MihomoManager {
 
     async fn close_connections(&self, controller_port: u16, secret: &str) -> Result<()> {
         tracing::debug!(controller_port, "closing Mihomo controller connections");
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(MIHOMO_CONTROLLER_REQUEST_TIMEOUT)
+            .build()?;
         let mut request =
             client.delete(format!("http://{LOCALHOST}:{controller_port}/connections"));
         if !secret.is_empty() {
@@ -1268,6 +1461,29 @@ impl MihomoManager {
             tracing::debug!("Mihomo stop skipped; no owned child");
         }
         Ok(())
+    }
+}
+
+fn read_output_pipe<R>(mut pipe: R) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        pipe.read_to_end(&mut output)?;
+        Ok(output)
+    })
+}
+
+fn join_output_reader(
+    reader: Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>,
+) -> Result<Vec<u8>> {
+    match reader {
+        Some(reader) => reader
+            .join()
+            .map_err(|_| anyhow!("Mihomo validation output reader panicked"))?
+            .context("failed to read Mihomo validation output"),
+        None => Ok(Vec::new()),
     }
 }
 
@@ -2287,15 +2503,15 @@ async fn run_discord_youtube_probes() -> Result<()> {
     let client = reqwest::Client::builder()
         .user_agent("BadVpn-Agent/0.1.0")
         .no_proxy()
-        .connect_timeout(Duration::from_secs(4))
-        .timeout(Duration::from_secs(8))
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(3))
         .build()?;
     for url in [
         "https://discord.com/api/v9/experiments",
         "https://www.youtube.com/generate_204",
     ] {
         let mut last_error = None;
-        for attempt in 1..=2 {
+        for attempt in 1..=1 {
             match client.get(url).send().await {
                 Ok(response) => {
                     let status = response.status();
@@ -3047,6 +3263,21 @@ mod tests {
             .diagnostics
             .iter()
             .any(|message| message.contains("already in progress")));
+    }
+
+    #[test]
+    fn smart_running_without_zapret_requires_late_fallback() {
+        let mut manager = RuntimeManager::new();
+        manager.snapshot.effective_mode = RuntimeMode::Smart;
+        manager.snapshot.mihomo =
+            RuntimeComponentSnapshot::new(RuntimeComponentState::Running, None);
+        manager.snapshot.zapret =
+            RuntimeComponentSnapshot::new(RuntimeComponentState::Stopped, None);
+
+        assert!(manager.late_zapret_death_requires_fallback());
+
+        manager.snapshot.effective_mode = RuntimeMode::VpnOnly;
+        assert!(!manager.late_zapret_death_requires_fallback());
     }
 
     #[test]
