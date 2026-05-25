@@ -848,7 +848,7 @@ impl RuntimeManager {
         } else {
             RuntimeComponentSnapshot::new(
                 RuntimeComponentState::Stopped,
-                self.mihomo.last_exit_detail().map(ToOwned::to_owned),
+                stopped_component_detail(&self.snapshot.mihomo, self.mihomo.last_exit_detail()),
             )
         };
         let zapret_running = self.zapret.is_running();
@@ -860,7 +860,7 @@ impl RuntimeManager {
         } else {
             RuntimeComponentSnapshot::new(
                 RuntimeComponentState::Stopped,
-                self.zapret.last_exit_detail().map(ToOwned::to_owned),
+                stopped_component_detail(&self.snapshot.zapret, self.zapret.last_exit_detail()),
             )
         };
     }
@@ -1003,6 +1003,22 @@ impl RuntimeManager {
             .map(|request| request.settings.mihomo.controller_port)
             .unwrap_or(9090)
     }
+}
+
+fn stopped_component_detail(
+    current: &RuntimeComponentSnapshot,
+    last_exit_detail: Option<&str>,
+) -> Option<String> {
+    last_exit_detail.map(ToOwned::to_owned).or_else(|| {
+        matches!(
+            current.state,
+            RuntimeComponentState::Stopped
+                | RuntimeComponentState::Unhealthy
+                | RuntimeComponentState::Missing
+        )
+        .then(|| current.detail.clone())
+        .flatten()
+    })
 }
 
 fn diagnostic_rule_kind(rule: &str) -> String {
@@ -3345,6 +3361,26 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("exit code: 1"));
+    }
+
+    #[test]
+    fn refresh_process_state_preserves_stopped_zapret_detail() {
+        let mut manager = RuntimeManager::new();
+        manager.snapshot.zapret = RuntimeComponentSnapshot::new(
+            RuntimeComponentState::Stopped,
+            Some("zapret is disabled for VPN Only.".to_string()),
+        );
+
+        manager.refresh_process_state();
+
+        assert_eq!(
+            manager.snapshot.zapret.state,
+            RuntimeComponentState::Stopped
+        );
+        assert_eq!(
+            manager.snapshot.zapret.detail.as_deref(),
+            Some("zapret is disabled for VPN Only.")
+        );
     }
 
     #[test]
