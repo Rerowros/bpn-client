@@ -80,6 +80,7 @@ button {
   border-right: 1px solid var(--desktop-line);
   display: grid;
   gap: 10px;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto auto minmax(0, 1fr) auto;
   min-height: 0;
   min-width: 0;

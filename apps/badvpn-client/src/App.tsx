@@ -682,6 +682,35 @@ export function App() {
 
   async function handlePrimaryConnectionAction() {
     const action = isConnected ? "disconnect" : "connect";
+    if (action === "connect" && agentService && !agentService.installed) {
+      const message = "badvpn-agent is not installed. Install or repair the service before connecting.";
+      setShowConnectionDetails(true);
+      setConnectionFailureStage("Agent");
+      setState((current) => ({
+        ...current,
+        phase: "ready",
+        connection: {
+          ...current.connection,
+          status: "idle",
+        },
+        diagnostics: {
+          ...current.diagnostics,
+          message,
+        },
+        last_error: message,
+      }));
+      pushNotification({
+        tone: "warning",
+        title: "Agent setup required",
+        message,
+        actionLabel: "Install",
+        action: () => {
+          void handleInstallAgentService();
+        },
+        autoDismiss: false,
+      });
+      return;
+    }
     const attempt = { action, startedAt: Date.now() } satisfies ConnectionAttempt;
     setConnectionAttempt(attempt);
     setProgressNow(Date.now());
@@ -1895,6 +1924,27 @@ export function App() {
 
             <div className="homeAlertStack">
               <ConnectionProgressView progress={connectionProgress} />
+              {!isConnected && hasSubscription && (!agentReady || (runtimeReadiness && !runtimeReadiness.components_ready)) ? (
+                <div className="connectionNotice warning">
+                  <AlertTriangle size={16} aria-hidden="true" />
+                  <span>
+                    {!agentReady
+                      ? agentService?.installed
+                        ? agentService.message
+                        : "badvpn-agent must be installed once before the GUI can start Mihomo and zapret."
+                      : runtimeReadiness?.message}
+                  </span>
+                  {!agentReady ? (
+                    <button type="button" onClick={() => void handleInstallAgentService()} disabled={agentServiceBusy}>
+                      Repair
+                    </button>
+                  ) : (
+                    <button type="button" onClick={() => void handleRuntimeUpdate()} disabled={updateBusy}>
+                      Prepare
+                    </button>
+                  )}
+                </div>
+              ) : null}
               {smartFallbackActive ? (
                 <div className="connectionNotice warning">
                   <AlertTriangle size={16} aria-hidden="true" />
