@@ -36,6 +36,8 @@ pub struct RuntimeManager {
     pub active_policy: Option<CompiledPolicy>,
     /// Group -> proxy pairs that failed egress verification and must not be re-applied on reconnect.
     invalid_proxy_selections: BTreeMap<String, BTreeSet<String>>,
+    invalid_proxy_selections_by_profile: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+    active_profile_scope: Option<String>,
 }
 
 impl RuntimeManager {
@@ -43,11 +45,11 @@ impl RuntimeManager {
         let component_store = ComponentStore::default();
         let config_store = RuntimeConfigStore::default();
         #[cfg(not(test))]
-        let invalid_proxy_selections = config_store
+        let invalid_proxy_selections_by_profile = config_store
             .load_invalid_proxy_selections()
             .unwrap_or_default();
         #[cfg(test)]
-        let invalid_proxy_selections = BTreeMap::new();
+        let invalid_proxy_selections_by_profile = BTreeMap::new();
         Self {
             snapshot: AgentRuntimeSnapshot::default(),
             last_request: None,
@@ -56,7 +58,9 @@ impl RuntimeManager {
             mihomo: MihomoManager::default(),
             zapret: ZapretManager::default(),
             active_policy: None,
-            invalid_proxy_selections,
+            invalid_proxy_selections: BTreeMap::new(),
+            invalid_proxy_selections_by_profile,
+            active_profile_scope: None,
         }
     }
 
@@ -73,9 +77,7 @@ impl RuntimeManager {
         if self.late_zapret_death_requires_fallback() {
             if let Err(error) = self.fallback_to_vpn_only_after_late_zapret_death().await {
                 tracing::error!(%error, "failed to apply VPN-only fallback after late zapret death");
-                self.set_error(format!(
-                    "Late zapret death fallback failed; Smart DIRECT rules may still be active: {error}"
-                ));
+                self.set_error(format!("Late zapret death fallback failed: {error}"));
             }
         }
         self.record_late_zapret_death_if_needed();
@@ -140,6 +142,7 @@ impl RuntimeManager {
                     .to_string(),
             );
         }
+        self.activate_profile_scope(&request);
         self.normalize_request_proxy_selections(&mut request);
         self.last_request = Some(request.clone());
 
@@ -1075,6 +1078,11 @@ impl RuntimeManager {
             }
         }
 
+        let _ = self.zapret.stop();
+        self.mark_unverified_late_vpn_only_fallback(&fallback, &fallback_run);
+        if let Err(error) = self.config_store.write_policy_summary(&fallback.policy) {
+            tracing::warn!(%error, "failed to write unverified late fallback policy summary JSON");
+        }
         if let Err(close_error) = self
             .mihomo
             .close_connections(request.settings.mihomo.controller_port, &secret)
@@ -1084,14 +1092,43 @@ impl RuntimeManager {
                 "Mihomo connection cleanup warning after late zapret fallback: {close_error}"
             ));
         }
-        let _ = self.zapret.stop();
+        if let Err(error) = self
+            .mihomo
+            .verify_proxy_egress(
+                &fallback.policy.main_proxy_group,
+                request.settings.mihomo.controller_port,
+                &secret,
+            )
+            .await
+        {
+            return Err(anyhow!(
+                "VPN-only fallback is active without DIRECT routes, but its selected VPN path failed egress verification: {error}. Choose another server to recover."
+            ));
+        }
+
         self.config_store.commit_last_working()?;
         self.snapshot.phase = RuntimePhase::DegradedVpnOnly;
+        self.snapshot.mihomo.detail = Some(format!(
+            "Mihomo is running with VPN-only fallback on {}",
+            fallback_run.display()
+        ));
+        self.snapshot.last_error = None;
+        if let Err(error) = self.config_store.write_policy_summary(&fallback.policy) {
+            tracing::warn!(%error, "failed to write late zapret fallback policy summary JSON");
+        }
+        Ok(())
+    }
+
+    fn mark_unverified_late_vpn_only_fallback(
+        &mut self,
+        fallback: &RuntimeConfig,
+        fallback_run: &Path,
+    ) {
         self.snapshot.effective_mode = RuntimeMode::VpnOnly;
         self.snapshot.mihomo = RuntimeComponentSnapshot::new(
             RuntimeComponentState::Running,
             Some(format!(
-                "Mihomo is running with VPN-only fallback on {}",
+                "Mihomo is running with unverified VPN-only fallback on {}",
                 fallback_run.display()
             )),
         );
@@ -1100,13 +1137,8 @@ impl RuntimeManager {
             Some("winws stopped after Smart start; VPN-only fallback is active".to_string()),
         );
         self.snapshot.windivert = RuntimeComponentSnapshot::default();
-        self.snapshot.active_config_id = Some(fallback.config_id);
-        self.snapshot.last_error = None;
+        self.snapshot.active_config_id = Some(fallback.config_id.clone());
         self.active_policy = Some(fallback.policy.clone());
-        if let Err(error) = self.config_store.write_policy_summary(&fallback.policy) {
-            tracing::warn!(%error, "failed to write late zapret fallback policy summary JSON");
-        }
-        Ok(())
     }
 
     fn record_late_zapret_death_if_needed(&mut self) {
@@ -1390,6 +1422,16 @@ impl RuntimeManager {
         self.strip_invalid_proxy_selections(&mut request.selected_proxies);
     }
 
+    fn activate_profile_scope(&mut self, request: &ConnectRequest) {
+        let scope = proxy_selection_profile_scope(&request.profile_body);
+        self.invalid_proxy_selections = self
+            .invalid_proxy_selections_by_profile
+            .get(&scope)
+            .cloned()
+            .unwrap_or_default();
+        self.active_profile_scope = Some(scope);
+    }
+
     fn record_invalid_proxy_selection(&mut self, group: &str, proxy: &str) {
         self.invalid_proxy_selections
             .entry(group.to_string())
@@ -1421,12 +1463,20 @@ impl RuntimeManager {
     }
 
     fn persist_invalid_proxy_selections_best_effort(&mut self) {
+        if let Some(scope) = self.active_profile_scope.as_ref() {
+            if self.invalid_proxy_selections.is_empty() {
+                self.invalid_proxy_selections_by_profile.remove(scope);
+            } else {
+                self.invalid_proxy_selections_by_profile
+                    .insert(scope.clone(), self.invalid_proxy_selections.clone());
+            }
+        }
         if cfg!(test) {
             return;
         }
         if let Err(error) = self
             .config_store
-            .save_invalid_proxy_selections(&self.invalid_proxy_selections)
+            .save_invalid_proxy_selections(&self.invalid_proxy_selections_by_profile)
         {
             tracing::warn!(%error, "failed to persist rejected proxy selections");
             self.snapshot.diagnostics.push(
@@ -1724,6 +1774,17 @@ fn diagnostic_rule_kind(rule: &str) -> String {
         .unwrap_or_else(|| "UNKNOWN".to_string())
 }
 
+fn proxy_selection_profile_scope(profile_body: &str) -> String {
+    // Stable FNV-1a revision identifier. Only this opaque digest is persisted; subscription
+    // contents, URLs, credentials, and node endpoints never enter the blacklist file.
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in profile_body.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("profile-v1-{hash:016x}")
+}
+
 impl Default for RuntimeManager {
     fn default() -> Self {
         Self::new()
@@ -1800,6 +1861,12 @@ struct RuntimeConfigStore {
     root: PathBuf,
 }
 
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct InvalidProxySelectionStore {
+    version: u32,
+    profiles: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+}
+
 impl RuntimeConfigStore {
     fn root_dir() -> PathBuf {
         runtime_root_dir().join("mihomo")
@@ -1829,7 +1896,9 @@ impl RuntimeConfigStore {
         self.root.join("invalid-proxy-selections.json")
     }
 
-    fn load_invalid_proxy_selections(&self) -> Result<BTreeMap<String, BTreeSet<String>>> {
+    fn load_invalid_proxy_selections(
+        &self,
+    ) -> Result<BTreeMap<String, BTreeMap<String, BTreeSet<String>>>> {
         let path = self.invalid_proxy_selections_path();
         let content = match fs::read_to_string(&path) {
             Ok(content) => content,
@@ -1838,15 +1907,27 @@ impl RuntimeConfigStore {
             }
             Err(error) => return Err(error.into()),
         };
-        serde_json::from_str(&content).context("failed to parse rejected proxy selections")
+        let store = match serde_json::from_str::<InvalidProxySelectionStore>(&content) {
+            Ok(store) => store,
+            // Schema 0 stored an unscoped group map. It cannot be attributed safely to a
+            // profile revision, so ignore it instead of applying it globally.
+            Err(_) => return Ok(BTreeMap::new()),
+        };
+        if store.version != 1 {
+            return Ok(BTreeMap::new());
+        }
+        Ok(store.profiles)
     }
 
     fn save_invalid_proxy_selections(
         &self,
-        selections: &BTreeMap<String, BTreeSet<String>>,
+        selections: &BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
     ) -> Result<()> {
         fs::create_dir_all(&self.root)?;
-        let content = serde_json::to_string_pretty(selections)?;
+        let content = serde_json::to_string_pretty(&InvalidProxySelectionStore {
+            version: 1,
+            profiles: selections.clone(),
+        })?;
         write_file_atomically(&self.invalid_proxy_selections_path(), &content)
     }
 
@@ -4888,8 +4969,11 @@ start "zapret: general (ALT9)" /min "%BIN%winws.exe" --wf-tcp=80,443,%GameFilter
         let root = std::env::temp_dir().join(format!("badvpn-rejected-proxy-{}", now_unix()));
         let store = RuntimeConfigStore { root: root.clone() };
         let rejected = BTreeMap::from([(
-            "PROXY".to_string(),
-            BTreeSet::from(["Dead node".to_string()]),
+            "profile-v1-test".to_string(),
+            BTreeMap::from([(
+                "PROXY".to_string(),
+                BTreeSet::from(["Dead node".to_string()]),
+            )]),
         )]);
 
         store.save_invalid_proxy_selections(&rejected).unwrap();
@@ -4897,6 +4981,57 @@ start "zapret: general (ALT9)" /min "%BIN%winws.exe" --wf-tcp=80,443,%GameFilter
 
         assert_eq!(reloaded, rejected);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_unscoped_proxy_blacklist_is_ignored() {
+        let root = std::env::temp_dir().join(format!("badvpn-legacy-rejected-{}", now_unix()));
+        let store = RuntimeConfigStore { root: root.clone() };
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            store.invalid_proxy_selections_path(),
+            r#"{"PROXY":["Germany"]}"#,
+        )
+        .unwrap();
+
+        assert!(store.load_invalid_proxy_selections().unwrap().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejected_proxy_is_scoped_to_exact_profile_revision() {
+        let mut manager = RuntimeManager::new();
+        let mut profile_a = test_request();
+        profile_a.profile_body.push_str("# profile-a\n");
+        let mut profile_b = test_request();
+        profile_b.profile_body.push_str("# profile-b\n");
+
+        manager.activate_profile_scope(&profile_a);
+        manager.record_invalid_proxy_selection("PROXY", "Germany");
+        profile_a
+            .selected_proxies
+            .insert("PROXY".to_string(), "Germany".to_string());
+        manager.normalize_request_proxy_selections(&mut profile_a);
+        assert!(!profile_a.selected_proxies.contains_key("PROXY"));
+
+        profile_b
+            .selected_proxies
+            .insert("PROXY".to_string(), "Germany".to_string());
+        manager.activate_profile_scope(&profile_b);
+        manager.normalize_request_proxy_selections(&mut profile_b);
+        assert_eq!(
+            profile_b.selected_proxies.get("PROXY"),
+            Some(&"Germany".to_string())
+        );
+
+        let mut profile_a_restart = test_request();
+        profile_a_restart.profile_body.push_str("# profile-a\n");
+        profile_a_restart
+            .selected_proxies
+            .insert("PROXY".to_string(), "Germany".to_string());
+        manager.activate_profile_scope(&profile_a_restart);
+        manager.normalize_request_proxy_selections(&mut profile_a_restart);
+        assert!(!profile_a_restart.selected_proxies.contains_key("PROXY"));
     }
 
     #[test]
@@ -5394,6 +5529,35 @@ rules:
         assert!(fallback.policy.zapret_hostlist_exclude.is_empty());
         assert!(fallback.policy.zapret_ipset.is_empty());
         assert!(fallback.policy.zapret_ipset_exclude.is_empty());
+    }
+
+    #[test]
+    fn unverified_late_vpn_only_fallback_stays_error_and_is_not_committed() {
+        let root = std::env::temp_dir().join(format!("badvpn-late-fallback-{}", now_unix()));
+        let mut manager = RuntimeManager::new();
+        manager.config_store = RuntimeConfigStore { root: root.clone() };
+        manager.snapshot.phase = RuntimePhase::Error;
+        manager.snapshot.last_error = Some("Smart path failed egress".to_string());
+        let mut request = test_request();
+        request.route_mode = RuntimeMode::VpnOnly;
+        let fallback = manager
+            .build_runtime_config_with_secret(&request, RuntimeMode::VpnOnly, "secret".to_string())
+            .unwrap();
+        let fallback_run = manager.config_store.run_path();
+
+        manager.mark_unverified_late_vpn_only_fallback(&fallback, &fallback_run);
+
+        assert_eq!(manager.snapshot.phase, RuntimePhase::Error);
+        assert_eq!(manager.snapshot.effective_mode, RuntimeMode::VpnOnly);
+        assert_eq!(
+            manager.snapshot.last_error.as_deref(),
+            Some("Smart path failed egress")
+        );
+        let active = manager.active_policy.as_ref().unwrap();
+        assert_eq!(active.mode, AppRouteMode::VpnOnly);
+        assert!(active.validate_invariants().is_ok());
+        assert!(!manager.config_store.last_working_path().exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
