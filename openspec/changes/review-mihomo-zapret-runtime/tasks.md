@@ -59,7 +59,7 @@ Potential bugs to check separately:
 
 ## 4. Startup Timing
 
-- [ ] Measure and explain each connect phase: preflight, policy render, Mihomo validation, zapret list write, winws start, config promote, Mihomo start, controller ready, diagnostics.
+- [x] Measure and explain each connect phase: preflight, policy render, Mihomo validation, zapret list write, winws start, config promote, Mihomo start, controller ready, diagnostics.
 - [x] Remove nonessential external network probes from the critical connect path or cap them to a short timeout.
 - [x] Add tests for startup timeline redaction and phase-keyed output.
 - [x] Ensure diagnostics probes have bounded timeout and cannot block disconnect/reconnect.
