@@ -324,7 +324,7 @@ impl RuntimeManager {
             }
             match self
                 .zapret
-                .start(&self.component_store, &request.settings.zapret)
+                .start(&self.component_store, &request.settings.zapret, cancel)
             {
                 Ok(message) => {
                     timeline.mark("zapret_start_ms");
@@ -335,6 +335,10 @@ impl RuntimeManager {
                     );
                 }
                 Err(error) => {
+                    if cancelled() {
+                        let _ = self.zapret.stop();
+                        return Err(anyhow!("connect cancelled during zapret startup: {error}"));
+                    }
                     timeline.mark("zapret_start_ms");
                     tracing::warn!(%error, "zapret failed; falling back to VPN-only");
                     let _ = self.zapret.stop();
@@ -2181,15 +2185,17 @@ impl ZapretManager {
         &mut self,
         component_store: &ComponentStore,
         settings: &badvpn_common::RuntimeZapretSettings,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<String> {
         self.stop()?;
         let winws = component_store.winws_bin()?;
         let attempts = zapret_strategy_attempt_order(settings);
         let mut errors = Vec::new();
         for strategy in attempts {
+            check_connect_cancel(cancel, "zapret profile selection")?;
             let mut attempt_settings = settings.clone();
             attempt_settings.strategy = strategy.to_string();
-            match self.spawn_with_strategy(component_store, &winws, &attempt_settings) {
+            match self.spawn_with_strategy(component_store, &winws, &attempt_settings, cancel) {
                 Ok(message) => {
                     if strategy != settings.strategy.as_str() {
                         return Ok(format!(
@@ -2199,6 +2205,9 @@ impl ZapretManager {
                     return Ok(message);
                 }
                 Err(error) => {
+                    if connect_is_cancelled(cancel) {
+                        return Err(error);
+                    }
                     tracing::warn!(strategy, %error, "winws strategy attempt failed");
                     errors.push(format!("{strategy}: {error}"));
                 }
@@ -2215,7 +2224,9 @@ impl ZapretManager {
         component_store: &ComponentStore,
         winws: &Path,
         settings: &badvpn_common::RuntimeZapretSettings,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<String> {
+        check_connect_cancel(cancel, "zapret profile spawn")?;
         let args = build_winws_args(component_store, settings)?;
         tracing::info!(
             winws = %winws.display(),
@@ -2240,8 +2251,9 @@ impl ZapretManager {
             pid = child.id(),
             "winws child bound to kill-on-close Job Object"
         );
-        std::thread::sleep(Duration::from_millis(900));
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) =
+            wait_for_zapret_stabilization(&mut child, cancel, Duration::from_millis(900))?
+        {
             self.last_exit_detail = Some(format!("winws exited immediately with {status}"));
             tracing::error!(%status, strategy = %settings.strategy, "winws exited immediately");
             return Err(anyhow!(
@@ -2270,6 +2282,47 @@ impl ZapretManager {
         }
         self.job = None;
         Ok(())
+    }
+}
+
+fn connect_is_cancelled(cancel: Option<&std::sync::atomic::AtomicBool>) -> bool {
+    cancel
+        .map(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+        .unwrap_or(false)
+}
+
+fn check_connect_cancel(cancel: Option<&std::sync::atomic::AtomicBool>, phase: &str) -> Result<()> {
+    if connect_is_cancelled(cancel) {
+        Err(anyhow!("connect cancelled during {phase}"))
+    } else {
+        Ok(())
+    }
+}
+
+fn wait_for_zapret_stabilization(
+    child: &mut Child,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    duration: Duration,
+) -> Result<Option<std::process::ExitStatus>> {
+    let started = Instant::now();
+    loop {
+        if connect_is_cancelled(cancel) {
+            let kill_error = child.kill().err();
+            let wait_error = child.wait().err();
+            if kill_error.is_some() || wait_error.is_some() {
+                return Err(anyhow!(
+                    "connect cancelled during zapret stabilization; cleanup errors: kill={kill_error:?}, wait={wait_error:?}"
+                ));
+            }
+            return Err(anyhow!("connect cancelled during zapret stabilization"));
+        }
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if started.elapsed() >= duration {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -4824,6 +4877,45 @@ mod tests {
             .status()
             .unwrap();
         assert!(query.success(), "child process {pid} survived bind failure");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn zapret_stabilization_cancellation_kills_child_promptly() {
+        let mut child = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_thread = std::sync::Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(75));
+            cancel_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let started = Instant::now();
+        let error = wait_for_zapret_stabilization(
+            &mut child,
+            Some(cancel.as_ref()),
+            Duration::from_secs(10),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("cancelled during zapret stabilization"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(child.try_wait().unwrap().is_some());
     }
 
     #[test]

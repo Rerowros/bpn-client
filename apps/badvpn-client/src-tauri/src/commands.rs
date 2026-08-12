@@ -5892,10 +5892,11 @@ fn stage_runtime_assets_powershell() -> Result<String, String> {
     let source_components = data_dir()?.join("components");
     let target_components = programdata_dir()?.join("components");
     let source_lists = data_dir()?.join("zapret").join("lists");
-    let target_lists = programdata_dir()?
-        .join("components")
-        .join("zapret")
-        .join("lists");
+    let required_profiles = ZapretProfile::all()
+        .iter()
+        .map(|profile| format!("'{}'", powershell_single_quote(profile.bat_file_name())))
+        .collect::<Vec<_>>()
+        .join(", ");
     Ok(format!(
         r#"$sourceComponents = '{source_components}'
 $targetComponents = '{target_components}'
@@ -5911,28 +5912,115 @@ if (Test-Path -LiteralPath $sourceComponents) {{
   if (-not $hasMihomo) {{
     throw "Refusing ProgramData staging because source components are incomplete (mihomo.exe missing)."
   }}
-  New-Item -ItemType Directory -Path $targetComponents -Force | Out-Null
-  # /E copies recursively without deleting destination files that are absent from source.
-  # /IS and /IT force source content to replace destination files even when release
-  # timestamps or other metadata would otherwise make robocopy skip them.
-  # Never use /MIR here: an incomplete AppData tree must not wipe ProgramData assets.
-  robocopy $sourceComponents $targetComponents /E /IS /IT /R:2 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
-  if ($LASTEXITCODE -gt 7) {{ throw "component staging failed with robocopy exit code $LASTEXITCODE" }}
-  $global:LASTEXITCODE = 0
-}}
-$sourceLists = '{source_lists}'
-$targetLists = '{target_lists}'
-if (Test-Path -LiteralPath $sourceLists) {{
-  New-Item -ItemType Directory -Path $targetLists -Force | Out-Null
-  robocopy $sourceLists $targetLists /E /IS /IT /R:2 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
-  if ($LASTEXITCODE -gt 7) {{ throw "Flowseal list staging failed with robocopy exit code $LASTEXITCODE" }}
-  $global:LASTEXITCODE = 0
+  $sourceZapret = Join-Path $sourceComponents 'zapret'
+  $targetZapret = Join-Path $targetComponents 'zapret'
+  if ((Test-Path -LiteralPath $sourceZapret) -or (Test-Path -LiteralPath $targetZapret)) {{
+    $requiredZapretAssets = @(
+      'zapret\bin\winws.exe',
+      'zapret\bin\WinDivert.dll',
+      'zapret\bin\WinDivert64.sys',
+      'zapret\bin\cygwin1.dll',
+      'zapret\bin\quic_initial_www_google_com.bin',
+      'zapret\bin\tls_clienthello_www_google_com.bin'
+    )
+    $missingZapretAssets = @($requiredZapretAssets | Where-Object {{
+      -not (Test-Path -LiteralPath (Join-Path $sourceComponents $_) -PathType Leaf)
+    }})
+    $requiredZapretProfiles = @({required_profiles})
+    foreach ($profile in $requiredZapretProfiles) {{
+      $rootProfile = Join-Path $sourceZapret $profile
+      $nestedProfile = Join-Path (Join-Path $sourceZapret 'profiles') $profile
+      if (-not (Test-Path -LiteralPath $rootProfile -PathType Leaf) -and -not (Test-Path -LiteralPath $nestedProfile -PathType Leaf)) {{
+        $missingZapretAssets += "zapret profile: $profile"
+      }}
+    }}
+    if ($missingZapretAssets.Count -gt 0) {{
+      throw "Refusing ProgramData staging because source zapret components are incomplete: $($missingZapretAssets -join ', ')"
+    }}
+  }}
+  $targetParent = Split-Path -Parent $targetComponents
+  New-Item -ItemType Directory -Path $targetParent -Force | Out-Null
+  $nonce = [Guid]::NewGuid().ToString('N')
+  $stagingComponents = Join-Path $targetParent ("components.stage-" + $nonce)
+  $backupComponents = Join-Path $targetParent ("components.backup-" + $nonce)
+  $targetWasMoved = $false
+
+  function Assert-StagedTreeContent([string]$source, [string]$destination) {{
+    $sourceRoot = [IO.Path]::GetFullPath($source).TrimEnd('\') + '\'
+    foreach ($sourceFile in Get-ChildItem -LiteralPath $source -File -Recurse) {{
+      $relative = $sourceFile.FullName.Substring($sourceRoot.Length)
+      $destinationFile = Join-Path $destination $relative
+      if (-not (Test-Path -LiteralPath $destinationFile -PathType Leaf)) {{
+        throw "Staged runtime asset is missing: $relative"
+      }}
+      $sourceHash = (Get-FileHash -LiteralPath $sourceFile.FullName -Algorithm SHA256).Hash
+      $destinationHash = (Get-FileHash -LiteralPath $destinationFile -Algorithm SHA256).Hash
+      if ($sourceHash -ne $destinationHash) {{
+        throw "Staged runtime asset hash mismatch: $relative"
+      }}
+    }}
+  }}
+
+  try {{
+    New-Item -ItemType Directory -Path $stagingComponents -Force | Out-Null
+    robocopy $sourceComponents $stagingComponents /E /COPY:DAT /DCOPY:DAT /R:2 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -gt 7) {{ throw "component staging failed with robocopy exit code $LASTEXITCODE" }}
+    $global:LASTEXITCODE = 0
+    Assert-StagedTreeContent $sourceComponents $stagingComponents
+
+    $sourceLists = '{source_lists}'
+    if (Test-Path -LiteralPath $sourceLists) {{
+      $stagingLists = Join-Path $stagingComponents 'zapret\lists'
+      New-Item -ItemType Directory -Path $stagingLists -Force | Out-Null
+      # /MIR is safe only inside the disposable staging tree and makes the list set exact.
+      robocopy $sourceLists $stagingLists /MIR /COPY:DAT /DCOPY:DAT /R:2 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+      if ($LASTEXITCODE -gt 7) {{ throw "Flowseal list staging failed with robocopy exit code $LASTEXITCODE" }}
+      $global:LASTEXITCODE = 0
+      Assert-StagedTreeContent $sourceLists $stagingLists
+    }}
+
+    $stagedMihomoCandidates = @(
+      (Join-Path $stagingComponents 'mihomo.exe'),
+      (Join-Path $stagingComponents 'mihomo\mihomo.exe')
+    )
+    if (-not ($stagedMihomoCandidates | Where-Object {{ Test-Path -LiteralPath $_ -PathType Leaf }})) {{
+      throw "Refusing ProgramData swap because staged components are incomplete (mihomo.exe missing)."
+    }}
+
+    if (Test-Path -LiteralPath $targetComponents) {{
+      Move-Item -LiteralPath $targetComponents -Destination $backupComponents
+      $targetWasMoved = $true
+    }}
+    try {{
+      Move-Item -LiteralPath $stagingComponents -Destination $targetComponents
+    }} catch {{
+      if (Test-Path -LiteralPath $targetComponents) {{
+        Remove-Item -LiteralPath $targetComponents -Recurse -Force
+      }}
+      if ($targetWasMoved -and (Test-Path -LiteralPath $backupComponents)) {{
+        Move-Item -LiteralPath $backupComponents -Destination $targetComponents
+        $targetWasMoved = $false
+      }}
+      throw
+    }}
+    if (Test-Path -LiteralPath $backupComponents) {{
+      Remove-Item -LiteralPath $backupComponents -Recurse -Force -ErrorAction SilentlyContinue
+    }}
+  }} catch {{
+    if (Test-Path -LiteralPath $stagingComponents) {{
+      Remove-Item -LiteralPath $stagingComponents -Recurse -Force -ErrorAction SilentlyContinue
+    }}
+    if ($targetWasMoved -and (Test-Path -LiteralPath $backupComponents) -and -not (Test-Path -LiteralPath $targetComponents)) {{
+      Move-Item -LiteralPath $backupComponents -Destination $targetComponents
+    }}
+    throw
+  }}
 }}
 "#,
         source_components = powershell_single_quote(&source_components.to_string_lossy()),
         target_components = powershell_single_quote(&target_components.to_string_lossy()),
         source_lists = powershell_single_quote(&source_lists.to_string_lossy()),
-        target_lists = powershell_single_quote(&target_lists.to_string_lossy()),
+        required_profiles = required_profiles,
     ))
 }
 
@@ -10253,7 +10341,7 @@ mod redaction_tests {
 
     #[cfg(windows)]
     #[test]
-    fn programdata_staging_overwrites_files_regardless_of_timestamps() {
+    fn programdata_staging_uses_verified_tree_swap_with_rollback() {
         let script = stage_runtime_assets_powershell().unwrap();
         let robocopy_lines = script
             .lines()
@@ -10263,22 +10351,47 @@ mod redaction_tests {
         assert_eq!(robocopy_lines.len(), 2);
         for line in robocopy_lines {
             assert!(
-                line.contains(" /E /IS /IT "),
-                "unexpected staging flags: {line}"
+                line.contains("$staging"),
+                "copy must target staging: {line}"
             );
-            assert!(
-                !line.contains("/XO"),
-                "staging must not skip older sources: {line}"
-            );
-            assert!(
-                !line.contains("/MIR"),
-                "staging must not delete extra assets: {line}"
-            );
+            assert!(!line.contains("$targetComponents"));
+            assert!(!line.contains("/XO"));
             assert!(
                 line.contains(" /R:2 /W:1 "),
                 "retries must be bounded: {line}"
             );
         }
+        assert!(script.contains("Get-FileHash"));
+        assert!(script.contains("robocopy $sourceLists $stagingLists /MIR"));
+        let backup = script
+            .find("Move-Item -LiteralPath $targetComponents -Destination $backupComponents")
+            .unwrap();
+        let promote = script
+            .find("Move-Item -LiteralPath $stagingComponents -Destination $targetComponents")
+            .unwrap();
+        let rollback = script
+            .rfind("Move-Item -LiteralPath $backupComponents -Destination $targetComponents")
+            .unwrap();
+        assert!(backup < promote);
+        assert!(promote < rollback);
+        assert!(!script.contains("robocopy $sourceComponents $targetComponents"));
+
+        let syntax = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$tokens=$null; $errors=$null; [void][System.Management.Automation.Language.Parser]::ParseInput($env:BADVPN_TEST_SCRIPT,[ref]$tokens,[ref]$errors); if ($errors.Count) { $errors | ForEach-Object { Write-Error $_ }; exit 1 }",
+            ])
+            .env("BADVPN_TEST_SCRIPT", &script)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            syntax.status.success(),
+            "PowerShell staging script syntax failed: {}",
+            String::from_utf8_lossy(&syntax.stderr)
+        );
     }
 
     #[cfg(windows)]
