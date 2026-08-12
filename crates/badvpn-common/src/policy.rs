@@ -554,6 +554,8 @@ pub struct ProxyGroupInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManagedProxyGroup {
     pub name: String,
+    #[serde(default)]
+    pub source_group: String,
     pub proxies: Vec<String>,
 }
 
@@ -810,6 +812,7 @@ fn finalize_proxy_group_resolution(
         group_rewrites.insert(group.name.clone(), managed_name.clone());
         managed_proxy_groups.push(ManagedProxyGroup {
             name: managed_name.clone(),
+            source_group: group.name.clone(),
             proxies,
         });
         return Ok(ProxyGroupResolution {
