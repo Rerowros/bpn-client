@@ -319,7 +319,7 @@ impl RuntimeManager {
         self.snapshot.phase = RuntimePhase::Verifying;
         let tested_active_proxy = self
             .mihomo
-            .active_proxy_selection(
+            .active_proxy_selection_chain(
                 &runtime_config.policy.main_proxy_group,
                 request.settings.mihomo.controller_port,
                 &runtime_config.secret,
@@ -1296,6 +1296,9 @@ impl RuntimeManager {
                 );
             }
         }
+        if recovery_verified {
+            self.commit_verified_proxy_recovery()?;
+        }
         self.remember_proxy_selection(group, proxy);
         self.snapshot
             .diagnostics
@@ -1312,11 +1315,20 @@ impl RuntimeManager {
             self.snapshot.diagnostics.push(
                 "Selected proxy passed egress verification; connection recovered.".to_string(),
             );
-            if let Err(error) = self.config_store.commit_last_working() {
-                tracing::warn!(%error, "failed to commit last working config after proxy recovery");
-            }
         }
         Ok(self.snapshot.clone())
+    }
+
+    fn commit_verified_proxy_recovery(&mut self) -> Result<()> {
+        if let Err(error) = self.config_store.commit_last_working() {
+            tracing::warn!(%error, "failed to commit last working config after proxy recovery");
+            let message = format!(
+                "The selected proxy passed egress verification, but the recovered config could not be committed: {error}. The live route is recovered, but recovery is not durable; retry the selection."
+            );
+            self.snapshot.diagnostics.push(message.clone());
+            return Err(anyhow!(message));
+        }
+        Ok(())
     }
 
     fn reject_proxy_selection(
@@ -1448,7 +1460,12 @@ impl RuntimeManager {
             .and_then(YamlValue::as_sequence)
             .into_iter()
             .flatten()
-            .filter_map(|proxy| proxy.get("name").and_then(YamlValue::as_str))
+            .filter_map(|proxy| {
+                proxy
+                    .get("name")
+                    .and_then(YamlValue::as_str)
+                    .map(str::to_string)
+            })
             .collect::<BTreeSet<_>>();
         let groups = config
             .get("proxy-groups")
@@ -1463,84 +1480,54 @@ impl RuntimeManager {
                     .iter()
                     .filter_map(YamlValue::as_str)
                     .collect::<Vec<_>>();
-                Some((name, members))
+                Some((
+                    name.to_string(),
+                    members.into_iter().map(str::to_string).collect(),
+                ))
             })
             .collect::<BTreeMap<_, _>>();
+        let mut assignments = BTreeMap::new();
         let mut affected_groups = BTreeSet::new();
 
         for managed in &policy.managed_proxy_groups {
             let mut rejected = BTreeSet::new();
             for group in [&managed.source_group, &managed.name] {
                 if let Some(invalid) = self.invalid_proxy_selections.get(group) {
-                    rejected.extend(invalid.iter().map(String::as_str));
+                    rejected.extend(invalid.iter().cloned());
                 }
             }
             if rejected.is_empty() {
                 continue;
             }
-            let selected = selected_proxies
-                .get(&managed.source_group)
-                .or_else(|| selected_proxies.get(&managed.name))
-                .filter(|proxy| {
-                    managed.proxies.iter().any(|member| member == *proxy)
-                        && !rejected.contains(proxy.as_str())
-                })
-                .cloned()
-                .or_else(|| {
-                    managed
-                        .proxies
-                        .iter()
-                        .find(|proxy| {
-                            proxy_nodes.contains(proxy.as_str())
-                                && !rejected.contains(proxy.as_str())
-                        })
-                        .cloned()
-                })
-                .ok_or_else(|| {
-                    anyhow!(
-                        "No eligible VPN server remains for selector '{}' (source '{}'); choose or add another server",
-                        managed.name,
-                        managed.source_group
-                    )
-                })?;
-            selected_proxies.insert(managed.source_group.clone(), selected.clone());
-            selected_proxies.insert(managed.name.clone(), selected);
-            affected_groups.insert(managed.source_group.as_str());
-            affected_groups.insert(managed.name.as_str());
+            let source_path =
+                first_eligible_proxy_path(&managed.source_group, &groups, &proxy_nodes, &rejected)?;
+            let managed_path =
+                proxy_path_to_leaf(&managed.name, &source_path.leaf, &groups, &proxy_nodes)
+                    .with_context(|| {
+                        format!(
+                    "managed selector '{}' cannot reach fallback node '{}' from source '{}'",
+                    managed.name, source_path.leaf, managed.source_group
+                )
+                    })?;
+            assignments.extend(source_path.assignments);
+            assignments.extend(managed_path);
+            affected_groups.insert(managed.source_group.clone());
+            affected_groups.insert(managed.name.clone());
         }
 
         for (group, rejected) in &self.invalid_proxy_selections {
-            if affected_groups.contains(group.as_str()) {
+            if affected_groups.contains(group) {
                 continue;
             }
-            let Some(members) = groups.get(group.as_str()) else {
+            if !groups.contains_key(group) {
                 continue;
-            };
-            let selected = selected_proxies
-                .get(group)
-                .filter(|proxy| {
-                    members.iter().any(|member| member == &proxy.as_str())
-                        && proxy_nodes.contains(proxy.as_str())
-                        && !rejected.contains(proxy.as_str())
-                })
-                .cloned()
-                .or_else(|| {
-                    members
-                        .iter()
-                        .find(|proxy| {
-                            proxy_nodes.contains(**proxy) && !rejected.contains(**proxy)
-                        })
-                        .map(|proxy| (*proxy).to_string())
-                })
-                .ok_or_else(|| {
-                    anyhow!(
-                        "No eligible VPN server remains for selector '{group}'; choose or add another server"
-                    )
-                })?;
-            selected_proxies.insert(group.clone(), selected);
-            affected_groups.insert(group.as_str());
+            }
+            let path = first_eligible_proxy_path(group, &groups, &proxy_nodes, rejected)?;
+            assignments.extend(path.assignments);
+            affected_groups.insert(group.clone());
         }
 
+        selected_proxies.extend(assignments);
         Ok(!affected_groups.is_empty())
     }
 
@@ -1639,20 +1626,28 @@ impl RuntimeManager {
     fn record_invalid_active_proxy_for_policy(
         &mut self,
         policy: &CompiledPolicy,
-        active_proxy: &str,
+        active_proxy: &ResolvedProxySelection,
     ) {
-        self.record_invalid_proxy_selection(&policy.main_proxy_group, active_proxy);
+        for selector in &active_proxy.selectors {
+            self.record_invalid_proxy_selection(selector, &active_proxy.leaf);
+        }
         let source_groups = policy
             .managed_proxy_groups
             .iter()
             .filter(|managed| {
                 managed.name == policy.main_proxy_group
-                    && managed.proxies.iter().any(|member| member == active_proxy)
+                    && (managed
+                        .proxies
+                        .iter()
+                        .any(|member| member == &active_proxy.leaf)
+                        || active_proxy.selectors.iter().any(|selector| {
+                            managed.proxies.iter().any(|member| member == selector)
+                        }))
             })
             .map(|managed| managed.source_group.clone())
             .collect::<Vec<_>>();
         for source_group in source_groups {
-            self.record_invalid_proxy_selection(&source_group, active_proxy);
+            self.record_invalid_proxy_selection(&source_group, &active_proxy.leaf);
         }
     }
 }
@@ -1738,6 +1733,182 @@ fn active_proxy_selection(catalog: &serde_json::Value, group: &str) -> Result<St
                 "Active Mihomo group '{group}' did not report its current selection; refusing a change that cannot be rolled back"
             )
         })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedProxySelection {
+    leaf: String,
+    selectors: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProxyFallbackPath {
+    leaf: String,
+    assignments: BTreeMap<String, String>,
+}
+
+fn first_eligible_proxy_path(
+    root: &str,
+    groups: &BTreeMap<String, Vec<String>>,
+    proxy_nodes: &BTreeSet<String>,
+    rejected: &BTreeSet<String>,
+) -> Result<ProxyFallbackPath> {
+    const MAX_SELECTOR_DEPTH: usize = 32;
+
+    fn walk(
+        group: &str,
+        groups: &BTreeMap<String, Vec<String>>,
+        proxy_nodes: &BTreeSet<String>,
+        rejected: &BTreeSet<String>,
+        visiting: &mut BTreeSet<String>,
+        depth: usize,
+    ) -> (Option<ProxyFallbackPath>, bool) {
+        if depth >= MAX_SELECTOR_DEPTH || !visiting.insert(group.to_string()) {
+            return (None, true);
+        }
+        let mut saw_cycle = false;
+        if let Some(members) = groups.get(group) {
+            for member in members {
+                if proxy_nodes.contains(member) && !rejected.contains(member) {
+                    visiting.remove(group);
+                    return (
+                        Some(ProxyFallbackPath {
+                            leaf: member.clone(),
+                            assignments: BTreeMap::from([(group.to_string(), member.clone())]),
+                        }),
+                        saw_cycle,
+                    );
+                }
+                if groups.contains_key(member) {
+                    let (path, branch_cycle) =
+                        walk(member, groups, proxy_nodes, rejected, visiting, depth + 1);
+                    saw_cycle |= branch_cycle;
+                    if let Some(mut path) = path {
+                        path.assignments.insert(group.to_string(), member.clone());
+                        visiting.remove(group);
+                        return (Some(path), saw_cycle);
+                    }
+                }
+            }
+        }
+        visiting.remove(group);
+        (None, saw_cycle)
+    }
+
+    let (path, saw_cycle) = walk(root, groups, proxy_nodes, rejected, &mut BTreeSet::new(), 0);
+    path.ok_or_else(|| {
+        if saw_cycle {
+            anyhow!(
+                "No eligible VPN server remains for selector '{root}'; its nested selector graph contains a cycle. Choose or add another server"
+            )
+        } else {
+            anyhow!(
+                "No eligible VPN server remains for selector '{root}'; choose or add another server"
+            )
+        }
+    })
+}
+
+fn proxy_path_to_leaf(
+    root: &str,
+    target_leaf: &str,
+    groups: &BTreeMap<String, Vec<String>>,
+    proxy_nodes: &BTreeSet<String>,
+) -> Result<BTreeMap<String, String>> {
+    fn walk(
+        group: &str,
+        target_leaf: &str,
+        groups: &BTreeMap<String, Vec<String>>,
+        proxy_nodes: &BTreeSet<String>,
+        visiting: &mut BTreeSet<String>,
+        depth: usize,
+    ) -> Option<BTreeMap<String, String>> {
+        if depth >= 32 || !visiting.insert(group.to_string()) {
+            return None;
+        }
+        for member in groups.get(group)? {
+            if member == target_leaf && proxy_nodes.contains(member) {
+                visiting.remove(group);
+                return Some(BTreeMap::from([(group.to_string(), member.clone())]));
+            }
+            if groups.contains_key(member) {
+                if let Some(mut path) = walk(
+                    member,
+                    target_leaf,
+                    groups,
+                    proxy_nodes,
+                    visiting,
+                    depth + 1,
+                ) {
+                    path.insert(group.to_string(), member.clone());
+                    visiting.remove(group);
+                    return Some(path);
+                }
+            }
+        }
+        visiting.remove(group);
+        None
+    }
+
+    walk(
+        root,
+        target_leaf,
+        groups,
+        proxy_nodes,
+        &mut BTreeSet::new(),
+        0,
+    )
+    .ok_or_else(|| anyhow!("selector '{root}' cannot reach concrete proxy '{target_leaf}'"))
+}
+
+fn resolve_active_proxy_selection(
+    catalog: &serde_json::Value,
+    root_group: &str,
+) -> Result<ResolvedProxySelection> {
+    const MAX_SELECTOR_DEPTH: usize = 32;
+    let proxies = catalog
+        .get("proxies")
+        .and_then(serde_json::Value::as_object)
+        .context("Mihomo proxy catalog has no proxies object")?;
+    let mut current = root_group.to_string();
+    let mut selectors = Vec::new();
+    let mut visited = BTreeSet::new();
+
+    for _ in 0..MAX_SELECTOR_DEPTH {
+        if !visited.insert(current.clone()) {
+            return Err(anyhow!(
+                "Mihomo proxy selector cycle detected while resolving '{root_group}' at '{current}'"
+            ));
+        }
+        let state = proxies.get(&current).with_context(|| {
+            format!("Mihomo proxy catalog is missing selected member '{current}'")
+        })?;
+        let is_selector = state
+            .get("all")
+            .and_then(serde_json::Value::as_array)
+            .is_some();
+        if !is_selector {
+            return Ok(ResolvedProxySelection {
+                leaf: current,
+                selectors,
+            });
+        }
+        selectors.push(current.clone());
+        current = state
+            .get("now")
+            .and_then(serde_json::Value::as_str)
+            .filter(|selection| !selection.is_empty())
+            .with_context(|| {
+                format!(
+                    "Active Mihomo selector '{}' has no current member",
+                    selectors.last().unwrap()
+                )
+            })?
+            .to_string();
+    }
+    Err(anyhow!(
+        "Mihomo proxy selector chain for '{root_group}' exceeds {MAX_SELECTOR_DEPTH} levels"
+    ))
 }
 
 fn apply_proxy_selection_to_yaml(
@@ -2475,12 +2646,12 @@ impl MihomoManager {
         Err(anyhow!(failures.join("; ")))
     }
 
-    async fn active_proxy_selection(
+    async fn active_proxy_selection_chain(
         &self,
         proxy_group: &str,
         controller_port: u16,
         secret: &str,
-    ) -> Result<String> {
+    ) -> Result<ResolvedProxySelection> {
         let client = reqwest::Client::builder()
             .timeout(MIHOMO_CONTROLLER_REQUEST_TIMEOUT)
             .build()?;
@@ -2497,7 +2668,7 @@ impl MihomoManager {
             .json::<serde_json::Value>()
             .await
             .context("failed to decode active Mihomo proxy groups")?;
-        active_proxy_selection(&catalog, proxy_group)
+        resolve_active_proxy_selection(&catalog, proxy_group)
     }
 
     async fn close_connections(&self, controller_port: u16, secret: &str) -> Result<()> {
@@ -5184,6 +5355,123 @@ rules:
     }
 
     #[test]
+    fn nested_selector_blacklists_resolved_leaf_and_reconnect_selects_alternative() {
+        let catalog = serde_json::json!({
+            "proxies": {
+                "PROXY": { "type": "Selector", "all": ["AUTO"], "now": "AUTO" },
+                "AUTO": { "type": "Selector", "all": ["A", "B"], "now": "A" },
+                "A": { "type": "VLESS" },
+                "B": { "type": "VLESS" }
+            }
+        });
+        let resolved = resolve_active_proxy_selection(&catalog, "PROXY").unwrap();
+        assert_eq!(resolved.leaf, "A");
+        assert_eq!(resolved.selectors, ["PROXY", "AUTO"]);
+
+        let mut manager = RuntimeManager::new();
+        let mut request = test_request();
+        request.profile_body = r#"
+proxies:
+  - name: A
+    type: direct
+  - name: B
+    type: direct
+proxy-groups:
+  - name: AUTO
+    type: select
+    proxies: [A, B]
+  - name: PROXY
+    type: select
+    proxies: [DIRECT, AUTO]
+rules:
+  - MATCH,PROXY
+"#
+        .to_string();
+        manager.activate_profile_scope(&request);
+        let policy = manager
+            .build_runtime_config_with_secret(
+                &request,
+                RuntimeMode::Smart,
+                "first-secret".to_string(),
+            )
+            .unwrap()
+            .policy;
+        manager.record_invalid_active_proxy_for_policy(&policy, &resolved);
+        assert!(manager
+            .invalid_proxy_selections
+            .get("PROXY")
+            .is_some_and(|rejected| rejected.contains("A")));
+        assert!(manager
+            .invalid_proxy_selections
+            .get("AUTO")
+            .is_some_and(|rejected| rejected.contains("A")));
+
+        let generated = manager
+            .build_runtime_config_with_secret(
+                &request,
+                RuntimeMode::Smart,
+                "second-secret".to_string(),
+            )
+            .unwrap();
+        let yaml = serde_yaml::from_str::<YamlValue>(&generated.yaml).unwrap();
+        let groups = yaml["proxy-groups"].as_sequence().unwrap();
+        let auto = groups
+            .iter()
+            .find(|group| group["name"].as_str() == Some("AUTO"))
+            .unwrap();
+        let proxy = groups
+            .iter()
+            .find(|group| group["name"].as_str() == Some("PROXY"))
+            .unwrap();
+        assert_eq!(auto["proxies"][0].as_str(), Some("B"));
+        assert_eq!(proxy["proxies"][0].as_str(), Some("AUTO"));
+        assert_eq!(yaml["profile"]["store-selected"].as_bool(), Some(false));
+
+        let vpn_only = manager
+            .build_runtime_config_with_secret(
+                &request,
+                RuntimeMode::VpnOnly,
+                "vpn-secret".to_string(),
+            )
+            .unwrap();
+        let yaml = serde_yaml::from_str::<YamlValue>(&vpn_only.yaml).unwrap();
+        let managed = yaml["proxy-groups"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .find(|group| group["name"].as_str() == Some("__BADVPN_VPN_ONLY__"))
+            .unwrap();
+        assert_eq!(managed["proxies"][0].as_str(), Some("B"));
+    }
+
+    #[test]
+    fn nested_selector_cycle_is_actionable() {
+        let catalog = serde_json::json!({
+            "proxies": {
+                "PROXY": { "type": "Selector", "all": ["AUTO"], "now": "AUTO" },
+                "AUTO": { "type": "Selector", "all": ["PROXY"], "now": "PROXY" }
+            }
+        });
+        let error = resolve_active_proxy_selection(&catalog, "PROXY").unwrap_err();
+        assert!(error.to_string().contains("selector cycle detected"));
+
+        let groups = BTreeMap::from([
+            ("PROXY".to_string(), vec!["AUTO".to_string()]),
+            ("AUTO".to_string(), vec!["PROXY".to_string()]),
+        ]);
+        let error = first_eligible_proxy_path(
+            "PROXY",
+            &groups,
+            &BTreeSet::new(),
+            &BTreeSet::from(["A".to_string()]),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("nested selector graph contains a cycle"));
+    }
+
+    #[test]
     fn invalid_proxy_selections_retain_multiple_rejected_nodes_per_group() {
         let mut manager = RuntimeManager::new();
         manager.record_invalid_proxy_selection("PROXY", "Dead one");
@@ -5305,6 +5593,33 @@ rules:
     }
 
     #[test]
+    fn verified_recovery_commit_failure_preserves_error_state() {
+        let root = std::env::temp_dir().join(format!("badvpn-recovery-commit-fail-{}", now_unix()));
+        let store = RuntimeConfigStore { root: root.clone() };
+        fs::create_dir_all(store.last_working_path()).unwrap();
+        fs::write(store.run_path(), "verified recovered config").unwrap();
+        let mut manager = RuntimeManager::new();
+        manager.config_store = store;
+        manager.snapshot.phase = RuntimePhase::Error;
+        manager.snapshot.last_error = Some("previous egress failure".to_string());
+
+        let error = manager.commit_verified_proxy_recovery().unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("recovered config could not be committed"));
+        assert_eq!(manager.snapshot.phase, RuntimePhase::Error);
+        assert_eq!(
+            manager.snapshot.last_error.as_deref(),
+            Some("previous egress failure")
+        );
+        assert!(manager.snapshot.diagnostics.iter().any(|message| {
+            message.contains("live route is recovered, but recovery is not durable")
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn active_main_proxy_is_invalidated_even_when_saved_selection_differs() {
         let mut manager = RuntimeManager::new();
         let mut request = test_request();
@@ -5340,10 +5655,11 @@ rules:
                     "type": "Selector",
                     "all": ["Germany", "Turkey"],
                     "now": "Turkey"
-                }
+                },
+                "Turkey": { "type": "VLESS" }
             }
         });
-        let tested_proxy = active_proxy_selection(&catalog, "__BADVPN_VPN_ONLY__").unwrap();
+        let tested_proxy = resolve_active_proxy_selection(&catalog, "__BADVPN_VPN_ONLY__").unwrap();
         manager.record_invalid_active_proxy_for_policy(&policy, &tested_proxy);
 
         assert!(manager
