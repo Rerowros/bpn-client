@@ -1893,6 +1893,8 @@ struct MihomoProxyState {
     delay: Option<u64>,
     #[serde(default)]
     history: Vec<MihomoProxyHistory>,
+    #[serde(default, rename = "all")]
+    members: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -2590,20 +2592,52 @@ pub async fn proxy_catalog() -> Result<ProxyCatalog, String> {
 
 #[tauri::command]
 pub async fn select_proxy(group: String, proxy: String) -> Result<ProxyCatalog, String> {
+    let group = group.trim();
+    let proxy = proxy.trim();
+    if group.is_empty() || proxy.is_empty() {
+        return Err("Proxy group and proxy name are required.".to_string());
+    }
+
+    if should_use_agent_runtime() {
+        let previous_selections = read_proxy_selections()?;
+        let mut updated_selections = previous_selections.clone();
+        updated_selections.insert(group.to_string(), proxy.to_string());
+        persist_proxy_selections(&updated_selections)?;
+        if let Err(error) = send_agent_command(
+            AgentCommand::SelectProxy {
+                group: group.to_string(),
+                proxy: proxy.to_string(),
+            },
+            false,
+        ) {
+            return match persist_proxy_selections(&previous_selections) {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(format!(
+                    "{error} The saved proxy selection also could not be restored: {rollback_error}"
+                )),
+            };
+        }
+        return proxy_catalog().await;
+    }
+
+    let api = fetch_mihomo_proxies().await?;
+    validate_proxy_selection(&api, group, proxy)?;
     let client = mihomo_http_client()?;
     let url = format!(
         "{}/proxies/{}",
         mihomo_controller_base()?,
-        path_encode(group.trim())
+        path_encode(group)
     );
-    let response = add_mihomo_auth(client.put(url).json(&json!({ "name": proxy.trim() })))
+    let response = add_mihomo_auth(client.put(url).json(&json!({ "name": proxy })))
         .send()
         .await
         .map_err(|error| format!("Failed to select proxy: {error}"))?;
-    response
-        .error_for_status()
-        .map_err(|error| format!("Mihomo rejected proxy selection: {error}"))?;
-    persist_proxy_selection(group.trim(), proxy.trim())?;
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response.text().await.unwrap_or_default();
+        return Err(proxy_selection_http_error(status, &detail));
+    }
+    persist_proxy_selection(group, proxy)?;
     proxy_catalog().await
 }
 
@@ -6174,7 +6208,7 @@ async fn check_https_endpoint(id: &str, label: &str, url: &str) -> RuntimeDiagno
 }
 
 fn local_proxy_catalog() -> Result<Vec<ProxyGroupView>, String> {
-    let path = mihomo_config_path()?;
+    let path = active_mihomo_config_path()?;
     if !path.exists() {
         return Err("Import a subscription before opening server groups.".to_string());
     }
@@ -6270,6 +6304,48 @@ fn local_proxy_catalog() -> Result<Vec<ProxyGroupView>, String> {
     } else {
         Ok(groups)
     }
+}
+
+fn validate_proxy_selection(
+    api: &MihomoProxiesResponse,
+    group: &str,
+    proxy: &str,
+) -> Result<(), String> {
+    let state = api.proxies.get(group).ok_or_else(|| {
+        format!(
+            "Proxy group '{group}' is not present in the active Mihomo runtime. Refresh the server list or reconnect before selecting a node."
+        )
+    })?;
+    if state
+        .proxy_type
+        .as_deref()
+        .is_some_and(|kind| !kind.eq_ignore_ascii_case("selector"))
+    {
+        return Err(format!(
+            "Proxy group '{group}' is not selectable in the active Mihomo runtime."
+        ));
+    }
+    if !state.members.is_empty() && !state.members.iter().any(|member| member == proxy) {
+        return Err(format!(
+            "Proxy '{proxy}' is not a member of active Mihomo group '{group}'. Refresh the server list before selecting a node."
+        ));
+    }
+    Ok(())
+}
+
+fn proxy_selection_http_error(status: reqwest::StatusCode, detail: &str) -> String {
+    let detail = detail.trim();
+    let detail = if detail.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Mihomo response: {}",
+            detail.chars().take(512).collect::<String>()
+        )
+    };
+    format!(
+        "Mihomo rejected proxy selection with HTTP {status}. Refresh the active server list or reconnect and try again.{detail}"
+    )
 }
 
 fn merge_proxy_runtime_state(groups: &mut [ProxyGroupView], api: &MihomoProxiesResponse) {
@@ -10070,6 +10146,33 @@ fn normalize_subscription_profile_description(
 #[cfg(test)]
 mod redaction_tests {
     use super::*;
+
+    #[test]
+    fn proxy_selection_validation_rejects_stale_group_and_unknown_member() {
+        let mut api = MihomoProxiesResponse::default();
+        api.proxies.insert(
+            "__BADVPN_VPN_ONLY__".to_string(),
+            MihomoProxyState {
+                proxy_type: Some("Selector".to_string()),
+                members: vec!["Germany".to_string(), "Switzerland".to_string()],
+                ..MihomoProxyState::default()
+            },
+        );
+
+        let stale = validate_proxy_selection(&api, "Выбор сервера", "Germany").unwrap_err();
+        assert!(stale.contains("not present in the active Mihomo runtime"));
+        let unknown = validate_proxy_selection(&api, "__BADVPN_VPN_ONLY__", "Poland").unwrap_err();
+        assert!(unknown.contains("not a member"));
+        validate_proxy_selection(&api, "__BADVPN_VPN_ONLY__", "Germany").unwrap();
+    }
+
+    #[test]
+    fn proxy_selection_path_encoding_preserves_one_unicode_segment() {
+        assert_eq!(
+            path_encode("Выбор сервера/основной"),
+            "%D0%92%D1%8B%D0%B1%D0%BE%D1%80%20%D1%81%D0%B5%D1%80%D0%B2%D0%B5%D1%80%D0%B0%2F%D0%BE%D1%81%D0%BD%D0%BE%D0%B2%D0%BD%D0%BE%D0%B9"
+        );
+    }
 
     #[test]
     fn subscription_url_redaction_keeps_origin_only() {

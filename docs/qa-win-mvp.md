@@ -34,6 +34,9 @@ This document owns manual Windows validation. Keep architecture in `docs/BADVPN_
 [ ] Windows reboot restores intended state or enters safe mode with an actionable message.
 [ ] Occupied TCP/UDP `1053` blocks before winws starts and shows a DNS conflict.
 [ ] External Mihomo/Clash/sing-box/v2rayN TUN client blocks before runtime mutation.
+[ ] `Connected` is not reported when the local Mihomo controller is reachable but the selected main proxy group cannot pass either bounded egress probe.
+[ ] Killing the owned Mihomo process changes the state from Connected to Error and stops owned winws.
+[ ] Selecting a Unicode-named proxy group uses the active service runtime catalog, survives reconnect, and survives Smart-to-VPN-only fallback.
 ```
 
 ## Smart Mode
@@ -48,6 +51,9 @@ This document owns manual Windows validation. Keep architecture in `docs/BADVPN_
 [ ] Missing or failed winws degrades to VPN Only without blocking VPN startup.
 [ ] External winws/GoodbyeDPI conflict degrades or reports a clear conflict without creating `BadVpnZapret`.
 [ ] Normal GUI actions never create or start legacy `BadVpnZapret`.
+[ ] Proxy endpoint IPs/hostnames are excluded from zapret interception, including with `ipset_filter=loaded`.
+[ ] Existing `list-general-user.txt`, `list-exclude-user.txt`, and `ipset-exclude-user.txt` contents survive reconnect and policy recompilation.
+[ ] HTTP rule providers and their `RULE-SET` rules are disabled during connect without a runtime URL/cache read, so a remote 404 or corrupt cache cannot block Mihomo startup or leak the URL.
 ```
 
 ## VPN Only Mode

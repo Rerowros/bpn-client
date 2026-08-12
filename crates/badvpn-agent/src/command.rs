@@ -43,8 +43,8 @@ impl AgentController {
             AgentCommand::CleanupLegacyZapret => self.cleanup_legacy_zapret().await,
             AgentCommand::RepairWindowsNetwork => self.repair_windows_network().await,
             AgentCommand::VerifyInstalledAgent => self.verify_installed_agent().await,
-            AgentCommand::SelectProxy { .. }
-            | AgentCommand::SetRouteMode { .. }
+            AgentCommand::SelectProxy { group, proxy } => self.select_proxy(group, proxy).await,
+            AgentCommand::SetRouteMode { .. }
             | AgentCommand::SetDpiProfile { .. }
             | AgentCommand::UpdateComponents
             | AgentCommand::RollbackComponent { .. }
@@ -117,6 +117,19 @@ impl AgentController {
         let snapshot = self
             .manager
             .restart()
+            .await
+            .map_err(|error| BadVpnError::OperationFailed(error.to_string()))?;
+        self.runtime = AgentRuntimeState::from_agent_state(snapshot_to_agent_state(
+            &snapshot,
+            self.runtime.subscription.clone(),
+        ));
+        Ok(self.runtime.snapshot())
+    }
+
+    async fn select_proxy(&mut self, group: String, proxy: String) -> BadVpnResult<AgentState> {
+        let snapshot = self
+            .manager
+            .select_proxy(group.trim(), proxy.trim())
             .await
             .map_err(|error| BadVpnError::OperationFailed(error.to_string()))?;
         self.runtime = AgentRuntimeState::from_agent_state(snapshot_to_agent_state(

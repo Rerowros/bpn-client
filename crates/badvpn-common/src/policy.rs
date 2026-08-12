@@ -524,6 +524,7 @@ pub struct RuntimeFacts {
     pub selected_proxy_group: Option<String>,
     pub selected_proxy_nodes: Vec<ProxyNode>,
     pub resolved_proxy_ips: Vec<String>,
+    pub proxy_endpoint_hosts: Vec<String>,
 }
 
 impl Default for RuntimeFacts {
@@ -532,6 +533,7 @@ impl Default for RuntimeFacts {
             selected_proxy_group: None,
             selected_proxy_nodes: Vec::new(),
             resolved_proxy_ips: Vec::new(),
+            proxy_endpoint_hosts: Vec::new(),
         }
     }
 }
@@ -1354,6 +1356,12 @@ fn emit_runtime_excludes(ctx: &mut CompileContext, facts: &RuntimeFacts) {
             if server.parse::<std::net::IpAddr>().is_ok() {
                 ctx.zapret_ipset_exclude.insert(server.clone());
             }
+        }
+    }
+    for host in &facts.proxy_endpoint_hosts {
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if is_valid_zapret_domain(&host) {
+            ctx.zapret_hostlist_exclude.insert(host);
         }
     }
 }

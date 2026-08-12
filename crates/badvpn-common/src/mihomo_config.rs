@@ -5,7 +5,7 @@ use url::Url;
 
 use crate::{
     compile_policy, subscription_body_to_text, AppRouteMode, CompiledPolicy, PolicyCompileInput,
-    ProxyGroupInfo, RouteMode, RoutingPolicySettings, RuntimeFacts, SubscriptionFormat,
+    ProxyGroupInfo, ProxyNode, RouteMode, RoutingPolicySettings, RuntimeFacts, SubscriptionFormat,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -490,6 +490,10 @@ fn build_vless_config_yaml(
     secret: &str,
     options: &MihomoConfigOptions,
 ) -> Result<(String, CompiledPolicy), String> {
+    let runtime_facts = runtime_facts_from_proxy_nodes(proxies.iter().map(|proxy| ProxyNode {
+        name: proxy.name.clone(),
+        server: Some(proxy.server.clone()),
+    }));
     let policy = compile_policy(PolicyCompileInput {
         mode: app_route_mode(options.route_mode),
         provider_rules: Vec::new(),
@@ -507,7 +511,7 @@ fn build_vless_config_yaml(
         ],
         proxy_count: proxies.len(),
         routing: routing_policy_for_options(options),
-        runtime_facts: RuntimeFacts::default(),
+        runtime_facts,
     })?;
     let mut yaml = base_config_yaml(secret, options);
     yaml.push_str("\nproxies:\n");
@@ -671,6 +675,7 @@ fn overlay_mihomo_config_yaml_with_policy(
         .ok_or_else(|| "Clash YAML root must be a mapping".to_string())?;
     let provider_rules = extract_provider_rules(map);
     let proxy_groups = extract_proxy_groups(map);
+    let runtime_facts = runtime_facts_from_yaml_proxies(map);
     let existing_dns = map
         .get(serde_yaml::Value::String("dns".to_string()))
         .cloned();
@@ -680,7 +685,7 @@ fn overlay_mihomo_config_yaml_with_policy(
         proxy_groups,
         proxy_count,
         routing: routing_policy_for_options(options),
-        runtime_facts: RuntimeFacts::default(),
+        runtime_facts,
     })?;
 
     insert_yaml(
@@ -727,6 +732,50 @@ fn overlay_mihomo_config_yaml_with_policy(
             .map_err(|error| format!("Failed to render Mihomo YAML: {error}"))?,
         policy,
     ))
+}
+
+fn runtime_facts_from_yaml_proxies(map: &serde_yaml::Mapping) -> RuntimeFacts {
+    let nodes = map
+        .get(serde_yaml::Value::String("proxies".to_string()))
+        .and_then(serde_yaml::Value::as_sequence)
+        .into_iter()
+        .flatten()
+        .filter_map(|proxy| {
+            let name = proxy.get("name")?.as_str()?.to_string();
+            let server = proxy
+                .get("server")
+                .and_then(serde_yaml::Value::as_str)
+                .map(ToOwned::to_owned);
+            Some(ProxyNode { name, server })
+        });
+    runtime_facts_from_proxy_nodes(nodes)
+}
+
+fn runtime_facts_from_proxy_nodes(nodes: impl IntoIterator<Item = ProxyNode>) -> RuntimeFacts {
+    let selected_proxy_nodes = nodes.into_iter().collect::<Vec<_>>();
+    let mut resolved_proxy_ips = Vec::new();
+    let mut proxy_endpoint_hosts = Vec::new();
+    for server in selected_proxy_nodes
+        .iter()
+        .filter_map(|node| node.server.as_deref())
+    {
+        let server = server.trim().trim_end_matches('.');
+        if server.parse::<std::net::IpAddr>().is_ok() {
+            resolved_proxy_ips.push(server.to_string());
+        } else if !server.is_empty() {
+            proxy_endpoint_hosts.push(server.to_ascii_lowercase());
+        }
+    }
+    resolved_proxy_ips.sort();
+    resolved_proxy_ips.dedup();
+    proxy_endpoint_hosts.sort();
+    proxy_endpoint_hosts.dedup();
+    RuntimeFacts {
+        selected_proxy_nodes,
+        resolved_proxy_ips,
+        proxy_endpoint_hosts,
+        ..RuntimeFacts::default()
+    }
 }
 
 fn extract_provider_rules(map: &serde_yaml::Mapping) -> Vec<String> {
@@ -2120,5 +2169,41 @@ rules:
         assert_eq!(messages.len(), 1);
         assert!(!yaml.to_ascii_uppercase().contains("GEOSITE,"));
         assert!(yaml.contains("DOMAIN-SUFFIX,example.com,PROXY"));
+    }
+
+    #[test]
+    fn proxy_endpoints_are_excluded_from_zapret_artifacts() {
+        let profile = r#"
+proxies:
+  - name: IpNode
+    type: http
+    server: 203.0.113.10
+    port: 443
+  - name: HostNode
+    type: http
+    server: Edge.Example.COM.
+    port: 443
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - IpNode
+      - HostNode
+rules:
+  - MATCH,PROXY
+"#;
+        let (_yaml, policy) = overlay_mihomo_config_yaml_with_policy(
+            profile,
+            "test-secret",
+            &MihomoConfigOptions::default(),
+        )
+        .unwrap();
+
+        assert!(policy
+            .zapret_ipset_exclude
+            .contains(&"203.0.113.10/32".to_string()));
+        assert!(policy
+            .zapret_hostlist_exclude
+            .contains(&"edge.example.com".to_string()));
     }
 }

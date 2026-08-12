@@ -30,7 +30,9 @@ This document owns runtime behavior: `badvpn-agent`, IPC, Mihomo/winws lifecycle
 5. In `Smart`, the agent starts winws when zapret coverage is required and safe. If winws cannot start, the agent recompiles a fresh `VPN Only` policy and degrades without blocking VPN startup.
 6. In `VPN Only`, the agent stops winws, emits no zapret artifacts, and prevents external traffic from escaping through provider `DIRECT` rules or groups containing `DIRECT`.
 7. The agent writes a draft Mihomo config, validates it with `mihomo -t` where available, promotes it atomically, and keeps `last-working.yaml` for rollback.
-8. The agent starts Mihomo, verifies the local controller, and reports runtime state through IPC.
+8. Before validation, HTTP rule providers and their `RULE-SET` references are disabled with a redacted diagnostic. Connect never fetches or trusts an unverified provider cache; provider resources must eventually arrive through the separately verified resource-update pipeline.
+9. The agent starts Mihomo, verifies the local controller, then verifies egress through the compiled main proxy group with bounded controller `/delay` probes. `Connected` is reported only after one probe succeeds.
+10. Proxy selection in service-first mode goes through `badvpn-agent`. The agent validates the group and member against the active controller, applies the selection, and retains it for restart and Smart-to-VPN-only fallback.
 
 ## Preflight
 
@@ -71,6 +73,7 @@ Checks include:
 - running service process path matching the installed service image;
 - Mihomo config/controller/process health through the agent;
 - selected proxy groups visible through the Mihomo controller;
+- bounded egress through the compiled main proxy group before reporting `Connected`;
 - policy expectations versus rendered Mihomo rules where available;
 - winws/zapret health through the agent;
 - legacy `BadVpnZapret` service state;
@@ -82,4 +85,5 @@ Checks include:
 - Persist the installing user SID for named-pipe ACLs instead of relying on active-console-user discovery.
 - Move final component update download/verify/swap ownership from GUI-assisted staging into `badvpn-agent`.
 - Finish reboot recovery and reattach-to-existing-owned-process logic.
-- Add late winws death auto-fallback policy if the product decision enables it.
+- Move late winws death detection from status polling into an agent-owned background watchdog. Status polling already triggers VPN-only fallback, but recovery must not depend on the GUI being open.
+- Expand `RunDiagnostics` beyond the current component snapshot into WinDivert/BFE, route, DNS, controller traffic, and HTTPS checks.
