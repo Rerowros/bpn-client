@@ -934,9 +934,8 @@ fn apply_selected_proxies(
     // managed MATCH group that replaced that provider group. Matching only by leaf proxy name
     // is ambiguous when several provider groups contain the same nodes.
     for managed in &policy.managed_proxy_groups {
-        if effective_selections.contains_key(&managed.name) {
-            continue;
-        }
+        // The exact source group is authoritative. A managed-group entry may be stale legacy
+        // state left by an older client that mirrored selections before source tracking existed.
         if let Some(proxy) = selected_proxies
             .get(&managed.source_group)
             .filter(|proxy| managed.proxies.iter().any(|member| member == *proxy))
@@ -2228,6 +2227,9 @@ rules:
         options
             .selected_proxies
             .insert("Primary".to_string(), "Turkey".to_string());
+        options
+            .selected_proxies
+            .insert("__BADVPN_VPN_ONLY__".to_string(), "Germany".to_string());
 
         let generated =
             generate_mihomo_config_from_subscription_with_options(body, "secret", &options)

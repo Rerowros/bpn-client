@@ -133,6 +133,7 @@ impl RuntimeManager {
                     .to_string(),
             );
         }
+        self.normalize_request_proxy_selections(&mut request);
         self.last_request = Some(request.clone());
 
         let preflight = match self.preflight(&request) {
@@ -306,6 +307,14 @@ impl RuntimeManager {
         timeline.mark("mihomo_ready_ms");
 
         self.snapshot.phase = RuntimePhase::Verifying;
+        let tested_active_proxy = self
+            .mihomo
+            .active_proxy_selection(
+                &runtime_config.policy.main_proxy_group,
+                request.settings.mihomo.controller_port,
+                &runtime_config.secret,
+            )
+            .await;
         if let Err(error) = self
             .mihomo
             .verify_proxy_egress(
@@ -319,7 +328,18 @@ impl RuntimeManager {
             // Keep Mihomo (and zapret) running so the user can recover via select_proxy
             // without tearing down the controller, and so reconnect can drop the dead
             // cached selection instead of looping on the same failed path.
-            self.record_invalid_proxy_selections_for_policy(&runtime_config.policy);
+            match tested_active_proxy {
+                Ok(active_proxy) => self
+                    .record_invalid_active_proxy_for_policy(&runtime_config.policy, &active_proxy),
+                Err(catalog_error) => {
+                    tracing::warn!(%catalog_error, "failed to identify active Mihomo proxy after egress failure");
+                    self.snapshot.diagnostics.push(
+                        "Could not identify the active proxy after egress failure; falling back to saved-selection invalidation."
+                            .to_string(),
+                    );
+                    self.record_invalid_proxy_selections_for_policy(&runtime_config.policy);
+                }
+            }
             self.snapshot.effective_mode = effective_mode;
             self.snapshot.mihomo = RuntimeComponentSnapshot::new(
                 RuntimeComponentState::Running,
@@ -1334,6 +1354,10 @@ impl RuntimeManager {
         });
     }
 
+    fn normalize_request_proxy_selections(&self, request: &mut ConnectRequest) {
+        self.strip_invalid_proxy_selections(&mut request.selected_proxies);
+    }
+
     fn record_invalid_proxy_selection(&mut self, group: &str, proxy: &str) {
         self.invalid_proxy_selections
             .entry(group.to_string())
@@ -1384,6 +1408,26 @@ impl RuntimeManager {
         };
         for (group, proxy) in to_invalidate {
             self.record_invalid_proxy_selection(&group, &proxy);
+        }
+    }
+
+    fn record_invalid_active_proxy_for_policy(
+        &mut self,
+        policy: &CompiledPolicy,
+        active_proxy: &str,
+    ) {
+        self.record_invalid_proxy_selection(&policy.main_proxy_group, active_proxy);
+        let source_groups = policy
+            .managed_proxy_groups
+            .iter()
+            .filter(|managed| {
+                managed.name == policy.main_proxy_group
+                    && managed.proxies.iter().any(|member| member == active_proxy)
+            })
+            .map(|managed| managed.source_group.clone())
+            .collect::<Vec<_>>();
+        for source_group in source_groups {
+            self.record_invalid_proxy_selection(&source_group, active_proxy);
         }
     }
 }
@@ -2097,6 +2141,31 @@ impl MihomoManager {
             }
         }
         Err(anyhow!(failures.join("; ")))
+    }
+
+    async fn active_proxy_selection(
+        &self,
+        proxy_group: &str,
+        controller_port: u16,
+        secret: &str,
+    ) -> Result<String> {
+        let client = reqwest::Client::builder()
+            .timeout(MIHOMO_CONTROLLER_REQUEST_TIMEOUT)
+            .build()?;
+        let mut request = client.get(format!("http://{LOCALHOST}:{controller_port}/proxies"));
+        if !secret.is_empty() {
+            request = request.bearer_auth(secret);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(anyhow!("Mihomo proxy catalog returned HTTP {status}"));
+        }
+        let catalog = response
+            .json::<serde_json::Value>()
+            .await
+            .context("failed to decode active Mihomo proxy groups")?;
+        active_proxy_selection(&catalog, proxy_group)
     }
 
     async fn close_connections(&self, controller_port: u16, secret: &str) -> Result<()> {
@@ -4675,6 +4744,88 @@ start "zapret: general (ALT9)" /min "%BIN%winws.exe" --wf-tcp=80,443,%GameFilter
         manager.clear_invalid_proxy_selection("PROXY", "Dead two");
         let rejected = manager.invalid_proxy_selections.get("PROXY").unwrap();
         assert_eq!(rejected, &BTreeSet::from(["Dead one".to_string()]));
+    }
+
+    #[test]
+    fn active_main_proxy_is_invalidated_even_when_saved_selection_differs() {
+        let mut manager = RuntimeManager::new();
+        let mut request = test_request();
+        request
+            .selected_proxies
+            .insert("Primary".to_string(), "Germany".to_string());
+        manager.last_request = Some(request);
+        let policy = CompiledPolicy {
+            mode: AppRouteMode::VpnOnly,
+            mihomo_rules: vec!["MATCH,__BADVPN_VPN_ONLY__".to_string()],
+            zapret_hostlist: Vec::new(),
+            zapret_hostlist_exclude: Vec::new(),
+            zapret_ipset: Vec::new(),
+            zapret_ipset_exclude: Vec::new(),
+            dns_nameserver_policy: Vec::new(),
+            diagnostics_expectations: Vec::new(),
+            diagnostics_messages: Vec::new(),
+            suppressed_rules: Vec::new(),
+            main_proxy_group: "__BADVPN_VPN_ONLY__".to_string(),
+            policy_rules: Vec::new(),
+            should_create_canonical_proxy_group: false,
+            managed_proxy_groups: vec![ManagedProxyGroup {
+                name: "__BADVPN_VPN_ONLY__".to_string(),
+                source_group: "Primary".to_string(),
+                proxies: vec!["Germany".to_string(), "Turkey".to_string()],
+            }],
+        };
+
+        // Mihomo restored Turkey through store-selected even though the request saved Germany.
+        let catalog = serde_json::json!({
+            "proxies": {
+                "__BADVPN_VPN_ONLY__": {
+                    "type": "Selector",
+                    "all": ["Germany", "Turkey"],
+                    "now": "Turkey"
+                }
+            }
+        });
+        let tested_proxy = active_proxy_selection(&catalog, "__BADVPN_VPN_ONLY__").unwrap();
+        manager.record_invalid_active_proxy_for_policy(&policy, &tested_proxy);
+
+        assert!(manager
+            .invalid_proxy_selections
+            .get("__BADVPN_VPN_ONLY__")
+            .is_some_and(|nodes| nodes.contains("Turkey")));
+        assert!(manager
+            .invalid_proxy_selections
+            .get("Primary")
+            .is_some_and(|nodes| nodes.contains("Turkey")));
+        assert_eq!(
+            manager
+                .last_request
+                .as_ref()
+                .unwrap()
+                .selected_proxies
+                .get("Primary"),
+            Some(&"Germany".to_string())
+        );
+    }
+
+    #[test]
+    fn request_normalization_removes_only_blacklisted_proxy_before_state_is_saved() {
+        let mut manager = RuntimeManager::new();
+        manager.record_invalid_proxy_selection("Primary", "Dead node");
+        let mut request = test_request();
+        request
+            .selected_proxies
+            .insert("Primary".to_string(), "Dead node".to_string());
+        request
+            .selected_proxies
+            .insert("Secondary".to_string(), "Working node".to_string());
+
+        manager.normalize_request_proxy_selections(&mut request);
+        manager.last_request = Some(request);
+        manager.invalid_proxy_selections.clear();
+
+        let selected = &manager.last_request.as_ref().unwrap().selected_proxies;
+        assert!(!selected.contains_key("Primary"));
+        assert_eq!(selected.get("Secondary"), Some(&"Working node".to_string()));
     }
 
     #[test]
