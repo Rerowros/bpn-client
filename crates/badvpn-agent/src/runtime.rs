@@ -437,12 +437,12 @@ impl RuntimeManager {
             )
             .await
         {
-            // Soft-fail: controller readiness already proved Mihomo is up. Remote
-            // /delay probes can false-negative on networks that block the probe URLs.
-            tracing::warn!(%error, "Mihomo proxy egress verification failed; continuing");
-            self.snapshot.diagnostics.push(format!(
-                "Proxy egress probe warning (connect continues): {error}"
-            ));
+            tracing::error!(%error, "Mihomo proxy egress verification failed");
+            let message = format!(
+                "Mihomo proxy egress verification failed; connection was not started: {error}"
+            );
+            self.abort_started_connect(message);
+            return Ok(self.snapshot.clone());
         }
         timeline.mark("proxy_egress_ms");
         if request.settings.diagnostics.discord_youtube_probes
@@ -1038,6 +1038,25 @@ impl RuntimeManager {
         self.refresh_process_state();
     }
 
+    fn abort_started_connect(&mut self, message: String) {
+        if let Err(error) = self.mihomo.stop() {
+            self.snapshot.diagnostics.push(format!(
+                "Failed to stop Mihomo after startup failure: {error}"
+            ));
+        }
+        if let Err(error) = self.config_store.rollback_run() {
+            self.snapshot.diagnostics.push(format!(
+                "Failed to roll back Mihomo config after startup failure: {error}"
+            ));
+        }
+        if let Err(error) = self.zapret.stop() {
+            self.snapshot.diagnostics.push(format!(
+                "Failed to stop winws after startup failure: {error}"
+            ));
+        }
+        self.set_error(message);
+    }
+
     fn handle_late_mihomo_death(&mut self) {
         if !matches!(
             self.snapshot.phase,
@@ -1533,6 +1552,11 @@ impl RuntimeConfigStore {
         let last_working = self.last_working_path();
         if last_working.exists() {
             fs::copy(last_working, self.run_path())?;
+        } else {
+            let run_path = self.run_path();
+            if run_path.exists() {
+                fs::remove_file(run_path)?;
+            }
         }
         Ok(())
     }
@@ -4450,6 +4474,81 @@ mod tests {
             "good: true\n"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_startup_egress_probe_stops_runtime_and_rolls_back_config() {
+        let root = std::env::temp_dir().join(format!(
+            "badvpn-egress-failure-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = RuntimeConfigStore { root: root.clone() };
+        fs::create_dir_all(&root).unwrap();
+        fs::write(store.run_path(), "new: unverified\n").unwrap();
+        fs::write(store.last_working_path(), "old: verified\n").unwrap();
+
+        let mut manager = RuntimeManager::new();
+        manager.config_store = store.clone();
+        manager.snapshot.phase = RuntimePhase::Verifying;
+        manager.snapshot.active_config_id = Some("unverified".to_string());
+        manager.snapshot.mihomo =
+            RuntimeComponentSnapshot::new(RuntimeComponentState::Running, None);
+        manager.snapshot.zapret =
+            RuntimeComponentSnapshot::new(RuntimeComponentState::Running, None);
+
+        manager.abort_started_connect(
+            "Mihomo proxy egress verification failed; connection was not started".to_string(),
+        );
+
+        assert_eq!(manager.snapshot.phase, RuntimePhase::Error);
+        assert_eq!(
+            manager.snapshot.mihomo.state,
+            RuntimeComponentState::Stopped
+        );
+        assert_eq!(
+            manager.snapshot.zapret.state,
+            RuntimeComponentState::Stopped
+        );
+        assert!(manager.snapshot.active_config_id.is_none());
+        assert!(manager
+            .snapshot
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("proxy egress verification failed"));
+        assert_eq!(
+            fs::read_to_string(store.run_path()).unwrap(),
+            "old: verified\n"
+        );
+
+        let _ = fs::remove_dir_all(root);
+
+        let first_connect_root = std::env::temp_dir().join(format!(
+            "badvpn-first-egress-failure-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let first_connect_store = RuntimeConfigStore {
+            root: first_connect_root.clone(),
+        };
+        fs::create_dir_all(&first_connect_root).unwrap();
+        fs::write(first_connect_store.run_path(), "new: unverified\n").unwrap();
+
+        let mut first_connect_manager = RuntimeManager::new();
+        first_connect_manager.config_store = first_connect_store.clone();
+        first_connect_manager.abort_started_connect(
+            "Mihomo proxy egress verification failed; connection was not started".to_string(),
+        );
+
+        assert!(!first_connect_store.run_path().exists());
+        let _ = fs::remove_dir_all(first_connect_root);
     }
 
     #[test]

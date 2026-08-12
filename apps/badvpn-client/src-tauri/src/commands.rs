@@ -5854,8 +5854,10 @@ if (Test-Path -LiteralPath $sourceComponents) {{
   }}
   New-Item -ItemType Directory -Path $targetComponents -Force | Out-Null
   # /E copies recursively without deleting destination files that are absent from source.
+  # /IS and /IT force source content to replace destination files even when release
+  # timestamps or other metadata would otherwise make robocopy skip them.
   # Never use /MIR here: an incomplete AppData tree must not wipe ProgramData assets.
-  robocopy $sourceComponents $targetComponents /E /XO /NFL /NDL /NJH /NJS /NP | Out-Null
+  robocopy $sourceComponents $targetComponents /E /IS /IT /NFL /NDL /NJH /NJS /NP | Out-Null
   if ($LASTEXITCODE -gt 7) {{ throw "component staging failed with robocopy exit code $LASTEXITCODE" }}
   $global:LASTEXITCODE = 0
 }}
@@ -5863,7 +5865,7 @@ $sourceLists = '{source_lists}'
 $targetLists = '{target_lists}'
 if (Test-Path -LiteralPath $sourceLists) {{
   New-Item -ItemType Directory -Path $targetLists -Force | Out-Null
-  robocopy $sourceLists $targetLists /E /XO /NFL /NDL /NJH /NJS /NP | Out-Null
+  robocopy $sourceLists $targetLists /E /IS /IT /NFL /NDL /NJH /NJS /NP | Out-Null
   if ($LASTEXITCODE -gt 7) {{ throw "Flowseal list staging failed with robocopy exit code $LASTEXITCODE" }}
   $global:LASTEXITCODE = 0
 }}
@@ -10189,6 +10191,32 @@ fn normalize_subscription_profile_description(
 #[cfg(test)]
 mod redaction_tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn programdata_staging_overwrites_files_regardless_of_timestamps() {
+        let script = stage_runtime_assets_powershell().unwrap();
+        let robocopy_lines = script
+            .lines()
+            .filter(|line| line.trim_start().starts_with("robocopy "))
+            .collect::<Vec<_>>();
+
+        assert_eq!(robocopy_lines.len(), 2);
+        for line in robocopy_lines {
+            assert!(
+                line.contains(" /E /IS /IT "),
+                "unexpected staging flags: {line}"
+            );
+            assert!(
+                !line.contains("/XO"),
+                "staging must not skip older sources: {line}"
+            );
+            assert!(
+                !line.contains("/MIR"),
+                "staging must not delete extra assets: {line}"
+            );
+        }
+    }
 
     #[test]
     fn proxy_selection_validation_rejects_stale_group_and_unknown_member() {
