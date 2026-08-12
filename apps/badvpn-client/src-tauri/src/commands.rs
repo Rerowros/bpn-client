@@ -675,7 +675,16 @@ fn apply_agent_unreachable_state(error: String) -> Result<AgentState, String> {
 }
 
 fn should_use_agent_runtime() -> bool {
-    std::env::var("BADVPN_LEGACY_RUNTIME").ok().as_deref() != Some("1")
+    // Release builds are service-first only. Legacy GUI-owned Mihomo/winws spawn
+    // remains available in debug builds behind BADVPN_LEGACY_RUNTIME=1.
+    #[cfg(not(debug_assertions))]
+    {
+        true
+    }
+    #[cfg(debug_assertions)]
+    {
+        std::env::var("BADVPN_LEGACY_RUNTIME").ok().as_deref() != Some("1")
+    }
 }
 
 fn send_agent_command(command: AgentCommand, spawn_if_missing: bool) -> Result<AgentState, String> {

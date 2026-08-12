@@ -60,6 +60,8 @@ Preflight should cover mixed/controller ports, DNS port `1053` TCP/UDP, managed 
 - Runtime update/repair should eventually download, verify, stage, swap, smoke-check, and rollback entirely inside `badvpn-agent`.
 - `badvpn-agent` resolves components only under ProgramData / `BADVPN_AGENT_DATA_DIR` (plus explicit `BADVPN_MIHOMO_BIN` / `BADVPN_WINWS_BIN` overrides). It does not fall back to `%APPDATA%`.
 - A background agent watchdog polls late winws death and applies VPN Only fallback even when the GUI is closed.
+- Desired runtime state is persisted under `%PROGRAMDATA%\BadVpn\runtime\desired-state.json` (no subscription URLs/secrets). After agent/service restart, orphaned owned processes are cleaned and the agent enters **Safe Mode** asking the UI to reconnect manually (no auto-reconnect).
+- Release builds force service-first runtime; `BADVPN_LEGACY_RUNTIME=1` is debug-only.
 
 ## Logs And Secrets
 
@@ -89,5 +91,5 @@ Checks include:
 ## Open Runtime Gaps
 
 - Move final component update download/verify/swap ownership from GUI-assisted staging into `badvpn-agent`.
-- Finish reboot recovery and reattach-to-existing-owned-process logic.
-- Expand `RunDiagnostics` beyond the current component snapshot into WinDivert/BFE, route, DNS, controller traffic, and HTTPS checks.
+- Expand Job Object kill-on-close for owned Mihomo/winws children (startup recovery currently cleans orphans and enters Safe Mode instead of auto-reconnect).
+- Expand `RunDiagnostics` with deeper WinDivert/BFE driver probes beyond current service/process snapshot checks.

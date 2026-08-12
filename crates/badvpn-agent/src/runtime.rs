@@ -24,10 +24,60 @@ const LOCALHOST: &str = "127.0.0.1";
 const BADVPN_DNS_PORT: u16 = 1053;
 const POLICY_DIAGNOSTIC_SAMPLE_LIMIT: usize = 5;
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct DesiredRuntimeState {
+    connected: bool,
+    desired_mode: RuntimeMode,
+    effective_mode: RuntimeMode,
+    controller_port: u16,
+    mixed_port: u16,
+    updated_at_unix: u64,
+    /// Present after an unclean agent restart while a session was marked connected.
+    safe_mode: bool,
+    message: Option<String>,
+}
+
+impl DesiredRuntimeState {
+    fn path() -> PathBuf {
+        runtime_root_dir()
+            .join("runtime")
+            .join("desired-state.json")
+    }
+
+    fn write(&self) -> Result<()> {
+        let path = Self::path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(self)?;
+        write_file_atomically(&path, &json)
+    }
+
+    fn read() -> Option<Self> {
+        let content = fs::read_to_string(Self::path()).ok()?;
+        serde_json::from_str(&content).ok()
+    }
+
+    fn clear_connected() -> Result<()> {
+        let state = Self {
+            connected: false,
+            desired_mode: RuntimeMode::Smart,
+            effective_mode: RuntimeMode::Smart,
+            controller_port: 9090,
+            mixed_port: 7890,
+            updated_at_unix: now_unix(),
+            safe_mode: false,
+            message: None,
+        };
+        state.write()
+    }
+}
+
 #[derive(Debug)]
 pub struct RuntimeManager {
     snapshot: AgentRuntimeSnapshot,
     last_request: Option<ConnectRequest>,
+    last_metrics: badvpn_common::TrafficMetrics,
     config_store: RuntimeConfigStore,
     component_store: ComponentStore,
     mihomo: MihomoManager,
@@ -41,6 +91,7 @@ impl RuntimeManager {
         Self {
             snapshot: AgentRuntimeSnapshot::default(),
             last_request: None,
+            last_metrics: badvpn_common::TrafficMetrics::default(),
             config_store: RuntimeConfigStore::default(),
             component_store,
             mihomo: MihomoManager::default(),
@@ -68,7 +119,29 @@ impl RuntimeManager {
             }
         }
         self.record_late_zapret_death_if_needed();
+        if self.mihomo.is_running() {
+            let port = self.last_controller_port();
+            let secret = self.config_store.controller_secret().unwrap_or_default();
+            if let Ok(metrics) = self.mihomo.fetch_traffic_metrics(port, &secret).await {
+                self.last_metrics = metrics;
+            }
+        } else {
+            self.last_metrics = badvpn_common::TrafficMetrics::default();
+        }
         self.snapshot.clone()
+    }
+
+    pub fn last_metrics(&self) -> badvpn_common::TrafficMetrics {
+        self.last_metrics
+    }
+
+    pub fn to_agent_state(&self, subscription: SubscriptionState) -> badvpn_common::AgentState {
+        snapshot_to_agent_state(
+            &self.snapshot,
+            subscription,
+            self.remembered_selected_proxy(),
+            self.last_metrics,
+        )
     }
 
     pub fn active_policy(&self) -> Option<&CompiledPolicy> {
@@ -510,6 +583,20 @@ impl RuntimeManager {
         }
         self.snapshot.last_error = None;
         self.snapshot.diagnostics.push(timeline.summary());
+        if let Err(error) = (DesiredRuntimeState {
+            connected: true,
+            desired_mode: request.route_mode,
+            effective_mode,
+            controller_port: request.settings.mihomo.controller_port,
+            mixed_port: request.settings.mihomo.mixed_port,
+            updated_at_unix: now_unix(),
+            safe_mode: false,
+            message: None,
+        })
+        .write()
+        {
+            tracing::warn!(%error, "failed to persist desired runtime state");
+        }
         tracing::info!(
             phase = ?self.snapshot.phase,
             effective_mode = ?self.snapshot.effective_mode,
@@ -541,6 +628,7 @@ impl RuntimeManager {
         self.mihomo.stop()?;
         self.zapret.stop()?;
         self.active_policy = None;
+        self.last_metrics = badvpn_common::TrafficMetrics::default();
         self.snapshot.phase = RuntimePhase::Idle;
         self.snapshot.effective_mode = self.snapshot.desired_mode;
         self.snapshot.mihomo = RuntimeComponentSnapshot::default();
@@ -550,6 +638,9 @@ impl RuntimeManager {
         self.snapshot
             .diagnostics
             .push("Stopped BadVpn-owned Mihomo and winws processes.".to_string());
+        if let Err(error) = DesiredRuntimeState::clear_connected() {
+            tracing::warn!(%error, "failed to clear desired runtime state");
+        }
         tracing::info!("runtime stop finished");
         Ok(self.snapshot.clone())
     }
@@ -1832,6 +1923,34 @@ impl MihomoManager {
         }
         let _ = request.send().await?;
         Ok(())
+    }
+
+    async fn fetch_traffic_metrics(
+        &self,
+        controller_port: u16,
+        secret: &str,
+    ) -> Result<badvpn_common::TrafficMetrics> {
+        let client = reqwest::Client::builder()
+            .timeout(MIHOMO_CONTROLLER_REQUEST_TIMEOUT)
+            .build()?;
+        let mut request = client.get(format!("http://{LOCALHOST}:{controller_port}/connections"));
+        if !secret.is_empty() {
+            request = request.bearer_auth(secret);
+        }
+        let response = request.send().await?;
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "Mihomo connections returned HTTP {}",
+                response.status()
+            ));
+        }
+        let value = response.json::<serde_json::Value>().await?;
+        let upload_bytes = json_u64(&value, "uploadTotal").unwrap_or(0);
+        let download_bytes = json_u64(&value, "downloadTotal").unwrap_or(0);
+        Ok(badvpn_common::TrafficMetrics {
+            upload_bytes,
+            download_bytes,
+        })
     }
 
     fn stop(&mut self) -> Result<()> {
@@ -3582,6 +3701,15 @@ fn appdata_root_dir() -> Option<PathBuf> {
         .map(|path| PathBuf::from(path).join("BadVpn"))
 }
 
+fn json_u64(value: &serde_json::Value, key: &str) -> Option<u64> {
+    let field = value.get(key)?;
+    field
+        .as_u64()
+        .or_else(|| field.as_i64().map(|v| v.max(0) as u64))
+        .or_else(|| field.as_f64().map(|v| v.max(0.0) as u64))
+        .or_else(|| field.as_str()?.parse::<u64>().ok())
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3593,6 +3721,7 @@ pub fn snapshot_to_agent_state(
     snapshot: &AgentRuntimeSnapshot,
     subscription: SubscriptionState,
     selected_proxy: Option<String>,
+    metrics: badvpn_common::TrafficMetrics,
 ) -> badvpn_common::AgentState {
     let running = matches!(
         snapshot.phase,
@@ -3632,7 +3761,7 @@ pub fn snapshot_to_agent_state(
             selected_proxy,
             route_mode: snapshot.effective_mode.as_route_mode(),
         },
-        metrics: badvpn_common::TrafficMetrics::default(),
+        metrics,
         diagnostics: badvpn_common::DiagnosticSummary {
             mihomo_healthy: snapshot.mihomo.state == RuntimeComponentState::Running,
             zapret_healthy: snapshot.zapret.state == RuntimeComponentState::Running,
@@ -3645,6 +3774,89 @@ pub fn snapshot_to_agent_state(
 pub fn cleanup_legacy_zapret_service() -> Result<String> {
     stop_legacy_zapret_service()?;
     Ok("Legacy BadVpnZapret service stop was requested; badvpn-agent owns winws now.".to_string())
+}
+
+/// After agent/service restart, clean up orphaned owned processes and enter Safe Mode
+/// instead of auto-reconnecting. Product default: manual Connect from the UI.
+pub fn safe_mode_message() -> Option<String> {
+    let desired = DesiredRuntimeState::read()?;
+    if desired.safe_mode {
+        desired.message.or_else(|| {
+            Some(
+                "Safe Mode: reconnect from the UI after the agent restarted during a session."
+                    .to_string(),
+            )
+        })
+    } else {
+        None
+    }
+}
+
+pub fn recover_after_agent_restart() -> Result<String> {
+    let mut messages = Vec::new();
+    let desired = DesiredRuntimeState::read();
+    let component_store = ComponentStore::default();
+    let managed_mihomo = component_store.mihomo_bin().ok();
+    let managed_winws = component_store.winws_bin().ok();
+
+    let mihomo_processes = running_process_details(&["mihomo.exe"]);
+    for message in
+        cleanup_stale_managed_mihomo_processes(&mihomo_processes, managed_mihomo.as_deref())
+    {
+        messages.push(message);
+    }
+    let zapret_processes = running_process_details(&["winws.exe"]);
+    let (external, stale) =
+        classify_zapret_preflight_processes(&zapret_processes, managed_winws.as_deref());
+    messages.extend(stale);
+    if !external.is_empty() {
+        messages.push(format!(
+            "External DPI processes still present after recovery: {}",
+            external.join(", ")
+        ));
+    }
+
+    let was_connected = desired.as_ref().is_some_and(|state| state.connected);
+    if was_connected || !messages.is_empty() {
+        let message = if was_connected {
+            "Safe Mode: badvpn-agent restarted while a session was marked connected. Orphaned owned processes were cleaned up when possible. Reconnect from the UI to restore VPN.".to_string()
+        } else {
+            "Agent startup recovery cleaned stale owned processes.".to_string()
+        };
+        let state = DesiredRuntimeState {
+            connected: false,
+            desired_mode: desired
+                .as_ref()
+                .map(|state| state.desired_mode)
+                .unwrap_or(RuntimeMode::Smart),
+            effective_mode: desired
+                .as_ref()
+                .map(|state| state.effective_mode)
+                .unwrap_or(RuntimeMode::Smart),
+            controller_port: desired
+                .as_ref()
+                .map(|state| state.controller_port)
+                .unwrap_or(9090),
+            mixed_port: desired
+                .as_ref()
+                .map(|state| state.mixed_port)
+                .unwrap_or(7890),
+            updated_at_unix: now_unix(),
+            safe_mode: was_connected,
+            message: Some(message.clone()),
+        };
+        let _ = state.write();
+        messages.insert(0, message);
+    }
+
+    if messages.is_empty() {
+        Ok(
+            "Agent recovery: no orphaned owned processes and no prior connected session."
+                .to_string(),
+        )
+    } else {
+        Ok(messages.join(" "))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3785,6 +3997,29 @@ mod architecture_fix_tests {
         assert!(!first["badvpn-".len()..]
             .chars()
             .all(|ch| ch.is_ascii_digit()));
+    }
+
+    #[test]
+    fn desired_runtime_state_round_trips_safe_mode_flag() {
+        let root = std::env::temp_dir().join(format!("badvpn-desired-{}", now_unix()));
+        std::env::set_var("BADVPN_AGENT_DATA_DIR", &root);
+        let state = DesiredRuntimeState {
+            connected: false,
+            desired_mode: RuntimeMode::Smart,
+            effective_mode: RuntimeMode::VpnOnly,
+            controller_port: 9090,
+            mixed_port: 7890,
+            updated_at_unix: now_unix(),
+            safe_mode: true,
+            message: Some("Safe Mode test".to_string()),
+        };
+        state.write().unwrap();
+        let loaded = DesiredRuntimeState::read().expect("desired state should load");
+        assert!(loaded.safe_mode);
+        assert_eq!(loaded.message.as_deref(), Some("Safe Mode test"));
+        assert_eq!(safe_mode_message().as_deref(), Some("Safe Mode test"));
+        let _ = fs::remove_dir_all(root);
+        std::env::remove_var("BADVPN_AGENT_DATA_DIR");
     }
 
     #[test]
@@ -3954,7 +4189,12 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("VPN routing is no longer active"));
-        let state = snapshot_to_agent_state(&manager.snapshot, SubscriptionState::default(), None);
+        let state = snapshot_to_agent_state(
+            &manager.snapshot,
+            SubscriptionState::default(),
+            None,
+            Default::default(),
+        );
         assert!(!state.running);
         assert!(!state.connection.connected);
         assert_eq!(state.phase, badvpn_common::AppPhase::Error);

@@ -13,10 +13,7 @@ use std::{
 use tokio::sync::Mutex;
 
 use crate::{
-    runtime::{
-        cleanup_legacy_zapret_service, repair_windows_network_state, snapshot_to_agent_state,
-        RuntimeManager,
-    },
+    runtime::{cleanup_legacy_zapret_service, repair_windows_network_state, RuntimeManager},
     security::redact_url,
     service,
     state::AgentRuntimeState,
@@ -89,11 +86,12 @@ impl AgentController {
                     }
                 }
                 let snapshot = guard.manager.snapshot();
-                guard.runtime = AgentRuntimeState::from_agent_state(snapshot_to_agent_state(
-                    &snapshot,
-                    guard.runtime.subscription.clone(),
-                    guard.manager.remembered_selected_proxy(),
-                ));
+                let _ = snapshot;
+                guard.runtime = AgentRuntimeState::from_agent_state(
+                    guard
+                        .manager
+                        .to_agent_state(guard.runtime.subscription.clone()),
+                );
                 if let Ok(mut slot) = progress.write() {
                     *slot = guard.runtime.snapshot();
                 }
@@ -147,12 +145,27 @@ impl AgentController {
         }
 
         let mut guard = self.inner.lock().await;
-        let snapshot = guard.manager.status_snapshot().await;
-        guard.runtime = AgentRuntimeState::from_agent_state(snapshot_to_agent_state(
-            &snapshot,
-            guard.runtime.subscription.clone(),
-            guard.manager.remembered_selected_proxy(),
-        ));
+        let _snapshot = guard.manager.status_snapshot().await;
+        guard.runtime = AgentRuntimeState::from_agent_state(
+            guard
+                .manager
+                .to_agent_state(guard.runtime.subscription.clone()),
+        );
+        if let Some(message) = crate::runtime::safe_mode_message() {
+            let existing = guard
+                .runtime
+                .diagnostics
+                .message
+                .clone()
+                .unwrap_or_default();
+            if !existing.contains(message.as_str()) {
+                guard.runtime.diagnostics.message = Some(if existing.is_empty() {
+                    message
+                } else {
+                    format!("{message} {existing}")
+                });
+            }
+        }
         let state = guard.runtime.snapshot();
         if let Ok(mut progress) = self.progress.write() {
             *progress = state.clone();
@@ -218,12 +231,12 @@ impl AgentController {
             };
             let mut guard = inner.lock().await;
             match result {
-                Ok(snapshot) => {
-                    guard.runtime = AgentRuntimeState::from_agent_state(snapshot_to_agent_state(
-                        &snapshot,
-                        guard.runtime.subscription.clone(),
-                        guard.manager.remembered_selected_proxy(),
-                    ));
+                Ok(_snapshot) => {
+                    guard.runtime = AgentRuntimeState::from_agent_state(
+                        guard
+                            .manager
+                            .to_agent_state(guard.runtime.subscription.clone()),
+                    );
                 }
                 Err(error) => {
                     if cancel.load(Ordering::SeqCst) {
@@ -257,16 +270,16 @@ impl AgentController {
         }
 
         let mut guard = self.inner.lock().await;
-        let snapshot = guard
+        let _snapshot = guard
             .manager
             .stop()
             .await
             .map_err(|error| BadVpnError::OperationFailed(error.to_string()))?;
-        guard.runtime = AgentRuntimeState::from_agent_state(snapshot_to_agent_state(
-            &snapshot,
-            guard.runtime.subscription.clone(),
-            guard.manager.remembered_selected_proxy(),
-        ));
+        guard.runtime = AgentRuntimeState::from_agent_state(
+            guard
+                .manager
+                .to_agent_state(guard.runtime.subscription.clone()),
+        );
         guard.runtime.clear_error();
         Ok(guard.runtime.snapshot())
     }
@@ -278,12 +291,12 @@ impl AgentController {
             self.connecting.store(false, Ordering::SeqCst);
         }
         let mut guard = self.inner.lock().await;
-        let snapshot = guard.manager.stop().await?;
-        guard.runtime = AgentRuntimeState::from_agent_state(snapshot_to_agent_state(
-            &snapshot,
-            guard.runtime.subscription.clone(),
-            guard.manager.remembered_selected_proxy(),
-        ));
+        let _snapshot = guard.manager.stop().await?;
+        guard.runtime = AgentRuntimeState::from_agent_state(
+            guard
+                .manager
+                .to_agent_state(guard.runtime.subscription.clone()),
+        );
         guard.runtime.clear_error();
         Ok(())
     }
@@ -316,11 +329,11 @@ impl AgentController {
             .select_proxy(group.trim(), proxy.trim())
             .await
             .map_err(|error| BadVpnError::OperationFailed(error.to_string()))?;
-        guard.runtime = AgentRuntimeState::from_agent_state(snapshot_to_agent_state(
-            &snapshot,
-            guard.runtime.subscription.clone(),
-            guard.manager.remembered_selected_proxy(),
-        ));
+        guard.runtime = AgentRuntimeState::from_agent_state(
+            guard
+                .manager
+                .to_agent_state(guard.runtime.subscription.clone()),
+        );
         Ok(guard.runtime.snapshot())
     }
 
@@ -369,11 +382,49 @@ impl AgentController {
 
     async fn run_diagnostics(&mut self) -> BadVpnResult<AgentState> {
         let mut guard = self.inner.lock().await;
+        let _ = guard.manager.status_snapshot().await;
         let snapshot = guard.manager.snapshot();
+        let mut messages = Vec::new();
+        messages.push(format!(
+            "phase={:?} desired={:?} effective={:?}",
+            snapshot.phase, snapshot.desired_mode, snapshot.effective_mode
+        ));
+        messages.push(format!(
+            "mihomo={:?} zapret={:?} windivert={:?}",
+            snapshot.mihomo.state, snapshot.zapret.state, snapshot.windivert.state
+        ));
+        if let Some(detail) = snapshot.mihomo.detail.as_deref() {
+            messages.push(format!("mihomo_detail={detail}"));
+        }
+        if let Some(detail) = snapshot.zapret.detail.as_deref() {
+            messages.push(format!("zapret_detail={detail}"));
+        }
+        for check in snapshot.preflight.iter().take(8) {
+            messages.push(format!(
+                "preflight:{}:{}:{}",
+                check.component, check.id, check.message
+            ));
+        }
+        if let Some(safe) = crate::runtime::safe_mode_message() {
+            messages.push(safe);
+        }
+        let service = service::status();
+        messages.push(format!(
+            "agent_service installed={} running={} state={:?}",
+            service.installed, service.running, service.state
+        ));
+        for note in snapshot.diagnostics.iter().rev().take(5).rev() {
+            messages.push(note.clone());
+        }
+        guard.runtime = AgentRuntimeState::from_agent_state(
+            guard
+                .manager
+                .to_agent_state(guard.runtime.subscription.clone()),
+        );
         guard.runtime.diagnostics = DiagnosticSummary {
             mihomo_healthy: snapshot.mihomo.state == badvpn_common::RuntimeComponentState::Running,
             zapret_healthy: snapshot.zapret.state == badvpn_common::RuntimeComponentState::Running,
-            message: Some("Service-first runtime manager diagnostics are available.".to_string()),
+            message: Some(messages.join(" | ")),
         };
         Ok(guard.runtime.snapshot())
     }
