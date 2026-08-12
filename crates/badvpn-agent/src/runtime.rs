@@ -1174,10 +1174,11 @@ impl RuntimeManager {
             .as_ref()
             .map(|policy| policy.main_proxy_group.as_str())
             .filter(|main| targets.iter().any(|target| target.group == *main))
-            .unwrap_or(group);
+            .unwrap_or(group)
+            .to_string();
         if let Err(error) = self
             .mihomo
-            .verify_proxy_egress(verify_group, controller_port, &secret)
+            .verify_proxy_egress(&verify_group, controller_port, &secret)
             .await
         {
             let rollback_errors =
@@ -1189,7 +1190,39 @@ impl RuntimeManager {
         self.snapshot
             .diagnostics
             .push(format!("Selected a new proxy in Mihomo group '{group}'."));
-        if self.snapshot.phase == RuntimePhase::Error {
+        let recovery_gate = proxy_recovery_gate(
+            self.snapshot.phase,
+            self.active_policy.as_ref(),
+            &verify_group,
+        );
+        let recovery_verified = match recovery_gate {
+            ProxyRecoveryGate::NotRecovering => false,
+            ProxyRecoveryGate::MainAlreadyVerified => true,
+            ProxyRecoveryGate::VerifyMain(main_group) => {
+                match self
+                    .mihomo
+                    .verify_proxy_egress(&main_group, controller_port, &secret)
+                    .await
+                {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(%error, %main_group, "selected proxy passed egress, but the active main route is still unavailable");
+                        self.snapshot.diagnostics.push(format!(
+                            "Selected proxy in '{group}' was saved, but the active VPN route '{main_group}' still failed egress verification: {error}"
+                        ));
+                        false
+                    }
+                }
+            }
+            ProxyRecoveryGate::MissingActivePolicy => {
+                self.snapshot.diagnostics.push(
+                    "Selected proxy was saved, but recovery could not verify the active VPN route because no active policy is available."
+                        .to_string(),
+                );
+                false
+            }
+        };
+        if recovery_verified {
             let desired = self.snapshot.desired_mode;
             let effective = self.snapshot.effective_mode;
             self.snapshot.phase = runtime_phase_after_connect(desired, effective);
@@ -1359,6 +1392,32 @@ impl RuntimeManager {
 struct ActiveProxySelectionTarget {
     group: String,
     previous_proxy: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProxyRecoveryGate {
+    NotRecovering,
+    MainAlreadyVerified,
+    VerifyMain(String),
+    MissingActivePolicy,
+}
+
+fn proxy_recovery_gate(
+    phase: RuntimePhase,
+    policy: Option<&CompiledPolicy>,
+    verified_group: &str,
+) -> ProxyRecoveryGate {
+    if phase != RuntimePhase::Error {
+        return ProxyRecoveryGate::NotRecovering;
+    }
+    let Some(main_group) = policy.map(|policy| policy.main_proxy_group.as_str()) else {
+        return ProxyRecoveryGate::MissingActivePolicy;
+    };
+    if main_group == verified_group {
+        ProxyRecoveryGate::MainAlreadyVerified
+    } else {
+        ProxyRecoveryGate::VerifyMain(main_group.to_string())
+    }
 }
 
 fn proxy_selection_targets(
@@ -4168,6 +4227,23 @@ mod tests {
                     previous_proxy: "Germany".to_string(),
                 },
             ]
+        );
+
+        assert_eq!(
+            proxy_recovery_gate(RuntimePhase::Error, Some(&policy), "A Secondary"),
+            ProxyRecoveryGate::VerifyMain("__BADVPN_VPN_ONLY__".to_string())
+        );
+        assert_eq!(
+            proxy_recovery_gate(RuntimePhase::Error, Some(&policy), "__BADVPN_VPN_ONLY__"),
+            ProxyRecoveryGate::MainAlreadyVerified
+        );
+        assert_eq!(
+            proxy_recovery_gate(RuntimePhase::Running, Some(&policy), "A Secondary"),
+            ProxyRecoveryGate::NotRecovering
+        );
+        assert_eq!(
+            proxy_recovery_gate(RuntimePhase::Error, None, "A Secondary"),
+            ProxyRecoveryGate::MissingActivePolicy
         );
     }
 
