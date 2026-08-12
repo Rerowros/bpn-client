@@ -405,6 +405,9 @@ impl AgentController {
                 check.component, check.id, check.message
             ));
         }
+        for note in crate::runtime::windivert_and_bfe_diagnostic_notes() {
+            messages.push(note);
+        }
         if let Some(safe) = crate::runtime::safe_mode_message() {
             messages.push(safe);
         }

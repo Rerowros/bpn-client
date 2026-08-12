@@ -1643,6 +1643,7 @@ impl Default for ComponentStore {
 #[derive(Debug, Default)]
 struct MihomoManager {
     child: Option<Child>,
+    job: Option<crate::process_job::ProcessJob>,
     last_exit_detail: Option<String>,
 }
 
@@ -1654,6 +1655,7 @@ impl MihomoManager {
                     self.last_exit_detail =
                         Some(format!("Mihomo exited unexpectedly with {status}"));
                     self.child = None;
+                    self.job = None;
                     false
                 }
                 Ok(None) => true,
@@ -1770,6 +1772,13 @@ impl MihomoManager {
             ));
         }
         tracing::info!(pid = child.id(), "Mihomo child started");
+        self.job = crate::process_job::bind_child_to_kill_on_close_job(&child);
+        if self.job.is_some() {
+            tracing::debug!(
+                pid = child.id(),
+                "Mihomo child bound to kill-on-close Job Object"
+            );
+        }
         self.last_exit_detail = None;
         self.child = Some(child);
         Ok(())
@@ -1963,6 +1972,7 @@ impl MihomoManager {
         } else {
             tracing::debug!("Mihomo stop skipped; no owned child");
         }
+        self.job = None;
         Ok(())
     }
 }
@@ -2011,6 +2021,7 @@ fn join_output_reader(
 #[derive(Debug, Default)]
 struct ZapretManager {
     child: Option<Child>,
+    job: Option<crate::process_job::ProcessJob>,
     last_exit_detail: Option<String>,
 }
 
@@ -2022,6 +2033,7 @@ impl ZapretManager {
                     self.last_exit_detail =
                         Some(format!("winws exited unexpectedly with {status}"));
                     self.child = None;
+                    self.job = None;
                     false
                 }
                 Ok(None) => true,
@@ -2108,6 +2120,13 @@ impl ZapretManager {
             ));
         }
         tracing::info!(pid = child.id(), strategy = %settings.strategy, "winws child started");
+        self.job = crate::process_job::bind_child_to_kill_on_close_job(&child);
+        if self.job.is_some() {
+            tracing::debug!(
+                pid = child.id(),
+                "winws child bound to kill-on-close Job Object"
+            );
+        }
         self.last_exit_detail = None;
         self.child = Some(child);
         Ok(format!(
@@ -2126,6 +2145,7 @@ impl ZapretManager {
         } else {
             tracing::debug!("winws stop skipped; no owned child");
         }
+        self.job = None;
         Ok(())
     }
 }
@@ -3195,13 +3215,107 @@ fn write_file_atomically(path: &Path, content: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension(format!("{}.tmp", now_unix()));
-    fs::write(&tmp, content)?;
-    if path.exists() {
-        fs::remove_file(path)?;
+    let mut nonce = [0_u8; 8];
+    let _ = getrandom::fill(&mut nonce);
+    let mut suffix = String::with_capacity(16);
+    for byte in nonce {
+        suffix.push(char::from_digit((byte >> 4) as u32, 16).unwrap_or('0'));
+        suffix.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap_or('0'));
     }
-    fs::rename(&tmp, path)?;
+    let tmp = path.with_extension(format!("tmp-{suffix}"));
+    fs::write(&tmp, content)?;
+    // Prefer rename-over on platforms that support it; Windows still needs replace.
+    #[cfg(windows)]
+    {
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        fs::rename(&tmp, path)?;
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(&tmp, path)?;
+    }
     Ok(())
+}
+
+pub fn windivert_and_bfe_diagnostic_notes() -> Vec<String> {
+    let mut notes = Vec::new();
+    for (label, names) in [
+        ("WinDivert", &["WinDivert", "WinDivert14"][..]),
+        ("Base Filtering Engine", &["BFE"][..]),
+    ] {
+        match windows_service_states(names) {
+            Some(states)
+                if states
+                    .iter()
+                    .any(|(_, state)| state.eq_ignore_ascii_case("RUNNING")) =>
+            {
+                let detail = states
+                    .iter()
+                    .map(|(name, state)| format!("{name}={state}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                notes.push(format!("{label} service probe: {detail}"));
+            }
+            Some(states) => {
+                let detail = states
+                    .iter()
+                    .map(|(name, state)| format!("{name}={state}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                notes.push(format!(
+                    "{label} service probe: not running ({detail}). WinDivert-based bypass may fail until the driver/service is available."
+                ));
+            }
+            None => notes.push(format!(
+                "{label} service probe unavailable on this platform/runtime."
+            )),
+        }
+    }
+    notes
+}
+
+fn windows_service_states(names: &[&str]) -> Option<Vec<(String, String)>> {
+    #[cfg(windows)]
+    {
+        let mut out = Vec::new();
+        for name in names {
+            let output = Command::new("sc")
+                .args(["query", name])
+                .stdin(Stdio::null())
+                .output()
+                .ok()?;
+            let body = String::from_utf8_lossy(&output.stdout);
+            let state = body
+                .lines()
+                .find_map(|line| {
+                    let line = line.trim();
+                    let lower = line.to_ascii_lowercase();
+                    if lower.starts_with("state") {
+                        line.split_whitespace()
+                            .last()
+                            .map(|value| value.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| {
+                    if output.status.success() {
+                        "UNKNOWN".to_string()
+                    } else {
+                        "MISSING".to_string()
+                    }
+                });
+            out.push(((*name).to_string(), state));
+        }
+        Some(out)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = names;
+        None
+    }
 }
 
 fn preflight_failed(
