@@ -380,12 +380,6 @@ impl RuntimeManager {
         timeline.mark("config_promote_ms");
 
         self.active_policy = Some(runtime_config.policy.clone());
-        if let Err(error) = self
-            .config_store
-            .write_policy_summary(&runtime_config.policy)
-        {
-            tracing::warn!(%error, "failed to write policy summary JSON");
-        }
 
         self.snapshot.phase = RuntimePhase::StartingMihomo;
         self.snapshot.mihomo = RuntimeComponentSnapshot::new(RuntimeComponentState::Starting, None);
@@ -434,9 +428,14 @@ impl RuntimeManager {
                 &runtime_config.policy.main_proxy_group,
                 request.settings.mihomo.controller_port,
                 &runtime_config.secret,
+                cancel,
             )
             .await
         {
+            if cancelled() {
+                self.abort_started_connect(error.to_string());
+                return Err(error);
+            }
             tracing::error!(%error, "Mihomo proxy egress verification failed");
             let message = format!(
                 "Mihomo proxy egress verification failed; connection was not started: {error}"
@@ -445,10 +444,26 @@ impl RuntimeManager {
             return Ok(self.snapshot.clone());
         }
         timeline.mark("proxy_egress_ms");
+        if let Err(error) = check_cancel("proxy_egress") {
+            self.abort_started_connect(error.to_string());
+            return Err(error);
+        }
         if request.settings.diagnostics.discord_youtube_probes
             && effective_mode == RuntimeMode::Smart
         {
-            if let Err(error) = run_discord_youtube_probes().await {
+            let probe_result = tokio::select! {
+                result = run_discord_youtube_probes() => result,
+                () = wait_for_connect_cancel(cancel), if cancel.is_some() => {
+                    let error = anyhow!("connect cancelled during Smart probes");
+                    self.abort_started_connect(error.to_string());
+                    return Err(error);
+                }
+            };
+            if let Err(error) = check_cancel("Smart probes") {
+                self.abort_started_connect(error.to_string());
+                return Err(error);
+            }
+            if let Err(error) = probe_result {
                 tracing::warn!(%error, "Smart probes failed");
                 self.snapshot
                     .diagnostics
@@ -477,9 +492,17 @@ impl RuntimeManager {
                     );
                     self.record_policy_diagnostics(&fallback.policy);
                     let fallback_draft = self.config_store.write_draft(&fallback.yaml)?;
+                    if let Err(error) = check_cancel("Smart probe fallback validation") {
+                        self.abort_started_connect(error.to_string());
+                        return Err(error);
+                    }
                     self.mihomo
                         .validate(&mihomo_bin, &fallback_draft, self.config_store.home_dir())
                         .context("Mihomo rejected VPN-only probe fallback config")?;
+                    if let Err(error) = check_cancel("Smart probe fallback validation") {
+                        self.abort_started_connect(error.to_string());
+                        return Err(error);
+                    }
                     let fallback_run = self.config_store.promote_draft_to_run(&fallback_draft)?;
                     if let Err(reload_error) = self
                         .mihomo
@@ -525,6 +548,10 @@ impl RuntimeManager {
                             return Ok(self.snapshot.clone());
                         }
                     }
+                    if let Err(error) = check_cancel("Smart probe fallback apply") {
+                        self.abort_started_connect(error.to_string());
+                        return Err(error);
+                    }
                     if let Err(close_error) = self
                         .mihomo
                         .close_connections(
@@ -554,6 +581,11 @@ impl RuntimeManager {
             }
         }
         timeline.mark("diagnostics_ms");
+
+        if let Err(error) = check_cancel("diagnostics") {
+            self.abort_started_connect(error.to_string());
+            return Err(error);
+        }
 
         self.config_store.commit_last_working()?;
         self.snapshot.effective_mode = effective_mode;
@@ -1898,23 +1930,33 @@ impl MihomoManager {
         proxy_group: &str,
         controller_port: u16,
         secret: &str,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<()> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()?;
         let mut failures = Vec::new();
         for attempt in 1..=2 {
+            check_egress_cancel(cancel)?;
             failures.clear();
             for test_url in [
                 "https://www.gstatic.com/generate_204",
                 "https://cp.cloudflare.com/generate_204",
             ] {
+                check_egress_cancel(cancel)?;
                 let url = mihomo_proxy_delay_url(controller_port, proxy_group, test_url, 3_500)?;
                 let mut request = client.get(url);
                 if !secret.is_empty() {
                     request = request.bearer_auth(secret);
                 }
-                match request.send().await {
+                let response = tokio::select! {
+                    response = request.send() => response,
+                    () = wait_for_connect_cancel(cancel), if cancel.is_some() => {
+                        return Err(anyhow!("connect cancelled during proxy_egress"));
+                    }
+                };
+                check_egress_cancel(cancel)?;
+                match response {
                     Ok(response) if response.status().is_success() => {
                         tracing::info!(
                             proxy_group,
@@ -1938,7 +1980,12 @@ impl MihomoManager {
                 }
             }
             if attempt < 2 {
-                sleep(Duration::from_millis(500)).await;
+                tokio::select! {
+                    () = sleep(Duration::from_millis(500)) => {}
+                    () = wait_for_connect_cancel(cancel), if cancel.is_some() => {
+                        return Err(anyhow!("connect cancelled during proxy_egress"));
+                    }
+                }
             }
         }
         Err(anyhow!(failures.join("; ")))
@@ -1997,6 +2044,29 @@ impl MihomoManager {
             tracing::debug!("Mihomo stop skipped; no owned child");
         }
         self.job = None;
+        Ok(())
+    }
+}
+
+async fn wait_for_connect_cancel(cancel: Option<&std::sync::atomic::AtomicBool>) {
+    loop {
+        if cancel
+            .map(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn check_egress_cancel(cancel: Option<&std::sync::atomic::AtomicBool>) -> Result<()> {
+    if cancel
+        .map(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+        .unwrap_or(false)
+    {
+        Err(anyhow!("connect cancelled during proxy_egress"))
+    } else {
         Ok(())
     }
 }
@@ -4459,6 +4529,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn proxy_egress_verification_observes_cancellation_during_http_request() {
+        let listener = TcpListener::bind((LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            if let Ok((_stream, _address)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        });
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_task = std::sync::Arc::clone(&cancel);
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(75)).await;
+            cancel_task.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let started = Instant::now();
+        let error = MihomoManager::default()
+            .verify_proxy_egress("PROXY", port, "", Some(cancel.as_ref()))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("cancelled during proxy_egress"));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "cancellation took {:?}",
+            started.elapsed()
+        );
+        server.join().unwrap();
+    }
+
     #[test]
     fn corrupt_draft_does_not_replace_last_working() {
         let root = std::env::temp_dir().join(format!("badvpn-config-test-{}", now_unix()));
@@ -4490,6 +4591,11 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(store.run_path(), "new: unverified\n").unwrap();
         fs::write(store.last_working_path(), "old: verified\n").unwrap();
+        fs::write(
+            store.policy_summary_path(),
+            r#"{"source":"previous-verified-policy"}"#,
+        )
+        .unwrap();
 
         let mut manager = RuntimeManager::new();
         manager.config_store = store.clone();
@@ -4524,6 +4630,10 @@ mod tests {
             fs::read_to_string(store.run_path()).unwrap(),
             "old: verified\n"
         );
+        assert_eq!(
+            fs::read_to_string(store.policy_summary_path()).unwrap(),
+            r#"{"source":"previous-verified-policy"}"#
+        );
 
         let _ = fs::remove_dir_all(root);
 
@@ -4548,6 +4658,7 @@ mod tests {
         );
 
         assert!(!first_connect_store.run_path().exists());
+        assert!(!first_connect_store.policy_summary_path().exists());
         let _ = fs::remove_dir_all(first_connect_root);
     }
 

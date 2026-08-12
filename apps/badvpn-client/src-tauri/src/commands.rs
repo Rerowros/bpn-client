@@ -5783,23 +5783,39 @@ fn install_badvpn_agent_service() -> Result<AgentServiceStatus, String> {
         } else {
             "badvpn-agent"
         });
+        let invoking_user_sid = current_process_user_sid()?;
         let staging_script = stage_runtime_assets_powershell()?;
-        let script = format!(
-            r#"$ErrorActionPreference = 'Stop'
+        let script = render_agent_install_powershell(
+            &agent_bin,
+            &service_agent_bin,
+            &invoking_user_sid,
+            &staging_script,
+        );
+        run_elevated_powershell_script(&script)?;
+        let status = read_badvpn_agent_service_status();
+        log_event(
+            "agent-service",
+            format!("install/repair completed: {}", status.message),
+        );
+        Ok(status)
+    }
+}
+
+#[cfg(windows)]
+fn render_agent_install_powershell(
+    agent_bin: &Path,
+    service_agent_bin: &Path,
+    invoking_user_sid: &str,
+    staging_script: &str,
+) -> String {
+    format!(
+        r#"$ErrorActionPreference = 'Stop'
 $sourceAgent = '{agent}'
 $serviceAgent = '{service_agent}'
 $serviceAgentDir = Split-Path -Parent $serviceAgent
-{staging_script}
 New-Item -ItemType Directory -Path $serviceAgentDir -Force | Out-Null
-try {{
-  $u = (Get-CimInstance Win32_ComputerSystem).UserName
-  if ($u) {{
-    $sid = ([System.Security.Principal.NTAccount]$u).Translate([System.Security.Principal.SecurityIdentifier]).Value
-    if ($sid -like 'S-1-*') {{
-      Set-Content -LiteralPath (Join-Path $serviceAgentDir 'allowed-user.sid') -Value $sid -Encoding ascii -NoNewline
-    }}
-  }}
-}} catch {{}}
+$invokingUserSid = '{invoking_user_sid}'
+Set-Content -LiteralPath (Join-Path $serviceAgentDir 'allowed-user.sid') -Value $invokingUserSid -Encoding ascii -NoNewline
 $service = Get-Service -Name '{service_name}' -ErrorAction SilentlyContinue
 if ($service -and $service.Status -ne 'Stopped') {{
   sc.exe stop '{service_name}' | Out-Null
@@ -5810,23 +5826,66 @@ if ($service -and $service.Status -ne 'Stopped') {{
   }} while ($service -and $service.Status -ne 'Stopped' -and (Get-Date) -lt $deadline)
   if ($service -and $service.Status -ne 'Stopped') {{ throw "{service_name} did not stop before agent repair" }}
 }}
+{staging_script}
 Copy-Item -LiteralPath $sourceAgent -Destination $serviceAgent -Force
 & $serviceAgent install-service | Out-Null
 if ($LASTEXITCODE -ne 0) {{ throw "badvpn-agent install-service failed with exit code $LASTEXITCODE" }}
 "#,
-            agent = powershell_single_quote(&agent_bin.to_string_lossy()),
-            service_agent = powershell_single_quote(&service_agent_bin.to_string_lossy()),
-            service_name = BADVPN_AGENT_SERVICE,
-            staging_script = staging_script,
-        );
-        run_elevated_powershell_script(&script)?;
-        let status = read_badvpn_agent_service_status();
-        log_event(
-            "agent-service",
-            format!("install/repair completed: {}", status.message),
-        );
-        Ok(status)
+        agent = powershell_single_quote(&agent_bin.to_string_lossy()),
+        service_agent = powershell_single_quote(&service_agent_bin.to_string_lossy()),
+        invoking_user_sid = powershell_single_quote(invoking_user_sid),
+        service_name = BADVPN_AGENT_SERVICE,
+        staging_script = staging_script,
+    )
+}
+
+#[cfg(windows)]
+fn current_process_user_sid() -> Result<String, String> {
+    let mut command = Command::new("whoami.exe");
+    command
+        .args(["/user", "/fo", "csv", "/nh"])
+        .stdin(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW);
+    let output = command
+        .output()
+        .map_err(|error| format!("Failed to query invoking user SID: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Failed to query invoking user SID: whoami exited with {}",
+            output.status
+        ));
     }
+    parse_user_sid(&String::from_utf8_lossy(&output.stdout))
+        .ok_or_else(|| "Failed to parse invoking user SID from whoami output".to_string())
+}
+
+#[cfg(windows)]
+fn parse_user_sid(output: &str) -> Option<String> {
+    output
+        .split([',', '\r', '\n'])
+        .map(|field| field.trim().trim_matches('"'))
+        .find(|field| is_valid_windows_sid(field))
+        .map(ToOwned::to_owned)
+}
+
+#[cfg(windows)]
+fn is_valid_windows_sid(value: &str) -> bool {
+    let mut parts = value.split('-');
+    if parts.next() != Some("S") {
+        return false;
+    }
+    let revision = parts.next();
+    let authority = parts.next();
+    let sub_authorities = parts.collect::<Vec<_>>();
+    revision.is_some_and(is_decimal_field)
+        && authority.is_some_and(is_decimal_field)
+        && !sub_authorities.is_empty()
+        && sub_authorities.into_iter().all(is_decimal_field)
+}
+
+#[cfg(windows)]
+fn is_decimal_field(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(|character| character.is_ascii_digit())
 }
 
 fn stage_runtime_assets_powershell() -> Result<String, String> {
@@ -5857,7 +5916,7 @@ if (Test-Path -LiteralPath $sourceComponents) {{
   # /IS and /IT force source content to replace destination files even when release
   # timestamps or other metadata would otherwise make robocopy skip them.
   # Never use /MIR here: an incomplete AppData tree must not wipe ProgramData assets.
-  robocopy $sourceComponents $targetComponents /E /IS /IT /NFL /NDL /NJH /NJS /NP | Out-Null
+  robocopy $sourceComponents $targetComponents /E /IS /IT /R:2 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
   if ($LASTEXITCODE -gt 7) {{ throw "component staging failed with robocopy exit code $LASTEXITCODE" }}
   $global:LASTEXITCODE = 0
 }}
@@ -5865,7 +5924,7 @@ $sourceLists = '{source_lists}'
 $targetLists = '{target_lists}'
 if (Test-Path -LiteralPath $sourceLists) {{
   New-Item -ItemType Directory -Path $targetLists -Force | Out-Null
-  robocopy $sourceLists $targetLists /E /IS /IT /NFL /NDL /NJH /NJS /NP | Out-Null
+  robocopy $sourceLists $targetLists /E /IS /IT /R:2 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
   if ($LASTEXITCODE -gt 7) {{ throw "Flowseal list staging failed with robocopy exit code $LASTEXITCODE" }}
   $global:LASTEXITCODE = 0
 }}
@@ -10215,7 +10274,46 @@ mod redaction_tests {
                 !line.contains("/MIR"),
                 "staging must not delete extra assets: {line}"
             );
+            assert!(
+                line.contains(" /R:2 /W:1 "),
+                "retries must be bounded: {line}"
+            );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn agent_install_stops_service_before_staging_and_binary_replacement() {
+        let staging_marker = "# runtime-staging-marker";
+        let script = render_agent_install_powershell(
+            Path::new(r"C:\Users\alice\badvpn-agent.exe"),
+            Path::new(r"C:\ProgramData\BadVpn\agent\badvpn-agent.exe"),
+            "S-1-5-21-1-2-3-1001",
+            staging_marker,
+        );
+
+        let stop = script.find("sc.exe stop").unwrap();
+        let staging = script.find(staging_marker).unwrap();
+        let replace = script.find("Copy-Item -LiteralPath").unwrap();
+        assert!(stop < staging, "service must stop before runtime staging");
+        assert!(
+            staging < replace,
+            "staging must finish before agent replacement"
+        );
+        assert!(script.contains("$invokingUserSid = 'S-1-5-21-1-2-3-1001'"));
+        assert!(!script.contains("Win32_ComputerSystem"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn invoking_user_sid_parser_accepts_only_strict_sid_fields() {
+        assert_eq!(
+            parse_user_sid("\"DESKTOP\\alice\",\"S-1-5-21-1-2-3-1001\"\r\n").as_deref(),
+            Some("S-1-5-21-1-2-3-1001")
+        );
+        assert!(parse_user_sid("DESKTOP\\alice,S-1-5-21-1-2-3-1001;evil").is_none());
+        assert!(parse_user_sid("DESKTOP\\alice,not-a-sid").is_none());
+        assert!(parse_user_sid("DESKTOP\\alice,S-1-").is_none());
     }
 
     #[test]

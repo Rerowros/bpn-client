@@ -203,7 +203,7 @@ impl AgentController {
         self.cancel_connect.store(false, Ordering::SeqCst);
         self.connecting.store(true, Ordering::SeqCst);
 
-        {
+        let connecting_snapshot = {
             let mut guard = self.inner.lock().await;
             guard.runtime.subscription = request.subscription.clone();
             guard.runtime.set_phase(AppPhase::Connecting);
@@ -215,7 +215,8 @@ impl AgentController {
             if let Ok(mut progress) = self.progress.write() {
                 *progress = guard.runtime.snapshot();
             }
-        }
+            guard.runtime.snapshot()
+        };
 
         let inner = Arc::clone(&self.inner);
         let connecting = Arc::clone(&self.connecting);
@@ -257,8 +258,7 @@ impl AgentController {
             connecting.store(false, Ordering::SeqCst);
         }));
 
-        let guard = self.inner.lock().await;
-        Ok(guard.runtime.snapshot())
+        Ok(connecting_snapshot)
     }
 
     async fn stop(&mut self) -> BadVpnResult<AgentState> {
@@ -568,5 +568,40 @@ fn command_kind(command: &AgentCommand) -> &'static str {
         AgentCommand::UpdateComponents => "update_components",
         AgentCommand::RollbackComponent { .. } => "rollback_component",
         AgentCommand::PolicySummary => "policy_summary",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn background_connect_returns_captured_connecting_snapshot_without_waiting_for_worker() {
+        let mut controller = AgentController::default();
+        let request = ConnectRequest {
+            profile_body: String::new(),
+            subscription: Default::default(),
+            selected_proxies: BTreeMap::new(),
+            route_mode: badvpn_common::RuntimeMode::Smart,
+            settings: badvpn_common::RuntimeSettings::default(),
+        };
+
+        let state = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            controller.connect(request),
+        )
+        .await
+        .expect("background Connect response must not wait for the runtime mutex")
+        .unwrap();
+
+        assert_eq!(state.phase, AppPhase::Connecting);
+        assert_eq!(
+            state.connection.status,
+            badvpn_common::ConnectionStatus::Starting
+        );
+        if let Some(task) = controller.connect_task.take() {
+            task.abort();
+        }
     }
 }
