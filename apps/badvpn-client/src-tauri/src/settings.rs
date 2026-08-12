@@ -37,6 +37,15 @@ impl AppSettings {
         self.routing_policy.migrate_legacy_local_overrides();
     }
 
+    pub fn migrate_runtime_network_defaults(&mut self) {
+        // v1: disable strict-route by default. Older installs persisted
+        // strict_route=true which blackholes DNS on multi-homed Windows.
+        if self.tun.defaults_version < 1 {
+            self.tun.strict_route = false;
+            self.tun.defaults_version = 1;
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.core.route_mode == RouteMode::Smart && !self.zapret.enabled {
             return Err("Smart requires zapret; disable zapret by using VPN Only.".into());
@@ -179,6 +188,9 @@ pub struct TunSettings {
     pub mtu: u16,
     pub dns_hijack: Vec<String>,
     pub excluded_routes: Vec<String>,
+    /// Bumped when TUN defaults change so existing settings.json can migrate once.
+    #[serde(default)]
+    pub defaults_version: u16,
 }
 
 impl Default for TunSettings {
@@ -186,12 +198,15 @@ impl Default for TunSettings {
         Self {
             enabled: true,
             stack: TunStack::Mixed,
-            strict_route: true,
+            // Prefer auto-route + dns-hijack; strict-route on Windows can
+            // blackhole DNS when another VPN/Hyper-V NIC is present.
+            strict_route: false,
             auto_route: true,
             auto_detect_interface: true,
             mtu: 1500,
             dns_hijack: vec!["any:53".to_string(), "tcp://any:53".to_string()],
             excluded_routes: Vec::new(),
+            defaults_version: 1,
         }
     }
 }
@@ -581,6 +596,7 @@ pub fn read_settings_from_path(path: &Path) -> AppSettings {
     };
     let mut settings = serde_json::from_str::<AppSettings>(&content).unwrap_or_default();
     settings.migrate_legacy_local_overrides();
+    settings.migrate_runtime_network_defaults();
     if settings.validate().is_ok() {
         settings
     } else {
@@ -591,6 +607,7 @@ pub fn read_settings_from_path(path: &Path) -> AppSettings {
 pub fn write_settings_to_path(path: &Path, settings: &AppSettings) -> Result<(), String> {
     let mut settings = settings.clone();
     settings.migrate_legacy_local_overrides();
+    settings.migrate_runtime_network_defaults();
     settings.validate()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -710,6 +727,32 @@ mod tests {
         settings.core.route_mode = RouteMode::VpnOnly;
         assert!(settings.validate().is_ok());
         assert_eq!(settings.effective_route_mode(), RouteMode::VpnOnly);
+    }
+
+    #[test]
+    fn migrates_legacy_strict_route_default_off() {
+        let path = std::env::temp_dir().join("badvpn-strict-route-migrate-test.json");
+        fs::write(
+            &path,
+            r#"{
+                "tun": {
+                    "enabled": true,
+                    "stack": "mixed",
+                    "strict_route": true,
+                    "auto_route": true,
+                    "auto_detect_interface": true,
+                    "mtu": 1500,
+                    "dns_hijack": ["any:53", "tcp://any:53"],
+                    "excluded_routes": []
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let settings = read_settings_from_path(&path);
+        assert!(!settings.tun.strict_route);
+        assert_eq!(settings.tun.defaults_version, 1);
+        let _ = fs::remove_file(path);
     }
 
     #[test]

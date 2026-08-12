@@ -2325,7 +2325,9 @@ fn normalize_overlay_cidr(value: &str) -> Option<String> {
 }
 
 fn ensure_list_file(path: &Path, values: Vec<&'static str>) -> Result<PathBuf> {
-    if !path.exists() {
+    let missing_or_empty =
+        !path.exists() || fs::metadata(path).map_or(true, |metadata| metadata.len() == 0);
+    if missing_or_empty {
         write_file_atomically(path, &values.join("\n"))?;
     }
     Ok(path.to_path_buf())
@@ -2451,16 +2453,45 @@ fn write_compiled_zapret_lists(
         &policy.zapret_ipset_exclude,
     )?;
 
-    write_policy_list_file(&lists.join("list-general.txt"), &general_hostlist)?;
-    write_policy_list_file(&lists.join("list-google.txt"), &google_hostlist)?;
-    write_policy_list_file(
-        &lists.join("list-exclude.txt"),
-        &policy.zapret_hostlist_exclude,
-    )?;
-    write_policy_list_file(
-        &lists.join("ipset-exclude.txt"),
-        &policy.zapret_ipset_exclude,
-    )?;
+    // VPN Only clears policy hosts; keep Flowseal defaults so a later Smart
+    // start (or ensure_list_file) never inherits empty ProgramData lists.
+    let general_values = if general_hostlist.is_empty() {
+        badvpn_common::flowseal_general_hostlist()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    } else {
+        general_hostlist
+    };
+    let google_values = if google_hostlist.is_empty() {
+        badvpn_common::flowseal_google_hostlist()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    } else {
+        google_hostlist
+    };
+    let exclude_values = if policy.zapret_hostlist_exclude.is_empty() {
+        badvpn_common::flowseal_exclude_hostlist()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    } else {
+        policy.zapret_hostlist_exclude.clone()
+    };
+    let ipset_exclude_values = if policy.zapret_ipset_exclude.is_empty() {
+        badvpn_common::flowseal_ipset_exclude()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    } else {
+        policy.zapret_ipset_exclude.clone()
+    };
+
+    write_policy_list_file(&lists.join("list-general.txt"), &general_values)?;
+    write_policy_list_file(&lists.join("list-google.txt"), &google_values)?;
+    write_policy_list_file(&lists.join("list-exclude.txt"), &exclude_values)?;
+    write_policy_list_file(&lists.join("ipset-exclude.txt"), &ipset_exclude_values)?;
     write_policy_list_file(&lists.join("list-general-user.txt"), &[])?;
     write_policy_list_file(&lists.join("list-exclude-user.txt"), &[])?;
     write_policy_list_file(&lists.join("ipset-exclude-user.txt"), &[])?;
@@ -3634,6 +3665,60 @@ start "zapret: general (ALT9)" /min "%BIN%winws.exe" --wf-tcp=80,443,%GameFilter
             fs::read_to_string(lists.join("ipset-all.effective.txt")).unwrap(),
             "198.51.100.0/24\n203.0.113.0/24\n"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn vpn_only_list_write_keeps_flowseal_defaults() {
+        let root = std::env::temp_dir().join(format!("badvpn-vpn-only-lists-{}", now_unix()));
+        let components = root.join("components");
+        let store = ComponentStore {
+            root: components.clone(),
+            appdata_fallback: None,
+        };
+        let policy = compile_policy(PolicyCompileInput {
+            mode: AppRouteMode::VpnOnly,
+            provider_rules: vec!["MATCH,PROXY".to_string()],
+            proxy_groups: vec![ProxyGroupInfo {
+                name: "PROXY".to_string(),
+                group_type: Some("select".to_string()),
+                proxies: vec!["Germany".to_string()],
+            }],
+            proxy_count: 1,
+            routing: RoutingPolicySettings::default(),
+            runtime_facts: RuntimeFacts::default(),
+        })
+        .unwrap();
+
+        let lists = components.join("zapret").join("lists");
+        fs::create_dir_all(&lists).unwrap();
+        fs::write(lists.join("list-general.txt"), "").unwrap();
+        fs::write(lists.join("list-google.txt"), "").unwrap();
+
+        write_compiled_zapret_lists(&store, &policy).unwrap();
+
+        assert!(policy.zapret_hostlist.is_empty());
+        assert!(fs::read_to_string(lists.join("zapret_hostlist.txt"))
+            .unwrap()
+            .trim()
+            .is_empty());
+        let general = fs::read_to_string(lists.join("list-general.txt")).unwrap();
+        let google = fs::read_to_string(lists.join("list-google.txt")).unwrap();
+        assert!(general.contains("discord.com"));
+        assert!(google.contains("googlevideo.com"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ensure_list_file_refills_empty_hostlists() {
+        let root = std::env::temp_dir().join(format!("badvpn-ensure-list-{}", now_unix()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("list-general.txt");
+        fs::write(&path, "").unwrap();
+
+        ensure_list_file(&path, badvpn_common::flowseal_general_hostlist()).unwrap();
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(body.contains("discord.com"));
         let _ = fs::remove_dir_all(root);
     }
 
