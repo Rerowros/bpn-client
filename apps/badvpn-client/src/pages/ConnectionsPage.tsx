@@ -4,14 +4,15 @@ import type { ConnectionGroupMode, ConnectionPathFilter, ConnectionTab } from ".
 import type { ConnectionPath, ConnectionsSnapshot, TrackedConnection } from "../services/agentClient";
 import { DetailItem, EmptyList, LegendItem, PathBadge } from "../ui/primitives";
 import { compareText, formatBytes, formatConnectionTime, formatPathLabel, formatTimestamp } from "../lib/format";
+import { ROUTE_PATH_LABELS, ROUTE_PATH_SUBTITLES } from "../lib/routeLabels";
 
 const connectionPathOptions: Array<[ConnectionPathFilter, string]> = [
   ["all", "All"],
-  ["vpn", "VPN"],
-  ["zapret", "zapret"],
-  ["direct", "DIRECT"],
-  ["blocked", "Blocked"],
-  ["unknown", "Unknown"],
+  ["vpn", ROUTE_PATH_LABELS.vpn],
+  ["zapret", ROUTE_PATH_LABELS.zapret],
+  ["direct", ROUTE_PATH_LABELS.direct],
+  ["blocked", ROUTE_PATH_LABELS.blocked],
+  ["unknown", ROUTE_PATH_LABELS.unknown],
 ];
 
 export function ConnectionsPage({
@@ -94,9 +95,9 @@ export function ConnectionsPage({
         </div>
 
         <div className="pathLegend">
-          <LegendItem tone="vpn" title="VPN" text="Mihomo proxy chain; traffic exits through selected server." />
-          <LegendItem tone="zapret" title="zapret" text="DIRECT in Mihomo plus local winws DPI bypass." />
-          <LegendItem tone="direct" title="DIRECT" text="No VPN proxy and not matched by zapret policy." />
+          <LegendItem tone="vpn" title={ROUTE_PATH_LABELS.vpn} text={ROUTE_PATH_SUBTITLES.vpn} />
+          <LegendItem tone="zapret" title={ROUTE_PATH_LABELS.zapret} text={ROUTE_PATH_SUBTITLES.zapret} />
+          <LegendItem tone="direct" title={ROUTE_PATH_LABELS.direct} text={ROUTE_PATH_SUBTITLES.direct} />
         </div>
 
         <div className="connectionToolbar">
@@ -312,11 +313,17 @@ function ConnectionRow({
   return (
     <div className="connectionRow">
       <div className="connectionMain">
-        <PathBadge path={connection.path} label={connection.path_label} />
+        <PathBadge
+          path={connection.path}
+          label={formatPathLabel(connection.path)}
+          subtitle={connection.path_note || ROUTE_PATH_SUBTITLES[connection.path]}
+        />
         <div>
-          <strong>{connection.host || connection.destination}</strong>
-          <span>{connection.destination}</span>
-          <span className="connectionProcessLine">{processLabel}</span>
+          <strong title={connection.host || connection.destination}>{connection.host || connection.destination}</strong>
+          <span title={connection.destination}>{connection.destination}</span>
+          <span className="connectionProcessLine" title={processLabel}>
+            {processLabel}
+          </span>
         </div>
       </div>
       <div className="connectionMeta">

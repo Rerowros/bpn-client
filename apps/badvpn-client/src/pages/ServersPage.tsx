@@ -108,7 +108,7 @@ export function ServersPage({
                   />
                   {expanded ? (
                     visibleNodes.length > 0 ? (
-                      <div className="serverNodeGrid">
+                      <div className="serverNodeList">
                         {visibleNodes.map((node) => (
                           <NodeRow key={node.name} group={group.name} node={node} busy={busy} select={select} />
                         ))}

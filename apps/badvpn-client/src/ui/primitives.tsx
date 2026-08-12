@@ -1,5 +1,5 @@
 import { AlertTriangle, CheckCircle2, Globe2, Power, RefreshCw } from "lucide-react";
-import type { ReactNode } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import type { ConnectionProgressModel, ServerIdentity } from "../appTypes";
 
 export function SetupStep({
@@ -119,8 +119,74 @@ export function StatusBadge({ connected, pending, status }: { connected: boolean
   );
 }
 
-export function PathBadge({ path, label }: { path: string; label: string }) {
-  return <span className={`pathBadge ${path}`}>{label}</span>;
+export function TruncatedText({
+  text,
+  className,
+  lines = 1,
+}: {
+  text: string;
+  className?: string;
+  lines?: 1 | 2 | 3;
+}) {
+  const style = lines > 1 ? ({ "--clamp-lines": lines } as CSSProperties) : undefined;
+  return (
+    <span
+      className={lines === 1 ? `truncatedText${className ? ` ${className}` : ""}` : `clampedText${className ? ` ${className}` : ""}`}
+      title={text}
+      style={style}
+    >
+      {text}
+    </span>
+  );
+}
+
+export function SettingsDisclosure({
+  title,
+  defaultOpen = false,
+  children,
+}: {
+  title: string;
+  defaultOpen?: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <details className="settingsDisclosure" open={defaultOpen}>
+      <summary>{title}</summary>
+      <div className="settingsDisclosureBody">{children}</div>
+    </details>
+  );
+}
+
+export function SettingsRow({
+  label,
+  value,
+  hint,
+  control,
+}: {
+  label: string;
+  value?: string;
+  hint?: string;
+  control?: ReactNode;
+}) {
+  return (
+    <div className="settingsRow">
+      <div className="settingsRowLabel">
+        <span>{label}</span>
+        {hint ? <small>{hint}</small> : null}
+      </div>
+      {value ? <TruncatedText text={value} className="settingsRowValue" lines={2} /> : <span className="settingsRowValue" />}
+      {control ? <div className="settingsRowControl">{control}</div> : null}
+    </div>
+  );
+}
+
+export function PathBadge({ path, label, subtitle }: { path: string; label: string; subtitle?: string | null }) {
+  return (
+    <span className="pathBadgeWrap" title={subtitle ?? undefined}>
+      <span className={`pathBadge ${path}`}>{label}</span>
+      {subtitle ? <span className="pathBadgeSubtitle">{subtitle}</span> : null}
+    </span>
+  );
 }
 
 export function Panel({ title, children }: { title: string; children: ReactNode }) {
