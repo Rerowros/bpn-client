@@ -41,15 +41,22 @@ pub struct RuntimeManager {
 impl RuntimeManager {
     pub fn new() -> Self {
         let component_store = ComponentStore::default();
+        let config_store = RuntimeConfigStore::default();
+        #[cfg(not(test))]
+        let invalid_proxy_selections = config_store
+            .load_invalid_proxy_selections()
+            .unwrap_or_default();
+        #[cfg(test)]
+        let invalid_proxy_selections = BTreeMap::new();
         Self {
             snapshot: AgentRuntimeSnapshot::default(),
             last_request: None,
-            config_store: RuntimeConfigStore::default(),
+            config_store,
             component_store,
             mihomo: MihomoManager::default(),
             zapret: ZapretManager::default(),
             active_policy: None,
-            invalid_proxy_selections: BTreeMap::new(),
+            invalid_proxy_selections,
         }
     }
 
@@ -361,7 +368,6 @@ impl RuntimeManager {
             ));
             return Ok(self.snapshot.clone());
         }
-        self.invalid_proxy_selections.clear();
         timeline.mark("proxy_egress_ms");
         if request.settings.diagnostics.discord_youtube_probes
             && effective_mode == RuntimeMode::Smart
@@ -929,12 +935,9 @@ impl RuntimeManager {
                     "Mihomo stopped unexpectedly; VPN routing is no longer active. {detail} Reconnect to restore the connection."
                 ));
             }
-            RuntimePhase::Error
-                if self.snapshot.zapret.state == RuntimeComponentState::Running
-                    || self.zapret.is_running() =>
-            {
+            RuntimePhase::Error if self.snapshot.active_config_id.is_some() => {
                 // Recoverable egress-failure Error keeps Mihomo up; if Mihomo later dies,
-                // still tear down zapret so Smart DIRECT rules are not left half-live.
+                // update the diagnosis even in VPN-only mode where zapret is already stopped.
                 if let Err(error) = self.zapret.stop() {
                     self.snapshot
                         .diagnostics
@@ -948,7 +951,7 @@ impl RuntimeManager {
                     .is_none_or(|message| !message.contains("VPN routing is no longer active"))
                 {
                     self.set_error(
-                        "Mihomo stopped unexpectedly while recovering from a failed VPN path. Reconnect to restore the connection."
+                        "Mihomo stopped unexpectedly while recovering from a failed VPN path; VPN routing is no longer active. Reconnect to restore the connection."
                             .to_string(),
                     );
                 }
@@ -1206,10 +1209,6 @@ impl RuntimeManager {
             return self.reject_proxy_selection(&targets, group, proxy, error, &rollback_errors);
         }
 
-        self.remember_proxy_selection(group, proxy);
-        self.snapshot
-            .diagnostics
-            .push(format!("Selected a new proxy in Mihomo group '{group}'."));
         let recovery_gate = proxy_recovery_gate(
             self.snapshot.phase,
             self.active_policy.as_ref(),
@@ -1242,6 +1241,20 @@ impl RuntimeManager {
                 false
             }
         };
+        if recovery_verified {
+            if let Err(error) = self.sync_verified_proxy_selection_to_run_config(&targets, proxy) {
+                let rollback_errors =
+                    rollback_proxy_selections(&client, &base, &secret, &applied).await;
+                return self.finish_failed_proxy_selection(
+                    error.context("failed to persist verified proxy recovery config"),
+                    &rollback_errors,
+                );
+            }
+        }
+        self.remember_proxy_selection(group, proxy);
+        self.snapshot
+            .diagnostics
+            .push(format!("Selected a new proxy in Mihomo group '{group}'."));
         if recovery_verified {
             let desired = self.snapshot.desired_mode;
             let effective = self.snapshot.effective_mode;
@@ -1341,6 +1354,25 @@ impl RuntimeManager {
         for managed_name in mirrored_groups {
             self.clear_invalid_proxy_selection(&managed_name, proxy);
         }
+        self.persist_invalid_proxy_selections_best_effort();
+    }
+
+    fn sync_verified_proxy_selection_to_run_config(
+        &mut self,
+        targets: &[ActiveProxySelectionTarget],
+        proxy: &str,
+    ) -> Result<()> {
+        let run_path = self.config_store.run_path();
+        let content = fs::read_to_string(&run_path)
+            .with_context(|| format!("failed to read {}", run_path.display()))?;
+        let mut yaml = serde_yaml::from_str::<YamlValue>(&content)
+            .context("failed to parse active Mihomo config for proxy recovery")?;
+        apply_proxy_selection_to_yaml(&mut yaml, targets, proxy)?;
+        let rendered = serde_yaml::to_string(&yaml)
+            .context("failed to render active Mihomo config after proxy recovery")?;
+        write_file_atomically(&run_path, &rendered)
+            .context("failed to atomically update active Mihomo proxy selection")?;
+        Ok(())
     }
 
     fn strip_invalid_proxy_selections(&self, selected_proxies: &mut BTreeMap<String, String>) {
@@ -1372,6 +1404,7 @@ impl RuntimeManager {
                 request.selected_proxies.remove(group);
             }
         }
+        self.persist_invalid_proxy_selections_best_effort();
     }
 
     fn clear_invalid_proxy_selection(&mut self, group: &str, proxy: &str) {
@@ -1384,6 +1417,22 @@ impl RuntimeManager {
             });
         if remove_group {
             self.invalid_proxy_selections.remove(group);
+        }
+    }
+
+    fn persist_invalid_proxy_selections_best_effort(&mut self) {
+        if cfg!(test) {
+            return;
+        }
+        if let Err(error) = self
+            .config_store
+            .save_invalid_proxy_selections(&self.invalid_proxy_selections)
+        {
+            tracing::warn!(%error, "failed to persist rejected proxy selections");
+            self.snapshot.diagnostics.push(
+                "Could not persist rejected proxy selections; avoid restarting the service until another server is selected."
+                    .to_string(),
+            );
         }
     }
 
@@ -1513,6 +1562,41 @@ fn active_proxy_selection(catalog: &serde_json::Value, group: &str) -> Result<St
                 "Active Mihomo group '{group}' did not report its current selection; refusing a change that cannot be rolled back"
             )
         })
+}
+
+fn apply_proxy_selection_to_yaml(
+    yaml: &mut YamlValue,
+    targets: &[ActiveProxySelectionTarget],
+    proxy: &str,
+) -> Result<()> {
+    let groups = yaml
+        .get_mut("proxy-groups")
+        .and_then(YamlValue::as_sequence_mut)
+        .context("active Mihomo config has no proxy-groups sequence")?;
+    for target in targets {
+        let group = groups
+            .iter_mut()
+            .find(|group| group.get("name").and_then(YamlValue::as_str) == Some(&target.group))
+            .with_context(|| {
+                format!("active Mihomo config has no proxy group '{}'", target.group)
+            })?;
+        let proxies = group
+            .get_mut("proxies")
+            .and_then(YamlValue::as_sequence_mut)
+            .with_context(|| format!("proxy group '{}' has no proxy list", target.group))?;
+        let index = proxies
+            .iter()
+            .position(|member| member.as_str() == Some(proxy))
+            .with_context(|| {
+                format!(
+                    "proxy '{proxy}' is not present in active config group '{}'",
+                    target.group
+                )
+            })?;
+        let selected = proxies.remove(index);
+        proxies.insert(0, selected);
+    }
+    Ok(())
 }
 
 async fn put_active_proxy_selection(
@@ -1739,6 +1823,31 @@ impl RuntimeConfigStore {
 
     fn policy_summary_path(&self) -> PathBuf {
         self.root.join("policy-summary.json")
+    }
+
+    fn invalid_proxy_selections_path(&self) -> PathBuf {
+        self.root.join("invalid-proxy-selections.json")
+    }
+
+    fn load_invalid_proxy_selections(&self) -> Result<BTreeMap<String, BTreeSet<String>>> {
+        let path = self.invalid_proxy_selections_path();
+        let content = match fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(BTreeMap::new());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        serde_json::from_str(&content).context("failed to parse rejected proxy selections")
+    }
+
+    fn save_invalid_proxy_selections(
+        &self,
+        selections: &BTreeMap<String, BTreeSet<String>>,
+    ) -> Result<()> {
+        fs::create_dir_all(&self.root)?;
+        let content = serde_json::to_string_pretty(selections)?;
+        write_file_atomically(&self.invalid_proxy_selections_path(), &content)
     }
 
     fn write_policy_summary(&self, policy: &CompiledPolicy) -> Result<()> {
@@ -4207,6 +4316,34 @@ mod tests {
     }
 
     #[test]
+    fn late_mihomo_death_updates_vpn_only_recovery_error_without_zapret() {
+        let mut manager = RuntimeManager::new();
+        manager.snapshot.phase = RuntimePhase::Error;
+        manager.snapshot.effective_mode = RuntimeMode::VpnOnly;
+        manager.snapshot.last_error = Some("Selected VPN path failed egress".to_string());
+        manager.snapshot.active_config_id = Some("failed-egress-config".to_string());
+        manager.snapshot.mihomo = RuntimeComponentSnapshot::new(
+            RuntimeComponentState::Stopped,
+            Some("Mihomo exited unexpectedly".to_string()),
+        );
+        manager.snapshot.zapret =
+            RuntimeComponentSnapshot::new(RuntimeComponentState::Stopped, None);
+
+        manager.handle_late_mihomo_death();
+
+        assert_eq!(manager.snapshot.phase, RuntimePhase::Error);
+        assert_eq!(
+            manager.snapshot.zapret.state,
+            RuntimeComponentState::Stopped
+        );
+        assert!(manager
+            .snapshot
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("VPN routing is no longer active")));
+    }
+
+    #[test]
     fn active_proxy_selection_rejects_stale_group_and_unknown_member() {
         let catalog = serde_json::json!({
             "proxies": {
@@ -4744,6 +4881,53 @@ start "zapret: general (ALT9)" /min "%BIN%winws.exe" --wf-tcp=80,443,%GameFilter
         manager.clear_invalid_proxy_selection("PROXY", "Dead two");
         let rejected = manager.invalid_proxy_selections.get("PROXY").unwrap();
         assert_eq!(rejected, &BTreeSet::from(["Dead one".to_string()]));
+    }
+
+    #[test]
+    fn rejected_proxy_selections_survive_agent_store_reload() {
+        let root = std::env::temp_dir().join(format!("badvpn-rejected-proxy-{}", now_unix()));
+        let store = RuntimeConfigStore { root: root.clone() };
+        let rejected = BTreeMap::from([(
+            "PROXY".to_string(),
+            BTreeSet::from(["Dead node".to_string()]),
+        )]);
+
+        store.save_invalid_proxy_selections(&rejected).unwrap();
+        let reloaded = store.load_invalid_proxy_selections().unwrap();
+
+        assert_eq!(reloaded, rejected);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verified_live_recovery_yaml_is_committed_with_recovered_proxy() {
+        let root = std::env::temp_dir().join(format!("badvpn-recovery-config-{}", now_unix()));
+        let store = RuntimeConfigStore { root: root.clone() };
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            store.run_path(),
+            "proxy-groups:\n  - name: PROXY\n    type: select\n    proxies:\n      - Dead node\n      - Working node\n",
+        )
+        .unwrap();
+        let mut manager = RuntimeManager::new();
+        manager.config_store = store.clone();
+        let targets = vec![ActiveProxySelectionTarget {
+            group: "PROXY".to_string(),
+            previous_proxy: "Dead node".to_string(),
+        }];
+
+        manager
+            .sync_verified_proxy_selection_to_run_config(&targets, "Working node")
+            .unwrap();
+        store.commit_last_working().unwrap();
+
+        for path in [store.run_path(), store.last_working_path()] {
+            let yaml =
+                serde_yaml::from_str::<YamlValue>(&fs::read_to_string(path).unwrap()).unwrap();
+            let proxies = yaml["proxy-groups"][0]["proxies"].as_sequence().unwrap();
+            assert_eq!(proxies[0].as_str(), Some("Working node"));
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
