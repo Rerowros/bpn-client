@@ -62,22 +62,12 @@ mod windows_impl {
         }
     }
 
-    /// Best-effort: create a kill-on-close job and assign `child`.
-    pub fn bind_child_to_kill_on_close_job(child: &Child) -> Option<ProcessJob> {
-        match ProcessJob::create_kill_on_close() {
-            Ok(job) => {
-                if let Err(error) = job.assign_child(child) {
-                    tracing::warn!(%error, "failed to assign child to Job Object");
-                    None
-                } else {
-                    Some(job)
-                }
-            }
-            Err(error) => {
-                tracing::warn!(%error, "failed to create Job Object for owned child");
-                None
-            }
-        }
+    /// Create a kill-on-close job and assign `child`. Callers must treat failure as
+    /// a startup failure because an unbound networking child can outlive the agent.
+    pub fn bind_child_to_kill_on_close_job(child: &Child) -> Result<ProcessJob> {
+        let job = ProcessJob::create_kill_on_close()?;
+        job.assign_child(child)?;
+        Ok(job)
     }
 }
 
@@ -89,6 +79,8 @@ pub use windows_impl::{bind_child_to_kill_on_close_job, ProcessJob};
 pub struct ProcessJob;
 
 #[cfg(not(windows))]
-pub fn bind_child_to_kill_on_close_job(_child: &std::process::Child) -> Option<ProcessJob> {
-    None
+pub fn bind_child_to_kill_on_close_job(_child: &std::process::Child) -> anyhow::Result<ProcessJob> {
+    // Job Objects are Windows-specific. Keep non-Windows development builds usable;
+    // platform-specific child containment must be added before a non-Windows release.
+    Ok(ProcessJob)
 }

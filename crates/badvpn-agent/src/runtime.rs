@@ -1809,7 +1809,7 @@ impl MihomoManager {
             controller_port,
             "starting Mihomo child"
         );
-        let mut child = Command::new(mihomo_bin)
+        let child = Command::new(mihomo_bin)
             .arg("-d")
             .arg(home_dir)
             .arg("-f")
@@ -1819,6 +1819,11 @@ impl MihomoManager {
             .stderr(log_stdio("mihomo.log")?)
             .spawn()
             .with_context(|| format!("failed to start {}", mihomo_bin.display()))?;
+        let (mut child, job) = bind_owned_child_to_job(child, "Mihomo")?;
+        tracing::debug!(
+            pid = child.id(),
+            "Mihomo child bound to kill-on-close Job Object"
+        );
         std::thread::sleep(Duration::from_millis(350));
         if let Some(status) = child.try_wait()? {
             self.last_exit_detail = Some(format!("Mihomo exited immediately with {status}"));
@@ -1828,15 +1833,9 @@ impl MihomoManager {
             ));
         }
         tracing::info!(pid = child.id(), "Mihomo child started");
-        self.job = crate::process_job::bind_child_to_kill_on_close_job(&child);
-        if self.job.is_some() {
-            tracing::debug!(
-                pid = child.id(),
-                "Mihomo child bound to kill-on-close Job Object"
-            );
-        }
         self.last_exit_detail = None;
         self.child = Some(child);
+        self.job = Some(job);
         Ok(())
     }
 
@@ -2197,7 +2196,7 @@ impl ZapretManager {
             "starting winws child"
         );
         tracing::debug!(args = ?args, "winws arguments");
-        let mut child = Command::new(winws)
+        let child = Command::new(winws)
             .current_dir(component_store.zapret_bin_dir())
             .args(&args)
             .stdin(Stdio::null())
@@ -2205,6 +2204,11 @@ impl ZapretManager {
             .stderr(log_stdio("winws.log")?)
             .spawn()
             .with_context(|| format!("failed to start {}", winws.display()))?;
+        let (mut child, job) = bind_owned_child_to_job(child, "winws")?;
+        tracing::debug!(
+            pid = child.id(),
+            "winws child bound to kill-on-close Job Object"
+        );
         std::thread::sleep(Duration::from_millis(900));
         if let Some(status) = child.try_wait()? {
             self.last_exit_detail = Some(format!("winws exited immediately with {status}"));
@@ -2214,15 +2218,9 @@ impl ZapretManager {
             ));
         }
         tracing::info!(pid = child.id(), strategy = %settings.strategy, "winws child started");
-        self.job = crate::process_job::bind_child_to_kill_on_close_job(&child);
-        if self.job.is_some() {
-            tracing::debug!(
-                pid = child.id(),
-                "winws child bound to kill-on-close Job Object"
-            );
-        }
         self.last_exit_detail = None;
         self.child = Some(child);
+        self.job = Some(job);
         Ok(format!(
             "winws started with profile={} ipset={} game={}",
             settings.strategy, settings.ipset_filter, settings.game_filter
@@ -2241,6 +2239,48 @@ impl ZapretManager {
         }
         self.job = None;
         Ok(())
+    }
+}
+
+fn bind_owned_child_to_job(
+    child: Child,
+    component: &str,
+) -> Result<(Child, crate::process_job::ProcessJob)> {
+    bind_owned_child_to_job_with(child, component, |child| {
+        crate::process_job::bind_child_to_kill_on_close_job(child)
+    })
+}
+
+fn bind_owned_child_to_job_with<F>(
+    mut child: Child,
+    component: &str,
+    bind: F,
+) -> Result<(Child, crate::process_job::ProcessJob)>
+where
+    F: FnOnce(&Child) -> Result<crate::process_job::ProcessJob>,
+{
+    match bind(&child) {
+        Ok(job) => Ok((child, job)),
+        Err(bind_error) => {
+            let pid = child.id();
+            let kill_error = child.kill().err();
+            let wait_error = child.wait().err();
+            tracing::error!(
+                %bind_error,
+                ?kill_error,
+                ?wait_error,
+                pid,
+                component,
+                "failed to bind owned child to kill-on-close Job Object"
+            );
+            let cleanup = match (kill_error, wait_error) {
+                (None, None) => "child was killed and reaped".to_string(),
+                (kill, wait) => format!("cleanup errors: kill={kill:?}, wait={wait:?}"),
+            };
+            Err(anyhow!(
+                "{component} startup aborted because Job Object binding failed: {bind_error}; {cleanup}"
+            ))
+        }
     }
 }
 
@@ -4558,6 +4598,48 @@ mod tests {
             started.elapsed()
         );
         server.join().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn job_binding_failure_kills_and_reaps_spawned_child() {
+        let child = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+
+        let error = bind_owned_child_to_job_with(child, "test-child", |_child| {
+            Err(anyhow!("forced Job Object bind failure"))
+        })
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("Job Object binding failed"));
+        assert!(message.contains("child was killed and reaped"));
+        let query = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!("if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 1 }}"),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(query.success(), "child process {pid} survived bind failure");
     }
 
     #[test]
