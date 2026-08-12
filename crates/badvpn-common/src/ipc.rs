@@ -541,6 +541,8 @@ pub struct PolicyDnsRuleView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManagedGroupView {
     pub name: String,
+    #[serde(default)]
+    pub source_group: String,
     pub proxies: Vec<String>,
 }
 
@@ -673,6 +675,7 @@ impl From<&CompiledPolicy> for PolicySummaryResponse {
             .iter()
             .map(|group| ManagedGroupView {
                 name: group.name.clone(),
+                source_group: group.source_group.clone(),
                 proxies: group.proxies.clone(),
             })
             .collect();

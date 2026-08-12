@@ -778,17 +778,22 @@ impl RuntimeManager {
             &options,
         )
         .map_err(|error| anyhow!(error))?;
-        if self.force_non_blacklisted_selector_defaults(
+        let forced_fallback = self.force_non_blacklisted_selector_defaults(
             &generated.yaml,
             &generated.policy,
             &mut options.selected_proxies,
-        )? {
+        )?;
+        if forced_fallback {
             generated = generate_mihomo_config_from_subscription_with_options(
                 &request.profile_body,
                 &secret,
                 &options,
             )
             .map_err(|error| anyhow!(error))?;
+        }
+        let filtered_automatic =
+            self.filter_blacklisted_automatic_group_members(&mut generated.yaml)?;
+        if forced_fallback || filtered_automatic {
             disable_mihomo_selection_cache(&mut generated.yaml)?;
         }
         Ok(RuntimeConfig {
@@ -1105,6 +1110,14 @@ impl RuntimeManager {
                 "Mihomo connection cleanup warning after late zapret fallback: {close_error}"
             ));
         }
+        let tested_active_proxy = self
+            .mihomo
+            .active_proxy_selection_chain(
+                &fallback.policy.main_proxy_group,
+                request.settings.mihomo.controller_port,
+                &secret,
+            )
+            .await;
         if let Err(error) = self
             .mihomo
             .verify_proxy_egress(
@@ -1114,6 +1127,19 @@ impl RuntimeManager {
             )
             .await
         {
+            match tested_active_proxy {
+                Ok(active_proxy) => {
+                    self.record_invalid_active_proxy_for_policy(&fallback.policy, &active_proxy)
+                }
+                Err(catalog_error) => {
+                    tracing::warn!(%catalog_error, "failed to identify active VPN-only fallback proxy after egress failure");
+                    self.snapshot.diagnostics.push(
+                        "Could not identify the active VPN-only fallback proxy after egress failure; falling back to saved-selection invalidation."
+                            .to_string(),
+                    );
+                    self.record_invalid_proxy_selections_for_policy(&fallback.policy);
+                }
+            }
             return Err(anyhow!(
                 "VPN-only fallback is active without DIRECT routes, but its selected VPN path failed egress verification: {error}. Choose another server to recover."
             ));
@@ -1220,7 +1246,13 @@ impl RuntimeManager {
             .json::<serde_json::Value>()
             .await
             .context("failed to decode active Mihomo proxy groups")?;
-        let targets = proxy_selection_targets(&catalog, self.active_policy.as_ref(), group, proxy)?;
+        let canonical_group = canonical_proxy_selection_group(self.active_policy.as_ref(), group);
+        let targets = proxy_selection_targets(
+            &catalog,
+            self.active_policy.as_ref(),
+            &canonical_group,
+            proxy,
+        )?;
         let mut applied = Vec::new();
         for target in &targets {
             if let Err(error) =
@@ -1299,7 +1331,7 @@ impl RuntimeManager {
         if recovery_verified {
             self.commit_verified_proxy_recovery()?;
         }
-        self.remember_proxy_selection(group, proxy);
+        self.remember_proxy_selection(&canonical_group, proxy);
         self.snapshot
             .diagnostics
             .push(format!("Selected a new proxy in Mihomo group '{group}'."));
@@ -1531,6 +1563,57 @@ impl RuntimeManager {
         Ok(!affected_groups.is_empty())
     }
 
+    fn filter_blacklisted_automatic_group_members(&self, yaml: &mut String) -> Result<bool> {
+        if self.invalid_proxy_selections.is_empty() {
+            return Ok(false);
+        }
+        let mut config = serde_yaml::from_str::<YamlValue>(yaml)
+            .context("failed to parse generated Mihomo config for automatic group filtering")?;
+        let groups = config
+            .get_mut("proxy-groups")
+            .and_then(YamlValue::as_sequence_mut)
+            .context("generated Mihomo config has no proxy-groups sequence")?;
+        let mut changed = false;
+        for group in groups {
+            let Some(group_name) = group
+                .get("name")
+                .and_then(YamlValue::as_str)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let is_automatic = group
+                .get("type")
+                .and_then(YamlValue::as_str)
+                .is_some_and(|kind| !kind.eq_ignore_ascii_case("select"));
+            if !is_automatic {
+                continue;
+            }
+            let Some(rejected) = self.invalid_proxy_selections.get(&group_name) else {
+                continue;
+            };
+            let Some(members) = group
+                .get_mut("proxies")
+                .and_then(YamlValue::as_sequence_mut)
+            else {
+                continue;
+            };
+            let before = members.len();
+            members.retain(|member| member.as_str().is_none_or(|name| !rejected.contains(name)));
+            if members.is_empty() {
+                return Err(anyhow!(
+                    "No eligible VPN server remains for automatic selector '{group_name}'; choose or add another server"
+                ));
+            }
+            changed |= members.len() != before;
+        }
+        if changed {
+            *yaml = serde_yaml::to_string(&config)
+                .context("failed to render Mihomo config after automatic group filtering")?;
+        }
+        Ok(changed)
+    }
+
     fn normalize_request_proxy_selections(&self, request: &mut ConnectRequest) {
         self.strip_invalid_proxy_selections(&mut request.selected_proxies);
     }
@@ -1682,6 +1765,18 @@ fn proxy_recovery_gate(
     } else {
         ProxyRecoveryGate::VerifyMain(main_group.to_string())
     }
+}
+
+fn canonical_proxy_selection_group(policy: Option<&CompiledPolicy>, group: &str) -> String {
+    policy
+        .and_then(|policy| {
+            policy
+                .managed_proxy_groups
+                .iter()
+                .find(|managed| managed.name == group)
+        })
+        .map(|managed| managed.source_group.clone())
+        .unwrap_or_else(|| group.to_string())
 }
 
 fn proxy_selection_targets(
@@ -5349,9 +5444,7 @@ rules:
             )
             .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("No eligible VPN server remains for selector 'PROXY'"));
+        assert!(error.to_string().contains("No eligible VPN server remains"));
     }
 
     #[test]
@@ -5469,6 +5562,136 @@ rules:
         assert!(error
             .to_string()
             .contains("nested selector graph contains a cycle"));
+    }
+
+    #[test]
+    fn automatic_nested_group_excludes_rejected_leaf_from_generated_config() {
+        let mut manager = RuntimeManager::new();
+        let mut request = test_request();
+        request.profile_body = r#"
+proxies:
+  - name: A
+    type: direct
+  - name: B
+    type: direct
+proxy-groups:
+  - name: AUTO
+    type: url-test
+    url: https://example.com
+    interval: 300
+    proxies: [A, B]
+  - name: PROXY
+    type: select
+    proxies: [AUTO]
+rules:
+  - MATCH,PROXY
+"#
+        .to_string();
+        manager.activate_profile_scope(&request);
+        manager.record_invalid_proxy_selection("AUTO", "A");
+        manager.record_invalid_proxy_selection("PROXY", "A");
+
+        let generated = manager
+            .build_runtime_config_with_secret(&request, RuntimeMode::Smart, "secret".to_string())
+            .unwrap();
+        let yaml = serde_yaml::from_str::<YamlValue>(&generated.yaml).unwrap();
+        let auto = yaml["proxy-groups"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .find(|group| group["name"].as_str() == Some("AUTO"))
+            .unwrap();
+        assert_eq!(auto["proxies"].as_sequence().unwrap().len(), 1);
+        assert_eq!(auto["proxies"][0].as_str(), Some("B"));
+
+        manager.record_invalid_proxy_selection("AUTO", "B");
+        manager.record_invalid_proxy_selection("PROXY", "B");
+        let error = manager
+            .build_runtime_config_with_secret(&request, RuntimeMode::Smart, "retry".to_string())
+            .unwrap_err();
+        assert!(error.to_string().contains("No eligible VPN server remains"));
+    }
+
+    #[test]
+    fn consecutive_late_fallback_failures_advance_to_next_leaf() {
+        let mut manager = RuntimeManager::new();
+        let mut request = test_request();
+        request.profile_body = r#"
+proxies:
+  - name: A
+    type: direct
+  - name: B
+    type: direct
+  - name: C
+    type: direct
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies: [DIRECT, A, B, C]
+rules:
+  - MATCH,PROXY
+"#
+        .to_string();
+        manager.activate_profile_scope(&request);
+        let initial = manager
+            .build_runtime_config_with_secret(&request, RuntimeMode::VpnOnly, "first".to_string())
+            .unwrap();
+        manager.record_invalid_active_proxy_for_policy(
+            &initial.policy,
+            &ResolvedProxySelection {
+                leaf: "A".to_string(),
+                selectors: vec!["__BADVPN_VPN_ONLY__".to_string()],
+            },
+        );
+        manager.record_invalid_active_proxy_for_policy(
+            &initial.policy,
+            &ResolvedProxySelection {
+                leaf: "B".to_string(),
+                selectors: vec!["__BADVPN_VPN_ONLY__".to_string()],
+            },
+        );
+
+        let next = manager
+            .build_runtime_config_with_secret(&request, RuntimeMode::VpnOnly, "next".to_string())
+            .unwrap();
+        let yaml = serde_yaml::from_str::<YamlValue>(&next.yaml).unwrap();
+        let managed = yaml["proxy-groups"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .find(|group| group["name"].as_str() == Some("__BADVPN_VPN_ONLY__"))
+            .unwrap();
+        assert_eq!(managed["proxies"][0].as_str(), Some("C"));
+        let rejected = manager.invalid_proxy_selections.get("PROXY").unwrap();
+        assert!(rejected.contains("A") && rejected.contains("B"));
+    }
+
+    #[test]
+    fn managed_proxy_selection_canonicalizes_to_exact_source_group() {
+        let policy = CompiledPolicy {
+            mode: AppRouteMode::VpnOnly,
+            mihomo_rules: vec!["MATCH,__BADVPN_VPN_ONLY__".to_string()],
+            zapret_hostlist: Vec::new(),
+            zapret_hostlist_exclude: Vec::new(),
+            zapret_ipset: Vec::new(),
+            zapret_ipset_exclude: Vec::new(),
+            dns_nameserver_policy: Vec::new(),
+            diagnostics_expectations: Vec::new(),
+            diagnostics_messages: Vec::new(),
+            suppressed_rules: Vec::new(),
+            main_proxy_group: "__BADVPN_VPN_ONLY__".to_string(),
+            policy_rules: Vec::new(),
+            should_create_canonical_proxy_group: false,
+            managed_proxy_groups: vec![ManagedProxyGroup {
+                name: "__BADVPN_VPN_ONLY__".to_string(),
+                source_group: "PROXY".to_string(),
+                proxies: vec!["A".to_string(), "B".to_string()],
+            }],
+        };
+        assert_eq!(
+            canonical_proxy_selection_group(Some(&policy), "__BADVPN_VPN_ONLY__"),
+            "PROXY"
+        );
     }
 
     #[test]

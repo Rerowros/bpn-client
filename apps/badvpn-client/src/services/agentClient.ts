@@ -681,6 +681,7 @@ export interface PolicyDnsRuleView {
 
 export interface ManagedGroupView {
   name: string;
+  source_group: string;
   proxies: string[];
 }
 

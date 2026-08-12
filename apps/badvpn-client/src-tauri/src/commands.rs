@@ -2599,9 +2599,16 @@ pub async fn select_proxy(group: String, proxy: String) -> Result<ProxyCatalog, 
     }
 
     if should_use_agent_runtime() {
+        let persisted_group = match policy_summary().await {
+            Ok(summary) => canonical_persisted_proxy_group(&summary, group),
+            Err(_) => group.to_string(),
+        };
         let previous_selections = read_proxy_selections()?;
         let mut updated_selections = previous_selections.clone();
-        updated_selections.insert(group.to_string(), proxy.to_string());
+        updated_selections.insert(persisted_group.clone(), proxy.to_string());
+        if persisted_group != group {
+            updated_selections.remove(group);
+        }
         persist_proxy_selections(&updated_selections)?;
         if let Err(error) = send_agent_command(
             AgentCommand::SelectProxy {
@@ -2639,6 +2646,18 @@ pub async fn select_proxy(group: String, proxy: String) -> Result<ProxyCatalog, 
     }
     persist_proxy_selection(group, proxy)?;
     proxy_catalog().await
+}
+
+fn canonical_persisted_proxy_group(
+    summary: &badvpn_common::ipc::PolicySummaryResponse,
+    group: &str,
+) -> String {
+    summary
+        .managed_proxy_groups
+        .iter()
+        .find(|managed| managed.name == group && !managed.source_group.is_empty())
+        .map(|managed| managed.source_group.clone())
+        .unwrap_or_else(|| group.to_string())
 }
 
 #[tauri::command]
@@ -6256,6 +6275,9 @@ fn local_proxy_catalog() -> Result<Vec<ProxyGroupView>, String> {
                 .iter()
                 .filter_map(|group| {
                     let name = yaml_field(group, "name")?.to_string();
+                    if name.starts_with("__BADVPN_") {
+                        return None;
+                    }
                     let group_type = yaml_field(group, "type").unwrap_or("select").to_string();
                     let nodes = group
                         .get("proxies")
@@ -10146,6 +10168,22 @@ fn normalize_subscription_profile_description(
 #[cfg(test)]
 mod redaction_tests {
     use super::*;
+
+    #[test]
+    fn managed_proxy_persistence_uses_source_group() {
+        let mut summary = badvpn_common::ipc::PolicySummaryResponse::empty();
+        summary.managed_proxy_groups = vec![badvpn_common::ipc::ManagedGroupView {
+            name: "__BADVPN_VPN_ONLY__".to_string(),
+            source_group: "PROXY".to_string(),
+            proxies: vec!["A".to_string(), "B".to_string()],
+        }];
+
+        assert_eq!(
+            canonical_persisted_proxy_group(&summary, "__BADVPN_VPN_ONLY__"),
+            "PROXY"
+        );
+        assert_eq!(canonical_persisted_proxy_group(&summary, "OTHER"), "OTHER");
+    }
 
     #[test]
     fn proxy_selection_validation_rejects_stale_group_and_unknown_member() {

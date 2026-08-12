@@ -636,7 +636,7 @@ function mockPolicySummary(): PolicySummaryResponse {
       source: rule.source,
     })),
     diagnostics_messages: [],
-    managed_proxy_groups: [{ name: "Выбор сервера", proxies: ["NL Amsterdam", "DE Frankfurt", "US New York"] }],
+    managed_proxy_groups: [{ name: "Выбор сервера", source_group: "Выбор сервера", proxies: ["NL Amsterdam", "DE Frankfurt", "US New York"] }],
     rule_count: policyRules.length + 1,
     suppressed_count: 1,
     warnings_count: 0,
