@@ -155,7 +155,10 @@ impl Default for MihomoConfigOptions {
             ipv6: false,
             tun_enabled: true,
             tun_stack: "mixed".to_string(),
-            tun_strict_route: true,
+            // Windows multi-homed DNS (Hyper-V, Radmin, second NICs) plus Mihomo
+            // strict-route firewall rules can blackhole resolution when dns-hijack
+            // does not capture system DNS. Prefer auto-route + dns-hijack.
+            tun_strict_route: false,
             tun_auto_route: true,
             tun_auto_detect_interface: true,
             tun_mtu: 1500,
@@ -1158,6 +1161,8 @@ fn dns_yaml_base(
         insert_yaml(
             &mut map,
             "fake-ip-filter",
+            // Do not import provider country-TLD filters (e.g. +.ru): they force
+            // real IPs while strict/multi-homed Windows DNS is fragile.
             fake_ip_filter_sequence(existing, &fake_ip_filters),
         );
     }
@@ -1228,22 +1233,69 @@ fn fake_ip_filter_sequence(
         .into_iter()
         .flatten()
         .filter_map(serde_yaml::Value::as_str)
+        .filter(|value| is_safe_provider_fake_ip_filter(value))
         .map(ToOwned::to_owned)
         .collect::<std::collections::BTreeSet<_>>();
 
-    for domain in zapret_domains {
-        let domain = domain
-            .trim()
+    for entry in zapret_domains {
+        let entry = entry.trim();
+        if entry.is_empty() || entry.contains('/') {
+            continue;
+        }
+        if entry.starts_with("rule-set:") {
+            continue;
+        }
+        if entry.starts_with("+.") || entry.starts_with("*.") || entry.contains('*') {
+            filters.insert(entry.to_ascii_lowercase());
+            continue;
+        }
+        let domain = entry
             .trim_start_matches('.')
             .trim_end_matches('.')
             .to_ascii_lowercase();
-        if domain.is_empty() || domain.contains('/') || domain.contains('*') {
+        if domain.is_empty() || domain.contains('*') {
             continue;
         }
         filters.insert(format!("+.{domain}"));
     }
 
     serde_yaml::Value::Sequence(filters.into_iter().map(serde_yaml::Value::String).collect())
+}
+
+fn is_safe_provider_fake_ip_filter(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty() || value.starts_with("rule-set:") {
+        return false;
+    }
+    let bare = value
+        .trim_start_matches("+.")
+        .trim_start_matches("*.")
+        .trim_start_matches('.');
+    // Drop country/public TLD bypasses that force real IPs for huge domains.
+    if !bare.contains('.')
+        && matches!(
+            bare,
+            "ru" | "su" | "by" | "kz" | "ua" | "cn" | "xn--p1ai" | "com" | "net" | "org" | "info"
+        )
+    {
+        return false;
+    }
+    bare == "lan"
+        || bare == "local"
+        || bare.ends_with(".lan")
+        || bare.ends_with(".local")
+        || bare.contains("msftconnecttest")
+        || bare.contains("msftncsi")
+        || bare.contains("ntp.org")
+        || bare.contains("pool.ntp.org")
+        || bare.contains("time.windows.com")
+        || bare.contains("time.nist.gov")
+        || bare.contains("time.apple.com")
+        || bare.contains("connectivitycheck.gstatic.com")
+        || bare.contains("detectportal.firefox.com")
+        || bare.contains("localhost.ptlogin2.qq.com")
+        || bare.ends_with(".badvpn.pro")
+        || bare == "badvpn.pro"
 }
 
 fn base_config_yaml(secret: &str, options: &MihomoConfigOptions) -> String {
@@ -1748,7 +1800,7 @@ rules:
     #[test]
     fn clash_yaml_overlay_excludes_zapret_domains_from_fake_ip() {
         let generated = overlay_mihomo_config_yaml(
-            "dns:\n  fake-ip-filter:\n    - +.existing.example\nproxies:\n  - name: Test\n    type: direct\nproxy-groups:\n  - name: PROXY\n    type: select\n    proxies:\n      - Test\nrules:\n  - MATCH,PROXY\n",
+            "dns:\n  fake-ip-filter:\n    - +.existing.example\n    - +.ru\n    - +.lan\n    - rule-set:category-ru\nproxies:\n  - name: Test\n    type: direct\nproxy-groups:\n  - name: PROXY\n    type: select\n    proxies:\n      - Test\nrules:\n  - MATCH,PROXY\n",
             "secret",
             &MihomoConfigOptions::default(),
         )
@@ -1763,11 +1815,64 @@ rules:
             .filter_map(serde_yaml::Value::as_str)
             .collect::<std::collections::BTreeSet<_>>();
 
-        assert!(filters.contains("+.existing.example"));
+        assert!(filters.contains("+.lan"));
+        assert!(!filters.contains("+.ru"));
+        assert!(!filters.contains("+.existing.example"));
+        assert!(!filters.contains("rule-set:category-ru"));
         assert!(filters.contains("+.discord.com"));
         assert!(filters.contains("+.discord.gg"));
         assert!(filters.contains("+.googlevideo.com"));
         assert!(filters.contains("+.youtube.com"));
+    }
+
+    #[test]
+    fn vpn_only_strips_provider_country_tld_fake_ip_filters() {
+        let body = r#"
+dns:
+  enhanced-mode: fake-ip
+  fake-ip-filter:
+    - +.ru
+    - +.su
+    - +.lan
+    - rule-set:category-ru
+proxies:
+  - name: Germany
+    type: vless
+    server: germany.example.com
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000000
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - Germany
+rules:
+  - MATCH,PROXY
+"#;
+        let options = MihomoConfigOptions {
+            route_mode: RouteMode::VpnOnly,
+            dns_fake_ip_filter: vec!["+.local".to_string()],
+            ..MihomoConfigOptions::default()
+        };
+        let generated =
+            generate_mihomo_config_from_subscription_with_options(body, "secret", &options)
+                .unwrap();
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(&generated.yaml).unwrap();
+        let filters = yaml
+            .get("dns")
+            .and_then(|dns| dns.get("fake-ip-filter"))
+            .and_then(serde_yaml::Value::as_sequence)
+            .unwrap()
+            .iter()
+            .filter_map(serde_yaml::Value::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(filters.contains("+.lan"));
+        assert!(filters.contains("+.local"));
+        assert!(!filters.contains("+.ru"));
+        assert!(!filters.contains("+.su"));
+        assert!(!filters.contains("rule-set:category-ru"));
+        assert!(!filters.contains("+.discord.com"));
     }
 
     #[test]
