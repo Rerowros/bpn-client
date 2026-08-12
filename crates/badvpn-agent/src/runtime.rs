@@ -45,7 +45,10 @@ impl DesiredRuntimeState {
     }
 
     fn write(&self) -> Result<()> {
-        let path = Self::path();
+        self.write_to(&Self::path())
+    }
+
+    fn write_to(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -54,7 +57,11 @@ impl DesiredRuntimeState {
     }
 
     fn read() -> Option<Self> {
-        let content = fs::read_to_string(Self::path()).ok()?;
+        Self::read_from(&Self::path())
+    }
+
+    fn read_from(path: &Path) -> Option<Self> {
+        let content = fs::read_to_string(path).ok()?;
         serde_json::from_str(&content).ok()
     }
 
@@ -512,7 +519,12 @@ impl RuntimeManager {
                         return Err(error);
                     }
                     self.mihomo
-                        .validate(&mihomo_bin, &fallback_draft, self.config_store.home_dir())
+                        .validate_with_cancel(
+                            &mihomo_bin,
+                            &fallback_draft,
+                            self.config_store.home_dir(),
+                            cancel,
+                        )
                         .context("Mihomo rejected VPN-only probe fallback config")?;
                     if let Err(error) = check_cancel("Smart probe fallback validation") {
                         self.abort_started_connect(error.to_string());
@@ -546,14 +558,16 @@ impl RuntimeManager {
                             return Ok(self.snapshot.clone());
                         }
                         if let Err(ready_error) = self
-                            .mihomo
-                            .wait_ready(
+                            .wait_for_initial_mihomo_ready(
                                 request.settings.mihomo.controller_port,
-                                MIHOMO_READY_TIMEOUT,
                                 &fallback.secret,
+                                cancel,
                             )
                             .await
                         {
+                            if cancelled() {
+                                return Err(ready_error);
+                            }
                             let _ = self.mihomo.stop();
                             let _ = self.config_store.rollback_run();
                             let _ = self.zapret.stop();
@@ -4318,7 +4332,10 @@ pub fn cleanup_legacy_zapret_service() -> Result<String> {
 /// After agent/service restart, clean up orphaned owned processes and enter Safe Mode
 /// instead of auto-reconnecting. Product default: manual Connect from the UI.
 pub fn safe_mode_message() -> Option<String> {
-    let desired = DesiredRuntimeState::read()?;
+    safe_mode_message_from(DesiredRuntimeState::read()?)
+}
+
+fn safe_mode_message_from(desired: DesiredRuntimeState) -> Option<String> {
     if desired.safe_mode {
         desired.message.or_else(|| {
             Some(
@@ -4541,7 +4558,7 @@ mod architecture_fix_tests {
     #[test]
     fn desired_runtime_state_round_trips_safe_mode_flag() {
         let root = std::env::temp_dir().join(format!("badvpn-desired-{}", now_unix()));
-        std::env::set_var("BADVPN_AGENT_DATA_DIR", &root);
+        let path = root.join("runtime").join("desired-state.json");
         let state = DesiredRuntimeState {
             connected: false,
             desired_mode: RuntimeMode::Smart,
@@ -4552,13 +4569,15 @@ mod architecture_fix_tests {
             safe_mode: true,
             message: Some("Safe Mode test".to_string()),
         };
-        state.write().unwrap();
-        let loaded = DesiredRuntimeState::read().expect("desired state should load");
+        state.write_to(&path).unwrap();
+        let loaded = DesiredRuntimeState::read_from(&path).expect("desired state should load");
         assert!(loaded.safe_mode);
         assert_eq!(loaded.message.as_deref(), Some("Safe Mode test"));
-        assert_eq!(safe_mode_message().as_deref(), Some("Safe Mode test"));
+        assert_eq!(
+            safe_mode_message_from(loaded).as_deref(),
+            Some("Safe Mode test")
+        );
         let _ = fs::remove_dir_all(root);
-        std::env::remove_var("BADVPN_AGENT_DATA_DIR");
     }
 
     #[test]

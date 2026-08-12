@@ -66,7 +66,6 @@ impl AgentController {
                 if connecting.load(Ordering::SeqCst) {
                     continue;
                 }
-                cancel_watchdog_transition.store(false, Ordering::SeqCst);
                 // Publish the non-blocking snapshot path before taking `inner` so
                 // Status cannot lose a race and wait behind fallback validation.
                 watchdog_transition.store(true, Ordering::SeqCst);
@@ -314,11 +313,19 @@ impl AgentController {
                 .to_agent_state(guard.runtime.subscription.clone()),
         );
         guard.runtime.clear_error();
-        Ok(guard.runtime.snapshot())
+        let state = guard.runtime.snapshot();
+        drop(guard);
+        // A completed Stop establishes the idle baseline for future watchdog ticks.
+        // Never clear this while Stop is pending behind the runtime mutex.
+        self.cancel_watchdog_transition
+            .store(false, Ordering::SeqCst);
+        Ok(state)
     }
 
     pub async fn shutdown_cleanup(&mut self) -> anyhow::Result<()> {
         self.cancel_connect.store(true, Ordering::SeqCst);
+        self.cancel_watchdog_transition
+            .store(true, Ordering::SeqCst);
         if let Some(task) = self.connect_task.take() {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
             self.connecting.store(false, Ordering::SeqCst);
@@ -716,6 +723,61 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(250), stopper)
             .await
             .expect("Stop must complete after watchdog releases the runtime mutex")
+            .unwrap()
+            .unwrap();
+        holder.await.unwrap();
+        assert!(!cancel.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn pending_stop_cancellation_is_not_cleared_by_watchdog_transition_start() {
+        let controller = AgentController::default();
+        let held_inner = Arc::clone(&controller.inner);
+        let guard = held_inner.lock().await;
+        controller
+            .cancel_watchdog_transition
+            .store(true, Ordering::SeqCst);
+        controller.start_background_watchdog();
+
+        tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            while !controller.watchdog_transition.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("watchdog must publish transition before waiting for the mutex");
+
+        assert!(controller.cancel_watchdog_transition.load(Ordering::SeqCst));
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn shutdown_requests_watchdog_cancellation_before_waiting_for_runtime_mutex() {
+        let mut controller = AgentController::default();
+        let cancel = Arc::clone(&controller.cancel_watchdog_transition);
+        let cancel_for_holder = Arc::clone(&cancel);
+        let held_inner = Arc::clone(&controller.inner);
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let holder = tokio::spawn(async move {
+            let _guard = held_inner.lock().await;
+            let _ = locked_tx.send(());
+            while !cancel_for_holder.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        });
+        locked_rx.await.unwrap();
+        let cleanup = tokio::spawn(async move { controller.shutdown_cleanup().await });
+
+        tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            while !cancel.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown must signal watchdog cancellation before waiting for the mutex");
+        tokio::time::timeout(std::time::Duration::from_millis(250), cleanup)
+            .await
+            .expect("shutdown cleanup must complete after watchdog releases the mutex")
             .unwrap()
             .unwrap();
         holder.await.unwrap();

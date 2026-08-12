@@ -5926,23 +5926,57 @@ try {{
   }}
 }} catch {{
   $installFailure = $_.Exception.Message
-  if ($runtimeAssetsBackup -and (Test-Path -LiteralPath $runtimeAssetsBackup)) {{
-    if (Test-Path -LiteralPath $runtimeAssetsTarget) {{
-      Remove-Item -LiteralPath $runtimeAssetsTarget -Recurse -Force
+  $rollbackFailures = [System.Collections.Generic.List[string]]::new()
+
+  # Stop and remove any partially installed service before replacing its executable.
+  try {{
+    $partialService = Get-Service -Name '{service_name}' -ErrorAction SilentlyContinue
+    if ($partialService) {{
+      if ($partialService.Status -ne 'Stopped') {{
+        Stop-Service -Name '{service_name}' -ErrorAction Stop
+        $partialService.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(20))
+      }}
+      & $serviceAgent uninstall-service | Out-Null
+      if ($LASTEXITCODE -ne 0) {{ throw "partial badvpn-agent uninstall-service failed with exit code $LASTEXITCODE" }}
     }}
-    Move-Item -LiteralPath $runtimeAssetsBackup -Destination $runtimeAssetsTarget
+  }} catch {{
+    $rollbackFailures.Add("partial service removal: $($_.Exception.Message)")
   }}
-  if ($serviceAgentBackup -and (Test-Path -LiteralPath $serviceAgentBackup)) {{
-    Copy-Item -LiteralPath $serviceAgentBackup -Destination $serviceAgent -Force
-    Remove-Item -LiteralPath $serviceAgentBackup -Force -ErrorAction SilentlyContinue
+
+  try {{
+    if ($runtimeAssetsBackup -and (Test-Path -LiteralPath $runtimeAssetsBackup)) {{
+      if (Test-Path -LiteralPath $runtimeAssetsTarget) {{
+        Remove-Item -LiteralPath $runtimeAssetsTarget -Recurse -Force
+      }}
+      Move-Item -LiteralPath $runtimeAssetsBackup -Destination $runtimeAssetsTarget
+    }}
+  }} catch {{
+    $rollbackFailures.Add("runtime asset restore: $($_.Exception.Message)")
   }}
-  if ($allowedUserSidExisted) {{
-    Set-Content -LiteralPath $allowedUserSidPath -Value $previousAllowedUserSid -Encoding ascii -NoNewline
-  }} elseif (Test-Path -LiteralPath $allowedUserSidPath) {{
-    Remove-Item -LiteralPath $allowedUserSidPath -Force
+
+  $binaryRestored = -not $serviceExisted
+  try {{
+    if ($serviceAgentBackup -and (Test-Path -LiteralPath $serviceAgentBackup)) {{
+      Copy-Item -LiteralPath $serviceAgentBackup -Destination $serviceAgent -Force
+      $binaryRestored = $true
+    }} elseif ($serviceExisted) {{
+      throw "previous badvpn-agent executable backup is unavailable"
+    }}
+  }} catch {{
+    $rollbackFailures.Add("agent executable restore: $($_.Exception.Message)")
   }}
-  $serviceRollbackFailure = $null
-  if ($serviceExisted) {{
+
+  try {{
+    if ($allowedUserSidExisted) {{
+      Set-Content -LiteralPath $allowedUserSidPath -Value $previousAllowedUserSid -Encoding ascii -NoNewline
+    }} elseif (Test-Path -LiteralPath $allowedUserSidPath) {{
+      Remove-Item -LiteralPath $allowedUserSidPath -Force
+    }}
+  }} catch {{
+    $rollbackFailures.Add("allowed-user SID restore: $($_.Exception.Message)")
+  }}
+
+  if ($serviceExisted -and $binaryRestored) {{
     try {{
       & $serviceAgent install-service | Out-Null
       if ($LASTEXITCODE -ne 0) {{ throw "restored badvpn-agent install-service failed with exit code $LASTEXITCODE" }}
@@ -5955,24 +5989,19 @@ try {{
         $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(20))
       }}
     }} catch {{
-      $serviceRollbackFailure = $_.Exception.Message
+      $rollbackFailures.Add("previous service recreation: $($_.Exception.Message)")
     }}
-  }} else {{
+  }} elseif (-not $serviceExisted -and -not $serviceAgentExisted) {{
     try {{
-      $partialService = Get-Service -Name '{service_name}' -ErrorAction SilentlyContinue
-      if ($partialService) {{
-        & $serviceAgent uninstall-service | Out-Null
-        if ($LASTEXITCODE -ne 0) {{ throw "partial badvpn-agent uninstall-service failed with exit code $LASTEXITCODE" }}
-      }}
-      if (-not $serviceAgentExisted -and (Test-Path -LiteralPath $serviceAgent)) {{
+      if (Test-Path -LiteralPath $serviceAgent) {{
         Remove-Item -LiteralPath $serviceAgent -Force
       }}
     }} catch {{
-      $serviceRollbackFailure = $_.Exception.Message
+      $rollbackFailures.Add("new agent executable cleanup: $($_.Exception.Message)")
     }}
   }}
-  if ($serviceRollbackFailure) {{
-    throw "$installFailure Service rollback failed: $serviceRollbackFailure"
+  if ($rollbackFailures.Count -gt 0) {{
+    throw "$installFailure Rollback warnings: $($rollbackFailures -join '; ')"
   }}
   throw $installFailure
 }}
@@ -10621,10 +10650,17 @@ mod redaction_tests {
         assert!(restore_binary < install_calls[1]);
         assert!(restore_sid < install_calls[1]);
         assert!(install_calls[1] < restart);
-        assert!(script.contains("if ($serviceExisted) {"));
+        assert!(script.contains("if ($serviceExisted -and $binaryRestored) {"));
         assert!(script.contains("if ($wasRunning) {"));
         assert!(script.contains("elseif ($service.Status -ne 'Stopped')"));
-        assert!(script.contains("Service rollback failed:"));
+        assert!(script.contains("Rollback warnings:"));
+        assert!(script.contains("$rollbackFailures.Add(\"runtime asset restore:"));
+        assert!(script.contains("$rollbackFailures.Add(\"agent executable restore:"));
+        assert!(script.contains("$rollbackFailures.Add(\"allowed-user SID restore:"));
+        let remove_partial = script.find("& $serviceAgent uninstall-service").unwrap();
+        assert!(remove_partial < restore_assets);
+        assert!(remove_partial < restore_binary);
+        assert!(remove_partial < restore_sid);
 
         let syntax = Command::new("powershell.exe")
             .args([
@@ -10660,7 +10696,9 @@ mod redaction_tests {
         assert!(!script.contains("if (-not $wasRunning) {\n    $service = Get-Service"));
         // Rollback recreates an existing service from the restored old binary,
         // then explicitly restores running vs stopped state.
-        let rollback = script.find("if ($serviceExisted) {").unwrap();
+        let rollback = script
+            .find("if ($serviceExisted -and $binaryRestored) {")
+            .unwrap();
         let recreate = script[rollback..]
             .find("& $serviceAgent install-service")
             .map(|offset| rollback + offset)
