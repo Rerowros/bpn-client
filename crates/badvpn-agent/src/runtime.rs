@@ -110,12 +110,9 @@ impl RuntimeManager {
     pub async fn status_snapshot(&mut self) -> AgentRuntimeSnapshot {
         self.refresh_process_state();
         self.handle_late_mihomo_death();
-        if self.late_zapret_death_requires_fallback() {
-            if let Err(error) = self.fallback_to_vpn_only_after_late_zapret_death().await {
-                tracing::error!(%error, "failed to apply VPN-only fallback after late zapret death");
-                self.fail_closed_after_late_zapret_fallback(&error);
-            }
-        }
+        // The watchdog owns the mutating late-zapret fallback. Status remains
+        // observational so it cannot monopolize the runtime lock for validation,
+        // reload, and readiness checks.
         self.record_late_zapret_death_if_needed();
         if self.mihomo.is_running() {
             let port = self.last_controller_port();
@@ -1210,7 +1207,12 @@ impl RuntimeManager {
             && self.snapshot.zapret.state != RuntimeComponentState::Running
     }
 
-    pub(crate) async fn fallback_to_vpn_only_after_late_zapret_death(&mut self) -> Result<()> {
+    pub(crate) async fn fallback_to_vpn_only_after_late_zapret_death(
+        &mut self,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
+        let check_cancel = |phase: &str| check_connect_cancel(cancel, phase);
+        check_cancel("late zapret fallback planning")?;
         let request = self
             .last_request
             .clone()
@@ -1230,19 +1232,30 @@ impl RuntimeManager {
         self.write_zapret_lists_best_effort(&fallback.policy, "late zapret VPN-only fallback");
         self.record_policy_diagnostics(&fallback.policy);
         let fallback_draft = self.config_store.write_draft(&fallback.yaml)?;
+        check_cancel("late zapret fallback validation")?;
         self.mihomo
-            .validate(&mihomo_bin, &fallback_draft, self.config_store.home_dir())
-            .context("Mihomo rejected late zapret VPN-only fallback config")?;
-        let fallback_run = self.config_store.promote_draft_to_run(&fallback_draft)?;
-        if let Err(reload_error) = self
-            .mihomo
-            .reload(
-                fallback_run.as_path(),
-                request.settings.mihomo.controller_port,
-                &secret,
+            .validate_with_cancel(
+                &mihomo_bin,
+                &fallback_draft,
+                self.config_store.home_dir(),
+                cancel,
             )
-            .await
-        {
+            .context("Mihomo rejected late zapret VPN-only fallback config")?;
+        check_cancel("late zapret fallback promotion")?;
+        let fallback_run = self.config_store.promote_draft_to_run(&fallback_draft)?;
+        let reload = self.mihomo.reload(
+            fallback_run.as_path(),
+            request.settings.mihomo.controller_port,
+            &secret,
+        );
+        let reload_result = tokio::select! {
+            result = reload => result,
+            () = wait_for_connect_cancel(cancel), if cancel.is_some() => {
+                let _ = self.config_store.rollback_run();
+                return Err(anyhow!("connect cancelled during late zapret fallback reload"));
+            }
+        };
+        if let Err(reload_error) = reload_result {
             self.snapshot.diagnostics.push(format!(
                 "Mihomo reload failed during late zapret fallback; restarting: {reload_error}"
             ));
@@ -1259,15 +1272,21 @@ impl RuntimeManager {
                     "Mihomo restart failed during late zapret fallback: {start_error}"
                 ));
             }
-            if let Err(ready_error) = self
-                .mihomo
-                .wait_ready(
-                    request.settings.mihomo.controller_port,
-                    MIHOMO_READY_TIMEOUT,
-                    &secret,
-                )
-                .await
-            {
+            check_cancel("late zapret fallback restart")?;
+            let ready = self.mihomo.wait_ready(
+                request.settings.mihomo.controller_port,
+                MIHOMO_READY_TIMEOUT,
+                &secret,
+            );
+            let ready_result = tokio::select! {
+                result = ready => result,
+                () = wait_for_connect_cancel(cancel), if cancel.is_some() => {
+                    let _ = self.mihomo.stop();
+                    let _ = self.config_store.rollback_run();
+                    return Err(anyhow!("connect cancelled during late zapret fallback readiness"));
+                }
+            };
+            if let Err(ready_error) = ready_result {
                 let _ = self.mihomo.stop();
                 let _ = self.config_store.rollback_run();
                 let _ = self.zapret.stop();
@@ -1277,15 +1296,23 @@ impl RuntimeManager {
             }
         }
 
-        if let Err(close_error) = self
+        check_cancel("late zapret fallback connection cleanup")?;
+        let close_connections = self
             .mihomo
-            .close_connections(request.settings.mihomo.controller_port, &secret)
-            .await
-        {
+            .close_connections(request.settings.mihomo.controller_port, &secret);
+        let close_result = tokio::select! {
+            result = close_connections => result,
+            () = wait_for_connect_cancel(cancel), if cancel.is_some() => {
+                let _ = self.config_store.rollback_run();
+                return Err(anyhow!("connect cancelled during late zapret fallback cleanup"));
+            }
+        };
+        if let Err(close_error) = close_result {
             self.snapshot.diagnostics.push(format!(
                 "Mihomo connection cleanup warning after late zapret fallback: {close_error}"
             ));
         }
+        check_cancel("late zapret fallback commit")?;
         let _ = self.zapret.stop();
         self.config_store.commit_last_working()?;
         self.snapshot.phase = RuntimePhase::DegradedVpnOnly;
@@ -1767,6 +1794,16 @@ impl MihomoManager {
     }
 
     fn validate(&self, mihomo_bin: &Path, config_path: &Path, home_dir: &Path) -> Result<()> {
+        self.validate_with_cancel(mihomo_bin, config_path, home_dir, None)
+    }
+
+    fn validate_with_cancel(
+        &self,
+        mihomo_bin: &Path,
+        config_path: &Path,
+        home_dir: &Path,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
         tracing::debug!(
             mihomo = %mihomo_bin.display(),
             config = %config_path.display(),
@@ -1789,6 +1826,11 @@ impl MihomoManager {
         let started = Instant::now();
         let timed_out;
         let status = loop {
+            if connect_is_cancelled(cancel) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow!("connect cancelled during Mihomo validation"));
+            }
             if let Some(status) = child.try_wait()? {
                 timed_out = false;
                 break status;

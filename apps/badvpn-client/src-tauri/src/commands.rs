@@ -26,7 +26,7 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::sleep;
 use zip::ZipArchive;
@@ -36,8 +36,9 @@ use std::os::windows::process::CommandExt;
 
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_BUSY,
-    GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+    CloseHandle, GetLastError, LocalFree, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA,
+    ERROR_PIPE_BUSY, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 #[cfg(windows)]
 use windows_sys::Win32::Security::Cryptography::{
@@ -45,10 +46,14 @@ use windows_sys::Win32::Security::Cryptography::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING,
+    CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+#[cfg(windows)]
+use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -826,7 +831,7 @@ fn open_agent_pipe(timeout: Duration) -> Result<windows_sys::Win32::Foundation::
                 0,
                 std::ptr::null(),
                 OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
                 std::ptr::null_mut(),
             )
         };
@@ -855,21 +860,22 @@ fn write_pipe_all(
     mut data: &[u8],
 ) -> Result<(), String> {
     while !data.is_empty() {
-        let mut written = 0_u32;
-        let ok = unsafe {
-            WriteFile(
-                handle,
-                data.as_ptr().cast(),
-                data.len().min(u32::MAX as usize) as u32,
-                &mut written,
-                std::ptr::null_mut(),
-            )
-        } != 0;
-        if !ok {
-            return Err(format!(
-                "Failed to write agent named pipe request: {}",
-                std::io::Error::last_os_error()
-            ));
+        let written = overlapped_pipe_io(
+            handle,
+            Duration::from_secs(30),
+            "Timed out writing BadVpn agent named pipe request.",
+            |overlapped, transferred| unsafe {
+                WriteFile(
+                    handle,
+                    data.as_ptr(),
+                    data.len().min(u32::MAX as usize) as u32,
+                    transferred,
+                    overlapped,
+                )
+            },
+        )?;
+        if written == 0 {
+            return Err("BadVpn agent named pipe accepted zero request bytes.".to_string());
         }
         data = &data[written as usize..];
     }
@@ -880,38 +886,30 @@ fn write_pipe_all(
 fn read_pipe_line(handle: windows_sys::Win32::Foundation::HANDLE) -> Result<String, String> {
     let mut data = Vec::new();
     let mut buffer = [0_u8; 4096];
-    let started = SystemTime::now();
-    let timeout = Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let mut read = 0_u32;
-        let ok = unsafe {
-            ReadFile(
-                handle,
-                buffer.as_mut_ptr().cast(),
-                buffer.len() as u32,
-                &mut read,
-                std::ptr::null_mut(),
-            )
-        } != 0;
-        if !ok {
-            let error = unsafe { GetLastError() };
-            if error == ERROR_NO_DATA {
-                if started.elapsed().map_or(true, |elapsed| elapsed >= timeout) {
-                    return Err(
-                        "Timed out waiting for BadVpn agent named pipe response.".to_string()
-                    );
-                }
-                std::thread::sleep(Duration::from_millis(20));
-                continue;
-            }
-            if error == ERROR_BROKEN_PIPE && !data.is_empty() {
-                break;
-            }
-            return Err(format!(
-                "Failed to read agent named pipe response: {}",
-                std::io::Error::last_os_error()
-            ));
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("Timed out waiting for BadVpn agent named pipe response.".to_string());
         }
+        let read = match overlapped_pipe_io(
+            handle,
+            remaining,
+            "Timed out waiting for BadVpn agent named pipe response.",
+            |overlapped, transferred| unsafe {
+                ReadFile(
+                    handle,
+                    buffer.as_mut_ptr(),
+                    buffer.len() as u32,
+                    transferred,
+                    overlapped,
+                )
+            },
+        ) {
+            Ok(read) => read,
+            Err(error) if error.contains("broken pipe") && !data.is_empty() => break,
+            Err(error) => return Err(error),
+        };
         if read == 0 {
             break;
         }
@@ -922,13 +920,84 @@ fn read_pipe_line(handle: windows_sys::Win32::Foundation::HANDLE) -> Result<Stri
         if data.len() > 1024 * 1024 {
             return Err("Agent response exceeded maximum IPC frame size.".to_string());
         }
-        if started.elapsed().map_or(true, |elapsed| elapsed >= timeout) {
-            return Err("Timed out reading BadVpn agent named pipe response.".to_string());
-        }
     }
     String::from_utf8(data)
         .map(|line| line.trim_end_matches(['\r', '\n']).to_string())
         .map_err(|error| format!("Agent response was not valid UTF-8: {error}"))
+}
+
+#[cfg(windows)]
+fn overlapped_pipe_io(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    timeout: Duration,
+    timeout_message: &str,
+    issue: impl FnOnce(*mut OVERLAPPED, *mut u32) -> i32,
+) -> Result<u32, String> {
+    let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+    if event.is_null() {
+        return Err(format!(
+            "Failed to create named pipe I/O event: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let result = (|| {
+        let mut overlapped = OVERLAPPED {
+            hEvent: event,
+            ..Default::default()
+        };
+        let mut transferred = 0_u32;
+        if issue(&mut overlapped, &mut transferred) != 0 {
+            return Ok(transferred);
+        }
+        let error = unsafe { GetLastError() };
+        if error != ERROR_IO_PENDING {
+            if error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA {
+                return Err("BadVpn agent named pipe was closed (broken pipe).".to_string());
+            }
+            return Err(format!(
+                "Failed to perform BadVpn agent named pipe I/O: {}",
+                std::io::Error::from_raw_os_error(error as i32)
+            ));
+        }
+
+        let timeout_ms = timeout.as_millis().clamp(1, u32::MAX as u128) as u32;
+        match unsafe { WaitForSingleObject(event, timeout_ms) } {
+            WAIT_OBJECT_0 => {
+                if unsafe { GetOverlappedResult(handle, &overlapped, &mut transferred, 0) } == 0 {
+                    let error = unsafe { GetLastError() };
+                    if error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA {
+                        return Err("BadVpn agent named pipe was closed (broken pipe).".to_string());
+                    }
+                    return Err(format!(
+                        "Failed to complete BadVpn agent named pipe I/O: {}",
+                        std::io::Error::from_raw_os_error(error as i32)
+                    ));
+                }
+                Ok(transferred)
+            }
+            WAIT_TIMEOUT => {
+                // Wait for cancellation completion before the OVERLAPPED/event/buffer leave scope.
+                unsafe {
+                    let _ = CancelIoEx(handle, &overlapped);
+                    let _ = GetOverlappedResult(handle, &overlapped, &mut transferred, 1);
+                }
+                Err(timeout_message.to_string())
+            }
+            wait_error => {
+                unsafe {
+                    let _ = CancelIoEx(handle, &overlapped);
+                    let _ = GetOverlappedResult(handle, &overlapped, &mut transferred, 1);
+                }
+                Err(format!(
+                    "Named pipe I/O wait failed with status {wait_error}."
+                ))
+            }
+        }
+    })();
+    unsafe {
+        CloseHandle(event);
+    }
+    result
 }
 
 #[cfg(windows)]
@@ -5817,19 +5886,66 @@ New-Item -ItemType Directory -Path $serviceAgentDir -Force | Out-Null
 $invokingUserSid = '{invoking_user_sid}'
 Set-Content -LiteralPath (Join-Path $serviceAgentDir 'allowed-user.sid') -Value $invokingUserSid -Encoding ascii -NoNewline
 $service = Get-Service -Name '{service_name}' -ErrorAction SilentlyContinue
-if ($service -and $service.Status -ne 'Stopped') {{
-  sc.exe stop '{service_name}' | Out-Null
-  $deadline = (Get-Date).AddSeconds(20)
-  do {{
-    Start-Sleep -Milliseconds 250
-    $service = Get-Service -Name '{service_name}' -ErrorAction SilentlyContinue
-  }} while ($service -and $service.Status -ne 'Stopped' -and (Get-Date) -lt $deadline)
-  if ($service -and $service.Status -ne 'Stopped') {{ throw "{service_name} did not stop before agent repair" }}
-}}
+$wasRunning = [bool]($service -and $service.Status -eq 'Running')
+$serviceAgentBackup = $null
+try {{
+  if ($service -and $service.Status -ne 'Stopped') {{
+    sc.exe stop '{service_name}' | Out-Null
+    $deadline = (Get-Date).AddSeconds(20)
+    do {{
+      Start-Sleep -Milliseconds 250
+      $service = Get-Service -Name '{service_name}' -ErrorAction SilentlyContinue
+    }} while ($service -and $service.Status -ne 'Stopped' -and (Get-Date) -lt $deadline)
+    if ($service -and $service.Status -ne 'Stopped') {{ throw "{service_name} did not stop before agent repair" }}
+  }}
 {staging_script}
-Copy-Item -LiteralPath $sourceAgent -Destination $serviceAgent -Force
-& $serviceAgent install-service | Out-Null
-if ($LASTEXITCODE -ne 0) {{ throw "badvpn-agent install-service failed with exit code $LASTEXITCODE" }}
+  if (Test-Path -LiteralPath $serviceAgent -PathType Leaf) {{
+    $serviceAgentBackup = "$serviceAgent.backup-$([Guid]::NewGuid().ToString('N'))"
+    Copy-Item -LiteralPath $serviceAgent -Destination $serviceAgentBackup -Force
+  }}
+  Copy-Item -LiteralPath $sourceAgent -Destination $serviceAgent -Force
+  & $serviceAgent install-service | Out-Null
+  if ($LASTEXITCODE -ne 0) {{ throw "badvpn-agent install-service failed with exit code $LASTEXITCODE" }}
+  if (-not $wasRunning) {{
+    $service = Get-Service -Name '{service_name}' -ErrorAction SilentlyContinue
+    if ($service -and $service.Status -ne 'Stopped') {{
+      Stop-Service -Name '{service_name}' -ErrorAction Stop
+      $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(20))
+    }}
+  }}
+  if ($runtimeAssetsBackup -and (Test-Path -LiteralPath $runtimeAssetsBackup)) {{
+    Remove-Item -LiteralPath $runtimeAssetsBackup -Recurse -Force -ErrorAction SilentlyContinue
+  }}
+  if ($serviceAgentBackup -and (Test-Path -LiteralPath $serviceAgentBackup)) {{
+    Remove-Item -LiteralPath $serviceAgentBackup -Force -ErrorAction SilentlyContinue
+  }}
+}} catch {{
+  $installFailure = $_.Exception.Message
+  if ($runtimeAssetsBackup -and (Test-Path -LiteralPath $runtimeAssetsBackup)) {{
+    if (Test-Path -LiteralPath $runtimeAssetsTarget) {{
+      Remove-Item -LiteralPath $runtimeAssetsTarget -Recurse -Force
+    }}
+    Move-Item -LiteralPath $runtimeAssetsBackup -Destination $runtimeAssetsTarget
+  }}
+  if ($serviceAgentBackup -and (Test-Path -LiteralPath $serviceAgentBackup)) {{
+    Copy-Item -LiteralPath $serviceAgentBackup -Destination $serviceAgent -Force
+    Remove-Item -LiteralPath $serviceAgentBackup -Force -ErrorAction SilentlyContinue
+  }}
+  $restartFailure = $null
+  if ($wasRunning) {{
+    try {{
+      Start-Service -Name '{service_name}' -ErrorAction Stop
+      $service = Get-Service -Name '{service_name}' -ErrorAction Stop
+      $service.WaitForStatus('Running', [TimeSpan]::FromSeconds(20))
+    }} catch {{
+      $restartFailure = $_.Exception.Message
+    }}
+  }}
+  if ($restartFailure) {{
+    throw "$installFailure Previously running {service_name} could not be restarted: $restartFailure"
+  }}
+  throw $installFailure
+}}
 "#,
         agent = powershell_single_quote(&agent_bin.to_string_lossy()),
         service_agent = powershell_single_quote(&service_agent_bin.to_string_lossy()),
@@ -5898,8 +6014,11 @@ fn stage_runtime_assets_powershell() -> Result<String, String> {
         .collect::<Vec<_>>()
         .join(", ");
     Ok(format!(
-        r#"$sourceComponents = '{source_components}'
+        r#"$runtimeAssetsBackup = $null
+$runtimeAssetsTarget = $null
+$sourceComponents = '{source_components}'
 $targetComponents = '{target_components}'
+$runtimeAssetsTarget = $targetComponents
 if (Test-Path -LiteralPath $sourceComponents) {{
   $mihomoCandidates = @(
     (Join-Path $sourceComponents 'mihomo.exe'),
@@ -5990,6 +6109,7 @@ if (Test-Path -LiteralPath $sourceComponents) {{
     if (Test-Path -LiteralPath $targetComponents) {{
       Move-Item -LiteralPath $targetComponents -Destination $backupComponents
       $targetWasMoved = $true
+      $runtimeAssetsBackup = $backupComponents
     }}
     try {{
       Move-Item -LiteralPath $stagingComponents -Destination $targetComponents
@@ -6000,11 +6120,9 @@ if (Test-Path -LiteralPath $sourceComponents) {{
       if ($targetWasMoved -and (Test-Path -LiteralPath $backupComponents)) {{
         Move-Item -LiteralPath $backupComponents -Destination $targetComponents
         $targetWasMoved = $false
+        $runtimeAssetsBackup = $null
       }}
       throw
-    }}
-    if (Test-Path -LiteralPath $backupComponents) {{
-      Remove-Item -LiteralPath $backupComponents -Recurse -Force -ErrorAction SilentlyContinue
     }}
   }} catch {{
     if (Test-Path -LiteralPath $stagingComponents) {{
@@ -6012,6 +6130,7 @@ if (Test-Path -LiteralPath $sourceComponents) {{
     }}
     if ($targetWasMoved -and (Test-Path -LiteralPath $backupComponents) -and -not (Test-Path -LiteralPath $targetComponents)) {{
       Move-Item -LiteralPath $backupComponents -Destination $targetComponents
+      $runtimeAssetsBackup = $null
     }}
     throw
   }}
@@ -6037,6 +6156,9 @@ fn stage_runtime_assets_to_programdata() -> Result<(), String> {
 {}
 "#,
             stage_runtime_assets_powershell()?
+        );
+        let script = format!(
+            "{script}\nif ($runtimeAssetsBackup -and (Test-Path -LiteralPath $runtimeAssetsBackup)) {{ Remove-Item -LiteralPath $runtimeAssetsBackup -Recurse -Force }}\n"
         );
         run_elevated_powershell_script(&script)
     }
@@ -10415,6 +10537,58 @@ mod redaction_tests {
         );
         assert!(script.contains("$invokingUserSid = 'S-1-5-21-1-2-3-1001'"));
         assert!(!script.contains("Win32_ComputerSystem"));
+        assert!(
+            script.contains("$wasRunning = [bool]($service -and $service.Status -eq 'Running')")
+        );
+        assert!(script.contains("if ($wasRunning) {"));
+        assert!(script.contains("Start-Service -Name 'badvpn-agent' -ErrorAction Stop"));
+        assert!(script.contains("if (-not $wasRunning) {"));
+        assert!(script.contains("Stop-Service -Name 'badvpn-agent' -ErrorAction Stop"));
+        assert!(script.contains("Previously running badvpn-agent could not be restarted"));
+        let catch = script.find("} catch {").unwrap();
+        let restore_assets = script
+            .find("Move-Item -LiteralPath $runtimeAssetsBackup -Destination $runtimeAssetsTarget")
+            .unwrap();
+        let restart = script.find("Start-Service -Name 'badvpn-agent'").unwrap();
+        assert!(catch < restore_assets);
+        assert!(restore_assets < restart);
+
+        let syntax = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$tokens=$null; $errors=$null; [void][System.Management.Automation.Language.Parser]::ParseInput($env:BADVPN_TEST_SCRIPT,[ref]$tokens,[ref]$errors); if ($errors.Count) { $errors | ForEach-Object { Write-Error $_ }; exit 1 }",
+            ])
+            .env("BADVPN_TEST_SCRIPT", &script)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            syntax.status.success(),
+            "PowerShell install script syntax failed: {}",
+            String::from_utf8_lossy(&syntax.stderr)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn named_pipe_client_uses_overlapped_io_with_bounded_cancellation() {
+        let source = include_str!("commands.rs");
+        let open_pipe = source
+            .find("FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED")
+            .unwrap();
+        let read = source.find("fn read_pipe_line").unwrap();
+        let wait = source
+            .find("WaitForSingleObject(event, timeout_ms)")
+            .unwrap();
+        let cancel = source.find("CancelIoEx(handle, &overlapped)").unwrap();
+        let complete = source
+            .find("GetOverlappedResult(handle, &overlapped, &mut transferred, 1)")
+            .unwrap();
+        assert!(open_pipe < read);
+        assert!(read < wait && wait < cancel && cancel < complete);
+        assert!(source.contains("Instant::now() + Duration::from_secs(30)"));
     }
 
     #[cfg(windows)]

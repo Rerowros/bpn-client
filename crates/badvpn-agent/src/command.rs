@@ -28,6 +28,8 @@ pub struct AgentController {
     inner: Arc<Mutex<AgentInner>>,
     connecting: Arc<AtomicBool>,
     cancel_connect: Arc<AtomicBool>,
+    watchdog_transition: Arc<AtomicBool>,
+    cancel_watchdog_transition: Arc<AtomicBool>,
     connect_task: Option<tokio::task::JoinHandle<()>>,
     /// Progress visible to Status while connect holds the runtime lock.
     progress: Arc<std::sync::RwLock<AgentState>>,
@@ -42,6 +44,8 @@ impl Default for AgentController {
             })),
             connecting: Arc::new(AtomicBool::new(false)),
             cancel_connect: Arc::new(AtomicBool::new(false)),
+            watchdog_transition: Arc::new(AtomicBool::new(false)),
+            cancel_watchdog_transition: Arc::new(AtomicBool::new(false)),
             connect_task: None,
             progress: Arc::new(std::sync::RwLock::new(AgentState::default())),
         }
@@ -53,6 +57,8 @@ impl AgentController {
         let inner = Arc::clone(&self.inner);
         let connecting = Arc::clone(&self.connecting);
         let progress = Arc::clone(&self.progress);
+        let watchdog_transition = Arc::clone(&self.watchdog_transition);
+        let cancel_watchdog_transition = Arc::clone(&self.cancel_watchdog_transition);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
@@ -60,13 +66,32 @@ impl AgentController {
                 if connecting.load(Ordering::SeqCst) {
                     continue;
                 }
+                cancel_watchdog_transition.store(false, Ordering::SeqCst);
+                // Publish the non-blocking snapshot path before taking `inner` so
+                // Status cannot lose a race and wait behind fallback validation.
+                watchdog_transition.store(true, Ordering::SeqCst);
                 let mut guard = inner.lock().await;
+                if cancel_watchdog_transition.load(Ordering::SeqCst) {
+                    drop(guard);
+                    watchdog_transition.store(false, Ordering::SeqCst);
+                    continue;
+                }
                 guard.manager.refresh_process_state_for_watchdog();
                 guard.manager.handle_late_mihomo_death_for_watchdog();
                 if guard.manager.late_zapret_death_requires_fallback() {
+                    guard.runtime = AgentRuntimeState::from_agent_state(
+                        guard
+                            .manager
+                            .to_agent_state(guard.runtime.subscription.clone()),
+                    );
+                    if let Ok(mut slot) = progress.write() {
+                        *slot = guard.runtime.snapshot();
+                    }
                     match guard
                         .manager
-                        .fallback_to_vpn_only_after_late_zapret_death()
+                        .fallback_to_vpn_only_after_late_zapret_death(Some(
+                            cancel_watchdog_transition.as_ref(),
+                        ))
                         .await
                     {
                         Ok(()) => {
@@ -79,7 +104,9 @@ impl AgentController {
                                 %error,
                                 "watchdog failed to apply VPN-only fallback after late zapret death"
                             );
-                            guard.manager.fail_closed_after_late_zapret_fallback(&error);
+                            if !cancel_watchdog_transition.load(Ordering::SeqCst) {
+                                guard.manager.fail_closed_after_late_zapret_fallback(&error);
+                            }
                         }
                     }
                 }
@@ -93,6 +120,8 @@ impl AgentController {
                 if let Ok(mut slot) = progress.write() {
                     *slot = guard.runtime.snapshot();
                 }
+                drop(guard);
+                watchdog_transition.store(false, Ordering::SeqCst);
             }
         });
     }
@@ -136,7 +165,8 @@ impl AgentController {
     async fn runtime_status(&mut self) -> BadVpnResult<AgentState> {
         // Prefer a non-blocking view while connect is running so status polling
         // cannot wait behind a long Connect on the serial named-pipe loop.
-        if self.connecting.load(Ordering::SeqCst) {
+        if self.connecting.load(Ordering::SeqCst) || self.watchdog_transition.load(Ordering::SeqCst)
+        {
             if let Ok(progress) = self.progress.read() {
                 return Ok(progress.clone());
             }
@@ -261,6 +291,10 @@ impl AgentController {
 
     async fn stop(&mut self) -> BadVpnResult<AgentState> {
         self.cancel_connect.store(true, Ordering::SeqCst);
+        // This is intentionally set before taking `inner`: a watchdog fallback may
+        // hold that mutex while waiting on Mihomo, but will observe cancellation.
+        self.cancel_watchdog_transition
+            .store(true, Ordering::SeqCst);
         if let Some(task) = self.connect_task.take() {
             // Give the connect loop a moment to observe cancel, then detach if stuck.
             let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
@@ -601,5 +635,60 @@ mod tests {
         if let Some(task) = controller.connect_task.take() {
             task.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn status_remains_responsive_while_watchdog_transition_holds_runtime_mutex() {
+        let mut controller = AgentController::default();
+        controller.watchdog_transition.store(true, Ordering::SeqCst);
+        let held_inner = Arc::clone(&controller.inner);
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let holder = tokio::spawn(async move {
+            let _guard = held_inner.lock().await;
+            let _ = locked_tx.send(());
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        });
+        locked_rx.await.unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            controller.runtime_status(),
+        )
+        .await
+        .expect("Status must use the progress snapshot during watchdog fallback")
+        .unwrap();
+        holder.abort();
+    }
+
+    #[tokio::test]
+    async fn stop_requests_watchdog_cancellation_before_waiting_for_runtime_mutex() {
+        let mut controller = AgentController::default();
+        let cancel = Arc::clone(&controller.cancel_watchdog_transition);
+        let cancel_for_holder = Arc::clone(&cancel);
+        let held_inner = Arc::clone(&controller.inner);
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let holder = tokio::spawn(async move {
+            let _guard = held_inner.lock().await;
+            let _ = locked_tx.send(());
+            while !cancel_for_holder.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        });
+        locked_rx.await.unwrap();
+        let stopper = tokio::spawn(async move { controller.stop().await });
+
+        tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            while !cancel.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Stop must signal watchdog cancellation without waiting for the mutex");
+        tokio::time::timeout(std::time::Duration::from_millis(250), stopper)
+            .await
+            .expect("Stop must complete after watchdog releases the runtime mutex")
+            .unwrap()
+            .unwrap();
+        holder.await.unwrap();
     }
 }
