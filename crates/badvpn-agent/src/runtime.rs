@@ -1416,6 +1416,15 @@ impl RuntimeManager {
 
     fn remember_proxy_selection(&mut self, group: &str, proxy: &str) {
         self.clear_invalid_proxy_selection(group, proxy);
+        let descendant_groups = self
+            .active_policy
+            .as_ref()
+            .zip(self.last_request.as_ref())
+            .and_then(|(policy, request)| {
+                selector_descendants_reaching_leaf_for_policy(&request.profile_body, policy, proxy)
+                    .ok()
+            })
+            .unwrap_or_default();
 
         // VPN Only (and Smart when the provider MATCH group contains DIRECT) rewrites the
         // live provider group to a managed MATCH group such as __BADVPN_VPN_ONLY__. Mirror
@@ -1450,6 +1459,9 @@ impl RuntimeManager {
         }
         for managed_name in mirrored_groups {
             self.clear_invalid_proxy_selection(&managed_name, proxy);
+        }
+        for descendant_group in descendant_groups {
+            self.clear_invalid_proxy_selection(&descendant_group, proxy);
         }
         self.persist_invalid_proxy_selections_best_effort();
     }
@@ -5790,6 +5802,58 @@ rules:
             .invalid_proxy_selections
             .get("AUTO")
             .is_some_and(|rejected| rejected.contains("A")));
+        let reconnect = manager
+            .build_runtime_config_with_secret(
+                &request,
+                RuntimeMode::VpnOnly,
+                "reconnect".to_string(),
+            )
+            .unwrap();
+        let yaml = serde_yaml::from_str::<YamlValue>(&reconnect.yaml).unwrap();
+        let auto = yaml["proxy-groups"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .find(|group| group["name"].as_str() == Some("AUTO"))
+            .unwrap();
+        assert_eq!(auto["proxies"].as_sequence().unwrap().len(), 1);
+        assert_eq!(auto["proxies"][0].as_str(), Some("B"));
+    }
+
+    #[test]
+    fn successful_managed_recovery_clears_leaf_from_descendant_automatic_group() {
+        let mut manager = RuntimeManager::new();
+        let mut request = test_request();
+        request.profile_body = r#"
+proxies:
+  - { name: A, type: direct }
+  - { name: B, type: direct }
+proxy-groups:
+  - { name: AUTO, type: url-test, proxies: [A, B] }
+  - { name: PROXY, type: select, proxies: [DIRECT, AUTO] }
+rules:
+  - MATCH,PROXY
+"#
+        .to_string();
+        manager.activate_profile_scope(&request);
+        let initial = manager
+            .build_runtime_config_with_secret(&request, RuntimeMode::VpnOnly, "initial".to_string())
+            .unwrap();
+        manager.active_policy = Some(initial.policy);
+        manager.last_request = Some(request.clone());
+        for group in ["PROXY", "AUTO", "__BADVPN_VPN_ONLY__"] {
+            manager.record_invalid_proxy_selection(group, "A");
+            manager.record_invalid_proxy_selection(group, "B");
+        }
+
+        // A verified click on flattened managed B is persisted canonically as PROXY/B.
+        manager.remember_proxy_selection("PROXY", "B");
+
+        for group in ["PROXY", "AUTO", "__BADVPN_VPN_ONLY__"] {
+            let rejected = manager.invalid_proxy_selections.get(group).unwrap();
+            assert!(rejected.contains("A"));
+            assert!(!rejected.contains("B"));
+        }
         let reconnect = manager
             .build_runtime_config_with_secret(
                 &request,
