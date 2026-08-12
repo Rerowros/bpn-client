@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::Read,
     net::{TcpListener, UdpSocket},
@@ -33,6 +34,8 @@ pub struct RuntimeManager {
     mihomo: MihomoManager,
     zapret: ZapretManager,
     pub active_policy: Option<CompiledPolicy>,
+    /// Group -> proxy pairs that failed egress verification and must not be re-applied on reconnect.
+    invalid_proxy_selections: BTreeMap<String, String>,
 }
 
 impl RuntimeManager {
@@ -46,6 +49,7 @@ impl RuntimeManager {
             mihomo: MihomoManager::default(),
             zapret: ZapretManager::default(),
             active_policy: None,
+            invalid_proxy_selections: BTreeMap::new(),
         }
     }
 
@@ -312,14 +316,32 @@ impl RuntimeManager {
             .await
         {
             tracing::error!(%error, "Mihomo proxy egress verification failed");
-            let _ = self.mihomo.stop();
-            let _ = self.zapret.stop();
-            let _ = self.config_store.rollback_run();
+            // Keep Mihomo (and zapret) running so the user can recover via select_proxy
+            // without tearing down the controller, and so reconnect can drop the dead
+            // cached selection instead of looping on the same failed path.
+            self.record_invalid_proxy_selections_for_policy(&runtime_config.policy);
+            self.snapshot.effective_mode = effective_mode;
+            self.snapshot.mihomo = RuntimeComponentSnapshot::new(
+                RuntimeComponentState::Running,
+                Some(format!(
+                    "controller 127.0.0.1:{} (egress verification failed)",
+                    request.settings.mihomo.controller_port
+                )),
+            );
+            self.snapshot.active_config_id = Some(runtime_config.config_id.clone());
+            self.active_policy = Some(runtime_config.policy.clone());
+            if let Err(summary_error) = self
+                .config_store
+                .write_policy_summary(&runtime_config.policy)
+            {
+                tracing::warn!(%summary_error, "failed to write policy summary after egress failure");
+            }
             self.set_error(format!(
-                "Mihomo started, but the selected VPN path cannot reach the internet: {error}"
+                "Mihomo started, but the selected VPN path cannot reach the internet: {error}. Choose another server, then reconnect if needed."
             ));
             return Ok(self.snapshot.clone());
         }
+        self.invalid_proxy_selections.clear();
         timeline.mark("proxy_egress_ms");
         if request.settings.diagnostics.discord_youtube_probes
             && effective_mode == RuntimeMode::Smart
@@ -713,6 +735,7 @@ impl RuntimeManager {
         let mut options = request.settings.mihomo.clone();
         options.route_mode = mode.as_route_mode();
         options.selected_proxies = request.selected_proxies.clone();
+        self.strip_invalid_proxy_selections(&mut options.selected_proxies);
         if mode == RuntimeMode::VpnOnly {
             options.zapret_direct_domains.clear();
             options.zapret_direct_cidrs.clear();
@@ -864,29 +887,54 @@ impl RuntimeManager {
     }
 
     fn handle_late_mihomo_death(&mut self) {
-        if !matches!(
-            self.snapshot.phase,
-            RuntimePhase::Running | RuntimePhase::DegradedVpnOnly
-        ) || self.snapshot.mihomo.state == RuntimeComponentState::Running
-        {
+        if self.snapshot.mihomo.state == RuntimeComponentState::Running {
             return;
         }
 
-        let detail = self
-            .snapshot
-            .mihomo
-            .detail
-            .clone()
-            .unwrap_or_else(|| "Mihomo is no longer running.".to_string());
-        if let Err(error) = self.zapret.stop() {
-            self.snapshot
-                .diagnostics
-                .push(format!("Failed to stop winws after Mihomo exited: {error}"));
+        match self.snapshot.phase {
+            RuntimePhase::Running | RuntimePhase::DegradedVpnOnly => {
+                let detail = self
+                    .snapshot
+                    .mihomo
+                    .detail
+                    .clone()
+                    .unwrap_or_else(|| "Mihomo is no longer running.".to_string());
+                if let Err(error) = self.zapret.stop() {
+                    self.snapshot
+                        .diagnostics
+                        .push(format!("Failed to stop winws after Mihomo exited: {error}"));
+                }
+                self.refresh_process_state();
+                self.set_error(format!(
+                    "Mihomo stopped unexpectedly; VPN routing is no longer active. {detail} Reconnect to restore the connection."
+                ));
+            }
+            RuntimePhase::Error
+                if self.snapshot.zapret.state == RuntimeComponentState::Running
+                    || self.zapret.is_running() =>
+            {
+                // Recoverable egress-failure Error keeps Mihomo up; if Mihomo later dies,
+                // still tear down zapret so Smart DIRECT rules are not left half-live.
+                if let Err(error) = self.zapret.stop() {
+                    self.snapshot
+                        .diagnostics
+                        .push(format!("Failed to stop winws after Mihomo exited: {error}"));
+                }
+                self.refresh_process_state();
+                if self
+                    .snapshot
+                    .last_error
+                    .as_deref()
+                    .is_none_or(|message| !message.contains("VPN routing is no longer active"))
+                {
+                    self.set_error(
+                        "Mihomo stopped unexpectedly while recovering from a failed VPN path. Reconnect to restore the connection."
+                            .to_string(),
+                    );
+                }
+            }
+            _ => {}
         }
-        self.refresh_process_state();
-        self.set_error(format!(
-            "Mihomo stopped unexpectedly; VPN routing is no longer active. {detail} Reconnect to restore the connection."
-        ));
     }
 
     fn preflight_summary(&self) -> String {
@@ -1133,14 +1181,152 @@ impl RuntimeManager {
         self.snapshot
             .diagnostics
             .push(format!("Selected a new proxy in Mihomo group '{group}'."));
+
+        let verify_group = self
+            .active_policy
+            .as_ref()
+            .map(|policy| policy.main_proxy_group.as_str())
+            .unwrap_or(group);
+        match self
+            .mihomo
+            .verify_proxy_egress(verify_group, controller_port, &secret)
+            .await
+        {
+            Ok(()) => {
+                if self.snapshot.phase == RuntimePhase::Error {
+                    let desired = self.snapshot.desired_mode;
+                    let effective = self.snapshot.effective_mode;
+                    self.snapshot.phase = runtime_phase_after_connect(desired, effective);
+                    self.snapshot.last_error = None;
+                    self.snapshot.mihomo = RuntimeComponentSnapshot::new(
+                        RuntimeComponentState::Running,
+                        Some(format!("controller 127.0.0.1:{controller_port}")),
+                    );
+                    self.snapshot.diagnostics.push(
+                        "Selected proxy passed egress verification; connection recovered."
+                            .to_string(),
+                    );
+                    if let Err(error) = self.config_store.commit_last_working() {
+                        tracing::warn!(%error, "failed to commit last working config after proxy recovery");
+                    }
+                }
+            }
+            Err(error) => {
+                self.record_invalid_proxy_selection(group, proxy);
+                if let Some(policy) = self.active_policy.clone() {
+                    self.record_invalid_proxy_selections_for_policy(&policy);
+                }
+                self.set_error(format!(
+                    "Selected proxy '{proxy}' in group '{group}' still cannot reach the internet: {error}. Choose another server."
+                ));
+            }
+        }
         Ok(self.snapshot.clone())
     }
 
     fn remember_proxy_selection(&mut self, group: &str, proxy: &str) {
+        self.clear_invalid_proxy_selection(group, proxy);
+
+        // VPN Only (and Smart when the provider MATCH group contains DIRECT) rewrites the
+        // live provider group to a managed MATCH group such as __BADVPN_VPN_ONLY__. Mirror
+        // the remembered selection onto every managed group that contains this proxy so
+        // fallback/reconnect apply it to the MATCH path.
+        let mirrored_groups = self
+            .active_policy
+            .as_ref()
+            .map(|policy| {
+                policy
+                    .managed_proxy_groups
+                    .iter()
+                    .filter(|managed| {
+                        managed.name != group
+                            && managed.proxies.iter().any(|member| member == proxy)
+                    })
+                    .map(|managed| managed.name.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
         if let Some(request) = self.last_request.as_mut() {
             request
                 .selected_proxies
                 .insert(group.to_string(), proxy.to_string());
+            for managed_name in &mirrored_groups {
+                request
+                    .selected_proxies
+                    .insert(managed_name.clone(), proxy.to_string());
+            }
+        }
+        for managed_name in mirrored_groups {
+            self.invalid_proxy_selections.remove(&managed_name);
+        }
+    }
+
+    fn strip_invalid_proxy_selections(&self, selected_proxies: &mut BTreeMap<String, String>) {
+        if self.invalid_proxy_selections.is_empty() {
+            return;
+        }
+        selected_proxies.retain(|group, proxy| {
+            self.invalid_proxy_selections
+                .get(group)
+                .is_none_or(|invalid| invalid != proxy)
+        });
+    }
+
+    fn record_invalid_proxy_selection(&mut self, group: &str, proxy: &str) {
+        self.invalid_proxy_selections
+            .insert(group.to_string(), proxy.to_string());
+        if let Some(request) = self.last_request.as_mut() {
+            if request
+                .selected_proxies
+                .get(group)
+                .is_some_and(|current| current == proxy)
+            {
+                request.selected_proxies.remove(group);
+            }
+        }
+    }
+
+    fn clear_invalid_proxy_selection(&mut self, group: &str, proxy: &str) {
+        if self
+            .invalid_proxy_selections
+            .get(group)
+            .is_some_and(|invalid| invalid == proxy)
+        {
+            self.invalid_proxy_selections.remove(group);
+        }
+    }
+
+    fn record_invalid_proxy_selections_for_policy(&mut self, policy: &CompiledPolicy) {
+        let to_invalidate = {
+            let Some(request) = self.last_request.as_ref() else {
+                return;
+            };
+            let mut to_invalidate = Vec::new();
+            for (group, proxy) in &request.selected_proxies {
+                let affects_main = group == &policy.main_proxy_group
+                    || policy.managed_proxy_groups.iter().any(|managed| {
+                        (&managed.name == group || managed.name == policy.main_proxy_group)
+                            && managed.proxies.iter().any(|member| member == proxy)
+                    });
+                if affects_main {
+                    to_invalidate.push((group.clone(), proxy.clone()));
+                }
+            }
+            if to_invalidate.is_empty() {
+                if let Some(proxy) = request.selected_proxies.get(&policy.main_proxy_group) {
+                    to_invalidate.push((policy.main_proxy_group.clone(), proxy.clone()));
+                }
+                for managed in &policy.managed_proxy_groups {
+                    if let Some(proxy) = request.selected_proxies.get(&managed.name) {
+                        to_invalidate.push((managed.name.clone(), proxy.clone()));
+                    }
+                }
+            }
+            to_invalidate
+        };
+        for (group, proxy) in to_invalidate {
+            self.record_invalid_proxy_selection(&group, &proxy);
         }
     }
 }
@@ -3642,9 +3828,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use badvpn_common::{
-        compile_policy, AppRouteMode, MihomoConfigOptions, PolicyCompileInput, ProxyGroupInfo,
-        RoutingPolicySettings, RuntimeDiagnosticsSettings, RuntimeFacts, RuntimeSettings,
-        RuntimeZapretSettings,
+        compile_policy, AppRouteMode, ManagedProxyGroup, MihomoConfigOptions, PolicyCompileInput,
+        ProxyGroupInfo, RoutingPolicySettings, RuntimeDiagnosticsSettings, RuntimeFacts,
+        RuntimeSettings, RuntimeZapretSettings,
     };
 
     #[tokio::test]
@@ -4078,6 +4264,136 @@ start "zapret: general (ALT9)" /min "%BIN%winws.exe" --wf-tcp=80,443,%GameFilter
             fallback_request.selected_proxies.get("PROXY"),
             Some(&"Backup node".to_string())
         );
+    }
+
+    #[test]
+    fn remembered_proxy_selection_mirrors_onto_managed_vpn_only_group() {
+        let mut manager = RuntimeManager::new();
+        manager.last_request = Some(test_request());
+        manager.active_policy = Some(CompiledPolicy {
+            mode: AppRouteMode::VpnOnly,
+            mihomo_rules: vec!["MATCH,__BADVPN_VPN_ONLY__".to_string()],
+            zapret_hostlist: Vec::new(),
+            zapret_hostlist_exclude: Vec::new(),
+            zapret_ipset: Vec::new(),
+            zapret_ipset_exclude: Vec::new(),
+            dns_nameserver_policy: Vec::new(),
+            diagnostics_expectations: Vec::new(),
+            diagnostics_messages: Vec::new(),
+            suppressed_rules: Vec::new(),
+            main_proxy_group: "__BADVPN_VPN_ONLY__".to_string(),
+            policy_rules: Vec::new(),
+            should_create_canonical_proxy_group: false,
+            managed_proxy_groups: vec![ManagedProxyGroup {
+                name: "__BADVPN_VPN_ONLY__".to_string(),
+                proxies: vec!["Backup node".to_string(), "Germany".to_string()],
+            }],
+        });
+
+        manager.remember_proxy_selection("PROXY", "Backup node");
+
+        let fallback_request = manager
+            .last_request
+            .clone()
+            .expect("late fallback request should remain available");
+        assert_eq!(
+            fallback_request.selected_proxies.get("PROXY"),
+            Some(&"Backup node".to_string())
+        );
+        assert_eq!(
+            fallback_request.selected_proxies.get("__BADVPN_VPN_ONLY__"),
+            Some(&"Backup node".to_string())
+        );
+    }
+
+    #[test]
+    fn invalid_proxy_selections_are_stripped_before_config_build() {
+        let mut manager = RuntimeManager::new();
+        let mut request = test_request();
+        request
+            .selected_proxies
+            .insert("PROXY".to_string(), "Dead node".to_string());
+        request
+            .selected_proxies
+            .insert("__BADVPN_VPN_ONLY__".to_string(), "Dead node".to_string());
+        manager.last_request = Some(request.clone());
+        manager
+            .invalid_proxy_selections
+            .insert("__BADVPN_VPN_ONLY__".to_string(), "Dead node".to_string());
+        manager
+            .invalid_proxy_selections
+            .insert("PROXY".to_string(), "Dead node".to_string());
+
+        let mut selected = request.selected_proxies.clone();
+        manager.strip_invalid_proxy_selections(&mut selected);
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn egress_failure_keeps_mihomo_running_for_proxy_recovery() {
+        let mut manager = RuntimeManager::new();
+        manager.last_request = Some(test_request());
+        manager.snapshot.phase = RuntimePhase::Verifying;
+        manager.snapshot.mihomo = RuntimeComponentSnapshot::new(
+            RuntimeComponentState::Running,
+            Some("controller 127.0.0.1:9090 (egress verification failed)".to_string()),
+        );
+        manager.snapshot.effective_mode = RuntimeMode::VpnOnly;
+        manager.active_policy = Some(CompiledPolicy {
+            mode: AppRouteMode::VpnOnly,
+            mihomo_rules: vec!["MATCH,PROXY".to_string()],
+            zapret_hostlist: Vec::new(),
+            zapret_hostlist_exclude: Vec::new(),
+            zapret_ipset: Vec::new(),
+            zapret_ipset_exclude: Vec::new(),
+            dns_nameserver_policy: Vec::new(),
+            diagnostics_expectations: Vec::new(),
+            diagnostics_messages: Vec::new(),
+            suppressed_rules: Vec::new(),
+            main_proxy_group: "PROXY".to_string(),
+            policy_rules: Vec::new(),
+            should_create_canonical_proxy_group: false,
+            managed_proxy_groups: Vec::new(),
+        });
+        manager
+            .last_request
+            .as_mut()
+            .unwrap()
+            .selected_proxies
+            .insert("PROXY".to_string(), "Dead node".to_string());
+        let policy = manager
+            .active_policy
+            .as_ref()
+            .expect("active policy")
+            .clone();
+        manager.record_invalid_proxy_selections_for_policy(&policy);
+
+        // Emulate the post-egress error state while leaving Mihomo available for select_proxy.
+        manager.set_error(
+            "Mihomo started, but the selected VPN path cannot reach the internet: probe failed. Choose another server, then reconnect if needed."
+                .to_string(),
+        );
+        manager.snapshot.mihomo = RuntimeComponentSnapshot::new(
+            RuntimeComponentState::Running,
+            Some("controller 127.0.0.1:9090 (egress verification failed)".to_string()),
+        );
+
+        assert_eq!(manager.snapshot.phase, RuntimePhase::Error);
+        assert_eq!(
+            manager.snapshot.mihomo.state,
+            RuntimeComponentState::Running
+        );
+        assert!(manager
+            .invalid_proxy_selections
+            .get("PROXY")
+            .is_some_and(|proxy| proxy == "Dead node"));
+        assert!(manager
+            .last_request
+            .as_ref()
+            .unwrap()
+            .selected_proxies
+            .get("PROXY")
+            .is_none());
     }
 
     #[test]

@@ -725,7 +725,7 @@ fn overlay_mihomo_config_yaml_with_policy(
         .map(serde_yaml::Value::String)
         .collect::<Vec<_>>();
     insert_yaml(map, "rules", serde_yaml::Value::Sequence(rules));
-    apply_selected_proxies(map, &options.selected_proxies);
+    apply_selected_proxies(map, &options.selected_proxies, &policy);
 
     Ok((
         serde_yaml::to_string(&value)
@@ -923,8 +923,28 @@ fn managed_proxy_group_yaml(name: &str, proxies: &[String]) -> serde_yaml::Value
 fn apply_selected_proxies(
     map: &mut serde_yaml::Mapping,
     selected_proxies: &BTreeMap<String, String>,
+    policy: &CompiledPolicy,
 ) {
-    if selected_proxies.is_empty() {
+    if selected_proxies.is_empty() && policy.managed_proxy_groups.is_empty() {
+        return;
+    }
+
+    let mut effective_selections = selected_proxies.clone();
+    // Provider-group selections (e.g. PROXY / Выбор сервера) must also apply to the managed
+    // MATCH group (__BADVPN_VPN_ONLY__) when VPN Only rewrote the final group.
+    for managed in &policy.managed_proxy_groups {
+        if effective_selections.contains_key(&managed.name) {
+            continue;
+        }
+        if let Some((_, proxy)) = selected_proxies
+            .iter()
+            .find(|(_, proxy)| managed.proxies.iter().any(|member| member == *proxy))
+        {
+            effective_selections.insert(managed.name.clone(), proxy.clone());
+        }
+    }
+
+    if effective_selections.is_empty() {
         return;
     }
 
@@ -945,7 +965,7 @@ fn apply_selected_proxies(
         else {
             continue;
         };
-        let Some(selected) = selected_proxies.get(group_name) else {
+        let Some(selected) = effective_selections.get(group_name) else {
             continue;
         };
         let Some(proxies) = group_map
@@ -2081,6 +2101,54 @@ rules:
 
         assert!(generated.yaml.contains("GEOSITE,telegram,PROXY"));
         assert!(generated.yaml.contains("GEOIP,telegram,PROXY,no-resolve"));
+    }
+
+    #[test]
+    fn clash_yaml_overlay_applies_provider_selection_to_managed_vpn_only_group() {
+        let body = r#"
+proxies:
+  - name: Germany
+    type: direct
+  - name: Turkey
+    type: direct
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - DIRECT
+      - Germany
+      - Turkey
+rules:
+  - MATCH,PROXY
+"#;
+        let mut options = MihomoConfigOptions {
+            route_mode: RouteMode::VpnOnly,
+            ..MihomoConfigOptions::default()
+        };
+        options
+            .selected_proxies
+            .insert("PROXY".to_string(), "Turkey".to_string());
+
+        let generated =
+            generate_mihomo_config_from_subscription_with_options(body, "secret", &options)
+                .unwrap();
+        assert_eq!(generated.policy.main_proxy_group, "__BADVPN_VPN_ONLY__");
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(&generated.yaml).unwrap();
+        let group = yaml
+            .get("proxy-groups")
+            .and_then(serde_yaml::Value::as_sequence)
+            .unwrap()
+            .iter()
+            .find(|group| {
+                group.get("name").and_then(serde_yaml::Value::as_str) == Some("__BADVPN_VPN_ONLY__")
+            })
+            .unwrap();
+        let proxies = group
+            .get("proxies")
+            .and_then(serde_yaml::Value::as_sequence)
+            .unwrap();
+
+        assert_eq!(proxies[0].as_str(), Some("Turkey"));
     }
 
     #[test]
