@@ -411,14 +411,16 @@ impl RuntimeManager {
         timeline.mark("mihomo_start_ms");
 
         if let Err(error) = self
-            .mihomo
-            .wait_ready(
+            .wait_for_initial_mihomo_ready(
                 request.settings.mihomo.controller_port,
-                MIHOMO_READY_TIMEOUT,
                 &runtime_config.secret,
+                cancel,
             )
             .await
         {
+            if cancelled() {
+                return Err(error);
+            }
             tracing::error!(%error, "mihomo controller readiness failed");
             let _ = self.mihomo.stop();
             let _ = self.config_store.rollback_run();
@@ -648,6 +650,48 @@ impl RuntimeManager {
             "runtime connect finished"
         );
         Ok(self.snapshot.clone())
+    }
+
+    async fn wait_for_initial_mihomo_ready(
+        &mut self,
+        controller_port: u16,
+        secret: &str,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
+        let outcome = {
+            let ready = self
+                .mihomo
+                .wait_ready(controller_port, MIHOMO_READY_TIMEOUT, secret);
+            tokio::select! {
+                result = ready => Some(result),
+                () = wait_for_connect_cancel(cancel), if cancel.is_some() => None,
+            }
+        };
+        if let Some(result) = outcome {
+            return result;
+        }
+
+        // Stop and reap the owned process before releasing the runtime mutex.
+        // The background command can then finish and Stop will not wait behind
+        // the full controller readiness timeout.
+        let mut cleanup_errors = Vec::new();
+        if let Err(error) = self.mihomo.stop() {
+            cleanup_errors.push(format!("Mihomo stop failed: {error}"));
+        }
+        if let Err(error) = self.config_store.rollback_run() {
+            cleanup_errors.push(format!("config rollback failed: {error}"));
+        }
+        if let Err(error) = self.zapret.stop() {
+            cleanup_errors.push(format!("winws stop failed: {error}"));
+        }
+        let cleanup = if cleanup_errors.is_empty() {
+            String::new()
+        } else {
+            format!(" Cleanup warnings: {}", cleanup_errors.join("; "))
+        };
+        Err(anyhow!(
+            "connect cancelled during Mihomo controller readiness.{cleanup}"
+        ))
     }
 
     pub async fn restart(&mut self) -> Result<AgentRuntimeSnapshot> {
@@ -5010,6 +5054,73 @@ mod tests {
             .contains("cancelled during Mihomo validation"));
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn mihomo_readiness_cancellation_stops_process_and_rolls_back_promptly() {
+        let root = std::env::temp_dir().join(format!(
+            "badvpn-ready-cancel-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = RuntimeConfigStore { root: root.clone() };
+        fs::create_dir_all(&root).unwrap();
+        fs::write(store.run_path(), "new: unready\n").unwrap();
+        fs::write(store.last_working_path(), "old: verified\n").unwrap();
+
+        let child = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let unavailable_port = TcpListener::bind((LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut manager = RuntimeManager::new();
+        manager.config_store = store.clone();
+        manager.mihomo.child = Some(child);
+        manager.snapshot.phase = RuntimePhase::StartingMihomo;
+        manager.snapshot.mihomo =
+            RuntimeComponentSnapshot::new(RuntimeComponentState::Starting, None);
+
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_thread = std::sync::Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(75));
+            cancel_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let started = Instant::now();
+        let error = manager
+            .wait_for_initial_mihomo_ready(unavailable_port, "", Some(cancel.as_ref()))
+            .await
+            .unwrap_err();
+        manager.persist_background_connect_failure(error.to_string());
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!manager.mihomo.is_running());
+        assert_eq!(manager.snapshot.phase, RuntimePhase::Error);
+        assert_ne!(manager.snapshot.phase, RuntimePhase::Running);
+        assert_eq!(
+            fs::read_to_string(store.run_path()).unwrap(),
+            "old: verified\n"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
