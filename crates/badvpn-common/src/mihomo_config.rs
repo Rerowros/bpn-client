@@ -754,7 +754,7 @@ fn overlay_mihomo_config_yaml_with_policy(
 }
 
 fn runtime_facts_from_yaml_proxies(map: &serde_yaml::Mapping) -> RuntimeFacts {
-    let nodes = map
+    let mut nodes = map
         .get(serde_yaml::Value::String("proxies".to_string()))
         .and_then(serde_yaml::Value::as_sequence)
         .into_iter()
@@ -766,7 +766,38 @@ fn runtime_facts_from_yaml_proxies(map: &serde_yaml::Mapping) -> RuntimeFacts {
                 .and_then(serde_yaml::Value::as_str)
                 .map(ToOwned::to_owned);
             Some(ProxyNode { name, server })
-        });
+        })
+        .collect::<Vec<_>>();
+
+    // Include proxy-provider endpoint hosts so zapret/Mihomo excludes cover
+    // provider fetch URLs even when nodes are not yet materialized locally.
+    if let Some(providers) = map
+        .get(serde_yaml::Value::String("proxy-providers".to_string()))
+        .and_then(serde_yaml::Value::as_mapping)
+    {
+        for (key, value) in providers {
+            let Some(name) = key.as_str() else {
+                continue;
+            };
+            let Some(provider) = value.as_mapping() else {
+                continue;
+            };
+            if let Some(url) = provider
+                .get(serde_yaml::Value::String("url".to_string()))
+                .and_then(serde_yaml::Value::as_str)
+            {
+                if let Ok(parsed) = Url::parse(url) {
+                    if let Some(host) = parsed.host_str() {
+                        nodes.push(ProxyNode {
+                            name: format!("provider:{name}"),
+                            server: Some(host.to_string()),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     runtime_facts_from_proxy_nodes(nodes)
 }
 
@@ -2224,6 +2255,43 @@ rules:
         assert!(policy
             .zapret_hostlist_exclude
             .contains(&"edge.example.com".to_string()));
+    }
+
+    #[test]
+    fn proxy_provider_url_hosts_are_added_to_runtime_excludes() {
+        let profile = r#"
+proxies:
+  - name: Local
+    type: http
+    server: 198.51.100.10
+    port: 443
+proxy-providers:
+  remote:
+    type: http
+    url: "https://providers.example.net/clash/sub"
+    path: ./providers/remote.yaml
+    interval: 3600
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - Local
+rules:
+  - MATCH,PROXY
+"#;
+        let (_yaml, policy) = overlay_mihomo_config_yaml_with_policy(
+            profile,
+            "test-secret",
+            &MihomoConfigOptions::default(),
+        )
+        .unwrap();
+
+        assert!(policy
+            .zapret_hostlist_exclude
+            .contains(&"providers.example.net".to_string()));
+        assert!(policy
+            .zapret_ipset_exclude
+            .contains(&"198.51.100.10/32".to_string()));
     }
 
     #[test]

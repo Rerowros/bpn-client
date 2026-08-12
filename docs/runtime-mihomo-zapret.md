@@ -91,4 +91,3 @@ Checks include:
 - Move final component update download/verify/swap ownership from GUI-assisted staging into `badvpn-agent`.
 - Finish reboot recovery and reattach-to-existing-owned-process logic.
 - Expand `RunDiagnostics` beyond the current component snapshot into WinDivert/BFE, route, DNS, controller traffic, and HTTPS checks.
-- Include `proxy-providers` endpoint hosts in runtime facts / zapret excludes.
