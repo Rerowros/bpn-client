@@ -308,7 +308,12 @@ impl RuntimeManager {
             .context("failed to write Mihomo draft config")?;
         let mihomo_bin = self.component_store.mihomo_bin()?;
         self.mihomo
-            .validate(&mihomo_bin, &draft_path, self.config_store.home_dir())
+            .validate_with_cancel(
+                &mihomo_bin,
+                &draft_path,
+                self.config_store.home_dir(),
+                cancel,
+            )
             .context("Mihomo rejected generated config")?;
         timeline.mark("mihomo_validate_ms");
         if let Err(error) = check_cancel("mihomo_validate") {
@@ -1832,25 +1837,7 @@ impl MihomoManager {
             .with_context(|| format!("failed to run {}", mihomo_bin.display()))?;
         let stdout_reader = child.stdout.take().map(read_output_pipe);
         let stderr_reader = child.stderr.take().map(read_output_pipe);
-        let started = Instant::now();
-        let timed_out;
-        let status = loop {
-            if connect_is_cancelled(cancel) {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(anyhow!("connect cancelled during Mihomo validation"));
-            }
-            if let Some(status) = child.try_wait()? {
-                timed_out = false;
-                break status;
-            }
-            if started.elapsed() >= MIHOMO_VALIDATE_TIMEOUT {
-                let _ = child.kill();
-                timed_out = true;
-                break child.wait()?;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
+        let (status, timed_out) = wait_for_mihomo_validation(&mut child, cancel)?;
         let stdout = join_output_reader(stdout_reader)?;
         let stderr = join_output_reader(stderr_reader)?;
         if timed_out {
@@ -2130,6 +2117,28 @@ impl MihomoManager {
         }
         self.job = None;
         Ok(())
+    }
+}
+
+fn wait_for_mihomo_validation(
+    child: &mut Child,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<(std::process::ExitStatus, bool)> {
+    let started = Instant::now();
+    loop {
+        if connect_is_cancelled(cancel) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow!("connect cancelled during Mihomo validation"));
+        }
+        if let Some(status) = child.try_wait()? {
+            return Ok((status, false));
+        }
+        if started.elapsed() >= MIHOMO_VALIDATE_TIMEOUT {
+            let _ = child.kill();
+            return Ok((child.wait()?, true));
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -4965,6 +4974,40 @@ mod tests {
         assert!(error
             .to_string()
             .contains("cancelled during zapret stabilization"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mihomo_validation_cancellation_kills_and_reaps_child_promptly() {
+        let mut child = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_thread = std::sync::Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(75));
+            cancel_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let started = Instant::now();
+        let error = wait_for_mihomo_validation(&mut child, Some(cancel.as_ref())).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("cancelled during Mihomo validation"));
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(child.try_wait().unwrap().is_some());
     }

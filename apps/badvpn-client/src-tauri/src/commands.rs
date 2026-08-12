@@ -5888,7 +5888,9 @@ $allowedUserSidPath = Join-Path $serviceAgentDir 'allowed-user.sid'
 $allowedUserSidExisted = Test-Path -LiteralPath $allowedUserSidPath -PathType Leaf
 $previousAllowedUserSid = if ($allowedUserSidExisted) {{ Get-Content -LiteralPath $allowedUserSidPath -Raw }} else {{ $null }}
 $service = Get-Service -Name '{service_name}' -ErrorAction SilentlyContinue
+$serviceExisted = [bool]$service
 $wasRunning = [bool]($service -and $service.Status -eq 'Running')
+$serviceAgentExisted = Test-Path -LiteralPath $serviceAgent -PathType Leaf
 $serviceAgentBackup = $null
 try {{
   if ($service -and $service.Status -ne 'Stopped') {{
@@ -5909,7 +5911,7 @@ try {{
   Copy-Item -LiteralPath $sourceAgent -Destination $serviceAgent -Force
   & $serviceAgent install-service | Out-Null
   if ($LASTEXITCODE -ne 0) {{ throw "badvpn-agent install-service failed with exit code $LASTEXITCODE" }}
-  if (-not $wasRunning) {{
+  if ($serviceExisted -and -not $wasRunning) {{
     $service = Get-Service -Name '{service_name}' -ErrorAction SilentlyContinue
     if ($service -and $service.Status -ne 'Stopped') {{
       Stop-Service -Name '{service_name}' -ErrorAction Stop
@@ -5939,18 +5941,38 @@ try {{
   }} elseif (Test-Path -LiteralPath $allowedUserSidPath) {{
     Remove-Item -LiteralPath $allowedUserSidPath -Force
   }}
-  $restartFailure = $null
-  if ($wasRunning) {{
+  $serviceRollbackFailure = $null
+  if ($serviceExisted) {{
     try {{
-      Start-Service -Name '{service_name}' -ErrorAction Stop
+      & $serviceAgent install-service | Out-Null
+      if ($LASTEXITCODE -ne 0) {{ throw "restored badvpn-agent install-service failed with exit code $LASTEXITCODE" }}
       $service = Get-Service -Name '{service_name}' -ErrorAction Stop
-      $service.WaitForStatus('Running', [TimeSpan]::FromSeconds(20))
+      if ($wasRunning) {{
+        if ($service.Status -ne 'Running') {{ Start-Service -Name '{service_name}' -ErrorAction Stop }}
+        $service.WaitForStatus('Running', [TimeSpan]::FromSeconds(20))
+      }} elseif ($service.Status -ne 'Stopped') {{
+        Stop-Service -Name '{service_name}' -ErrorAction Stop
+        $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(20))
+      }}
     }} catch {{
-      $restartFailure = $_.Exception.Message
+      $serviceRollbackFailure = $_.Exception.Message
+    }}
+  }} else {{
+    try {{
+      $partialService = Get-Service -Name '{service_name}' -ErrorAction SilentlyContinue
+      if ($partialService) {{
+        & $serviceAgent uninstall-service | Out-Null
+        if ($LASTEXITCODE -ne 0) {{ throw "partial badvpn-agent uninstall-service failed with exit code $LASTEXITCODE" }}
+      }}
+      if (-not $serviceAgentExisted -and (Test-Path -LiteralPath $serviceAgent)) {{
+        Remove-Item -LiteralPath $serviceAgent -Force
+      }}
+    }} catch {{
+      $serviceRollbackFailure = $_.Exception.Message
     }}
   }}
-  if ($restartFailure) {{
-    throw "$installFailure Previously running {service_name} could not be restarted: $restartFailure"
+  if ($serviceRollbackFailure) {{
+    throw "$installFailure Service rollback failed: $serviceRollbackFailure"
   }}
   throw $installFailure
 }}
@@ -10552,14 +10574,14 @@ mod redaction_tests {
         ));
         assert!(script.contains("elseif (Test-Path -LiteralPath $allowedUserSidPath)"));
         assert!(script.contains("Remove-Item -LiteralPath $allowedUserSidPath -Force"));
+        assert!(script.contains("$serviceExisted = [bool]$service"));
         assert!(
             script.contains("$wasRunning = [bool]($service -and $service.Status -eq 'Running')")
         );
         assert!(script.contains("if ($wasRunning) {"));
         assert!(script.contains("Start-Service -Name 'badvpn-agent' -ErrorAction Stop"));
-        assert!(script.contains("if (-not $wasRunning) {"));
+        assert!(script.contains("if ($serviceExisted -and -not $wasRunning) {"));
         assert!(script.contains("Stop-Service -Name 'badvpn-agent' -ErrorAction Stop"));
-        assert!(script.contains("Previously running badvpn-agent could not be restarted"));
         let catch = script.find("} catch {").unwrap();
         let restore_assets = script
             .find("Move-Item -LiteralPath $runtimeAssetsBackup -Destination $runtimeAssetsTarget")
@@ -10588,6 +10610,22 @@ mod redaction_tests {
         assert!(catch < restore_assets);
         assert!(restore_assets < restart);
 
+        let install_calls = script
+            .match_indices("& $serviceAgent install-service")
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(install_calls.len(), 2);
+        let restore_binary = script
+            .find("Copy-Item -LiteralPath $serviceAgentBackup -Destination $serviceAgent -Force")
+            .unwrap();
+        assert!(restore_binary < install_calls[1]);
+        assert!(restore_sid < install_calls[1]);
+        assert!(install_calls[1] < restart);
+        assert!(script.contains("if ($serviceExisted) {"));
+        assert!(script.contains("if ($wasRunning) {"));
+        assert!(script.contains("elseif ($service.Status -ne 'Stopped')"));
+        assert!(script.contains("Service rollback failed:"));
+
         let syntax = Command::new("powershell.exe")
             .args([
                 "-NoProfile",
@@ -10604,6 +10642,38 @@ mod redaction_tests {
             "PowerShell install script syntax failed: {}",
             String::from_utf8_lossy(&syntax.stderr)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn agent_install_preserves_absent_running_and_stopped_service_states() {
+        let script = render_agent_install_powershell(
+            Path::new(r"C:\Users\alice\badvpn-agent.exe"),
+            Path::new(r"C:\ProgramData\BadVpn\agent\badvpn-agent.exe"),
+            "S-1-5-21-1-2-3-1001",
+            "# runtime-staging-marker",
+        );
+
+        // Fresh installs are not stopped: only an existing, previously stopped
+        // service enters the success-path Stop-Service branch.
+        assert!(script.contains("if ($serviceExisted -and -not $wasRunning) {"));
+        assert!(!script.contains("if (-not $wasRunning) {\n    $service = Get-Service"));
+        // Rollback recreates an existing service from the restored old binary,
+        // then explicitly restores running vs stopped state.
+        let rollback = script.find("if ($serviceExisted) {").unwrap();
+        let recreate = script[rollback..]
+            .find("& $serviceAgent install-service")
+            .map(|offset| rollback + offset)
+            .unwrap();
+        let running = script[recreate..]
+            .find("if ($wasRunning) {")
+            .map(|offset| recreate + offset)
+            .unwrap();
+        let stopped = script[running..]
+            .find("elseif ($service.Status -ne 'Stopped')")
+            .map(|offset| running + offset)
+            .unwrap();
+        assert!(rollback < recreate && recreate < running && running < stopped);
     }
 
     #[cfg(windows)]
