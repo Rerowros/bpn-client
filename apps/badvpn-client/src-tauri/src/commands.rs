@@ -5,11 +5,12 @@ use crate::settings::{
 use badvpn_common::{
     classify_subscription_failure, decode_header_value, flowseal_exclude_hostlist,
     flowseal_general_hostlist, flowseal_google_hostlist, flowseal_ipset_exclude,
-    generate_mihomo_config_from_subscription_with_options, overlay_mihomo_config_yaml,
-    parse_subscription_userinfo, summarize_subscription_body, zapret_default_hostlist,
-    zapret_default_ipset, zapret_user_placeholder_hostlist, AgentCommand, AgentState, AppPhase,
-    CompiledPolicy, ConnectRequest, ConnectionStatus, DiagnosticSummary, MihomoConfigOptions,
-    RouteMode, RuntimeDiagnosticsSettings, RuntimeGameProfile, RuntimeMode, RuntimeSettings,
+    generate_mihomo_config_from_subscription_with_options, geodata_asset_exists,
+    overlay_mihomo_config_yaml, parse_subscription_userinfo, strip_missing_geodata_rules,
+    summarize_subscription_body, zapret_default_hostlist, zapret_default_ipset,
+    zapret_user_placeholder_hostlist, AgentCommand, AgentState, AppPhase, CompiledPolicy,
+    ConnectRequest, ConnectionStatus, DiagnosticSummary, MihomoConfigOptions, RouteMode,
+    RuntimeDiagnosticsSettings, RuntimeGameProfile, RuntimeMode, RuntimeSettings,
     RuntimeZapretSettings, SubscriptionFormat, SubscriptionState, AGENT_LOCAL_ADDR,
     AGENT_PIPE_NAME,
 };
@@ -1043,6 +1044,17 @@ fn resolve_agent_bin() -> Result<PathBuf, String> {
         if let Some(dir) = current_exe.parent() {
             candidates.extend(exe_names.iter().map(|name| dir.join(name)));
             candidates.extend(agent_resource_bin_candidates(dir, &exe_names));
+            // tauri:dev keeps resources under src-tauri/resources, not next to the debug exe.
+            if let Some(src_tauri) = dir
+                .ancestors()
+                .find(|path| path.file_name().and_then(|name| name.to_str()) == Some("src-tauri"))
+            {
+                candidates.extend(
+                    exe_names
+                        .iter()
+                        .map(|name| src_tauri.join("resources").join("agent").join(name)),
+                );
+            }
         }
     }
     if let Ok(current_dir) = std::env::current_dir() {
@@ -1060,6 +1072,13 @@ fn resolve_agent_bin() -> Result<PathBuf, String> {
             );
             candidates.push(
                 current_dir
+                    .join("src-tauri")
+                    .join("resources")
+                    .join("agent")
+                    .join(exe_name),
+            );
+            candidates.push(
+                current_dir
                     .join("apps")
                     .join("badvpn-client")
                     .join("src-tauri")
@@ -1067,6 +1086,27 @@ fn resolve_agent_bin() -> Result<PathBuf, String> {
                     .join("release")
                     .join(exe_name),
             );
+        }
+        // Walk up to workspace root when cwd is apps/badvpn-client.
+        for ancestor in current_dir.ancestors().take(5) {
+            for exe_name in &exe_names {
+                candidates.push(ancestor.join("target").join("debug").join(exe_name));
+                candidates.push(ancestor.join("target").join("release").join(exe_name));
+                candidates.push(
+                    ancestor
+                        .join("apps")
+                        .join("badvpn-client")
+                        .join("src-tauri")
+                        .join("resources")
+                        .join("agent")
+                        .join(exe_name),
+                );
+            }
+        }
+    }
+    if let Ok(data) = data_dir() {
+        for exe_name in &exe_names {
+            candidates.push(data.join("components").join("agent").join(exe_name));
         }
     }
     if let Some(path) = data_dir()
@@ -1853,6 +1893,8 @@ struct MihomoProxyState {
     delay: Option<u64>,
     #[serde(default)]
     history: Vec<MihomoProxyHistory>,
+    #[serde(default, rename = "all")]
+    members: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -2550,20 +2592,52 @@ pub async fn proxy_catalog() -> Result<ProxyCatalog, String> {
 
 #[tauri::command]
 pub async fn select_proxy(group: String, proxy: String) -> Result<ProxyCatalog, String> {
+    let group = group.trim();
+    let proxy = proxy.trim();
+    if group.is_empty() || proxy.is_empty() {
+        return Err("Proxy group and proxy name are required.".to_string());
+    }
+
+    if should_use_agent_runtime() {
+        let previous_selections = read_proxy_selections()?;
+        let mut updated_selections = previous_selections.clone();
+        updated_selections.insert(group.to_string(), proxy.to_string());
+        persist_proxy_selections(&updated_selections)?;
+        if let Err(error) = send_agent_command(
+            AgentCommand::SelectProxy {
+                group: group.to_string(),
+                proxy: proxy.to_string(),
+            },
+            false,
+        ) {
+            return match persist_proxy_selections(&previous_selections) {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(format!(
+                    "{error} The saved proxy selection also could not be restored: {rollback_error}"
+                )),
+            };
+        }
+        return proxy_catalog().await;
+    }
+
+    let api = fetch_mihomo_proxies().await?;
+    validate_proxy_selection(&api, group, proxy)?;
     let client = mihomo_http_client()?;
     let url = format!(
         "{}/proxies/{}",
         mihomo_controller_base()?,
-        path_encode(group.trim())
+        path_encode(group)
     );
-    let response = add_mihomo_auth(client.put(url).json(&json!({ "name": proxy.trim() })))
+    let response = add_mihomo_auth(client.put(url).json(&json!({ "name": proxy })))
         .send()
         .await
         .map_err(|error| format!("Failed to select proxy: {error}"))?;
-    response
-        .error_for_status()
-        .map_err(|error| format!("Mihomo rejected proxy selection: {error}"))?;
-    persist_proxy_selection(group.trim(), proxy.trim())?;
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response.text().await.unwrap_or_default();
+        return Err(proxy_selection_http_error(status, &detail));
+    }
+    persist_proxy_selection(group, proxy)?;
     proxy_catalog().await
 }
 
@@ -6134,7 +6208,7 @@ async fn check_https_endpoint(id: &str, label: &str, url: &str) -> RuntimeDiagno
 }
 
 fn local_proxy_catalog() -> Result<Vec<ProxyGroupView>, String> {
-    let path = mihomo_config_path()?;
+    let path = active_mihomo_config_path()?;
     if !path.exists() {
         return Err("Import a subscription before opening server groups.".to_string());
     }
@@ -6230,6 +6304,48 @@ fn local_proxy_catalog() -> Result<Vec<ProxyGroupView>, String> {
     } else {
         Ok(groups)
     }
+}
+
+fn validate_proxy_selection(
+    api: &MihomoProxiesResponse,
+    group: &str,
+    proxy: &str,
+) -> Result<(), String> {
+    let state = api.proxies.get(group).ok_or_else(|| {
+        format!(
+            "Proxy group '{group}' is not present in the active Mihomo runtime. Refresh the server list or reconnect before selecting a node."
+        )
+    })?;
+    if state
+        .proxy_type
+        .as_deref()
+        .is_some_and(|kind| !kind.eq_ignore_ascii_case("selector"))
+    {
+        return Err(format!(
+            "Proxy group '{group}' is not selectable in the active Mihomo runtime."
+        ));
+    }
+    if !state.members.is_empty() && !state.members.iter().any(|member| member == proxy) {
+        return Err(format!(
+            "Proxy '{proxy}' is not a member of active Mihomo group '{group}'. Refresh the server list before selecting a node."
+        ));
+    }
+    Ok(())
+}
+
+fn proxy_selection_http_error(status: reqwest::StatusCode, detail: &str) -> String {
+    let detail = detail.trim();
+    let detail = if detail.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Mihomo response: {}",
+            detail.chars().take(512).collect::<String>()
+        )
+    };
+    format!(
+        "Mihomo rejected proxy selection with HTTP {status}. Refresh the active server list or reconnect and try again.{detail}"
+    )
 }
 
 fn merge_proxy_runtime_state(groups: &mut [ProxyGroupView], api: &MihomoProxiesResponse) {
@@ -7201,10 +7317,17 @@ fn write_mihomo_config_atomically(
     let next_path = config_path.with_file_name("config.yaml.next");
     let backup_path = config_path.with_file_name("config.yaml.last-good");
 
-    fs::write(&next_path, rendered_yaml)
+    let mut yaml = rendered_yaml.to_string();
+    let geosite_available = geodata_asset_exists(parent, &["GeoSite.dat", "geosite.dat"]);
+    let geoip_available = geodata_asset_exists(parent, &["GeoIP.dat", "geoip.dat"]);
+    for message in strip_missing_geodata_rules(&mut yaml, geosite_available, geoip_available)? {
+        log_event("mihomo-config", message);
+    }
+
+    fs::write(&next_path, &yaml)
         .map_err(|error| format!("Failed to write staged Mihomo config: {error}"))?;
 
-    if let Err(error) = validate_mihomo_config_yaml_structure(rendered_yaml) {
+    if let Err(error) = validate_mihomo_config_yaml_structure(&yaml) {
         let _ = fs::remove_file(&next_path);
         log_event(
             "mihomo-config",
@@ -10023,6 +10146,33 @@ fn normalize_subscription_profile_description(
 #[cfg(test)]
 mod redaction_tests {
     use super::*;
+
+    #[test]
+    fn proxy_selection_validation_rejects_stale_group_and_unknown_member() {
+        let mut api = MihomoProxiesResponse::default();
+        api.proxies.insert(
+            "__BADVPN_VPN_ONLY__".to_string(),
+            MihomoProxyState {
+                proxy_type: Some("Selector".to_string()),
+                members: vec!["Germany".to_string(), "Switzerland".to_string()],
+                ..MihomoProxyState::default()
+            },
+        );
+
+        let stale = validate_proxy_selection(&api, "Выбор сервера", "Germany").unwrap_err();
+        assert!(stale.contains("not present in the active Mihomo runtime"));
+        let unknown = validate_proxy_selection(&api, "__BADVPN_VPN_ONLY__", "Poland").unwrap_err();
+        assert!(unknown.contains("not a member"));
+        validate_proxy_selection(&api, "__BADVPN_VPN_ONLY__", "Germany").unwrap();
+    }
+
+    #[test]
+    fn proxy_selection_path_encoding_preserves_one_unicode_segment() {
+        assert_eq!(
+            path_encode("Выбор сервера/основной"),
+            "%D0%92%D1%8B%D0%B1%D0%BE%D1%80%20%D1%81%D0%B5%D1%80%D0%B2%D0%B5%D1%80%D0%B0%2F%D0%BE%D1%81%D0%BD%D0%BE%D0%B2%D0%BD%D0%BE%D0%B9"
+        );
+    }
 
     #[test]
     fn subscription_url_redaction_keeps_origin_only() {

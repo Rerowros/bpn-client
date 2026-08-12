@@ -5,7 +5,7 @@ use url::Url;
 
 use crate::{
     compile_policy, subscription_body_to_text, AppRouteMode, CompiledPolicy, PolicyCompileInput,
-    ProxyGroupInfo, RouteMode, RoutingPolicySettings, RuntimeFacts, SubscriptionFormat,
+    ProxyGroupInfo, ProxyNode, RouteMode, RoutingPolicySettings, RuntimeFacts, SubscriptionFormat,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -155,7 +155,10 @@ impl Default for MihomoConfigOptions {
             ipv6: false,
             tun_enabled: true,
             tun_stack: "mixed".to_string(),
-            tun_strict_route: true,
+            // Windows multi-homed DNS (Hyper-V, Radmin, second NICs) plus Mihomo
+            // strict-route firewall rules can blackhole resolution when dns-hijack
+            // does not capture system DNS. Prefer auto-route + dns-hijack.
+            tun_strict_route: false,
             tun_auto_route: true,
             tun_auto_detect_interface: true,
             tun_mtu: 1500,
@@ -487,6 +490,10 @@ fn build_vless_config_yaml(
     secret: &str,
     options: &MihomoConfigOptions,
 ) -> Result<(String, CompiledPolicy), String> {
+    let runtime_facts = runtime_facts_from_proxy_nodes(proxies.iter().map(|proxy| ProxyNode {
+        name: proxy.name.clone(),
+        server: Some(proxy.server.clone()),
+    }));
     let policy = compile_policy(PolicyCompileInput {
         mode: app_route_mode(options.route_mode),
         provider_rules: Vec::new(),
@@ -504,7 +511,7 @@ fn build_vless_config_yaml(
         ],
         proxy_count: proxies.len(),
         routing: routing_policy_for_options(options),
-        runtime_facts: RuntimeFacts::default(),
+        runtime_facts,
     })?;
     let mut yaml = base_config_yaml(secret, options);
     yaml.push_str("\nproxies:\n");
@@ -668,6 +675,7 @@ fn overlay_mihomo_config_yaml_with_policy(
         .ok_or_else(|| "Clash YAML root must be a mapping".to_string())?;
     let provider_rules = extract_provider_rules(map);
     let proxy_groups = extract_proxy_groups(map);
+    let runtime_facts = runtime_facts_from_yaml_proxies(map);
     let existing_dns = map
         .get(serde_yaml::Value::String("dns".to_string()))
         .cloned();
@@ -677,7 +685,7 @@ fn overlay_mihomo_config_yaml_with_policy(
         proxy_groups,
         proxy_count,
         routing: routing_policy_for_options(options),
-        runtime_facts: RuntimeFacts::default(),
+        runtime_facts,
     })?;
 
     insert_yaml(
@@ -724,6 +732,50 @@ fn overlay_mihomo_config_yaml_with_policy(
             .map_err(|error| format!("Failed to render Mihomo YAML: {error}"))?,
         policy,
     ))
+}
+
+fn runtime_facts_from_yaml_proxies(map: &serde_yaml::Mapping) -> RuntimeFacts {
+    let nodes = map
+        .get(serde_yaml::Value::String("proxies".to_string()))
+        .and_then(serde_yaml::Value::as_sequence)
+        .into_iter()
+        .flatten()
+        .filter_map(|proxy| {
+            let name = proxy.get("name")?.as_str()?.to_string();
+            let server = proxy
+                .get("server")
+                .and_then(serde_yaml::Value::as_str)
+                .map(ToOwned::to_owned);
+            Some(ProxyNode { name, server })
+        });
+    runtime_facts_from_proxy_nodes(nodes)
+}
+
+fn runtime_facts_from_proxy_nodes(nodes: impl IntoIterator<Item = ProxyNode>) -> RuntimeFacts {
+    let selected_proxy_nodes = nodes.into_iter().collect::<Vec<_>>();
+    let mut resolved_proxy_ips = Vec::new();
+    let mut proxy_endpoint_hosts = Vec::new();
+    for server in selected_proxy_nodes
+        .iter()
+        .filter_map(|node| node.server.as_deref())
+    {
+        let server = server.trim().trim_end_matches('.');
+        if server.parse::<std::net::IpAddr>().is_ok() {
+            resolved_proxy_ips.push(server.to_string());
+        } else if !server.is_empty() {
+            proxy_endpoint_hosts.push(server.to_ascii_lowercase());
+        }
+    }
+    resolved_proxy_ips.sort();
+    resolved_proxy_ips.dedup();
+    proxy_endpoint_hosts.sort();
+    proxy_endpoint_hosts.dedup();
+    RuntimeFacts {
+        selected_proxy_nodes,
+        resolved_proxy_ips,
+        proxy_endpoint_hosts,
+        ..RuntimeFacts::default()
+    }
 }
 
 fn extract_provider_rules(map: &serde_yaml::Mapping) -> Vec<String> {
@@ -1158,6 +1210,8 @@ fn dns_yaml_base(
         insert_yaml(
             &mut map,
             "fake-ip-filter",
+            // Do not import provider country-TLD filters (e.g. +.ru): they force
+            // real IPs while strict/multi-homed Windows DNS is fragile.
             fake_ip_filter_sequence(existing, &fake_ip_filters),
         );
     }
@@ -1228,22 +1282,152 @@ fn fake_ip_filter_sequence(
         .into_iter()
         .flatten()
         .filter_map(serde_yaml::Value::as_str)
+        .filter(|value| is_safe_provider_fake_ip_filter(value))
         .map(ToOwned::to_owned)
         .collect::<std::collections::BTreeSet<_>>();
 
-    for domain in zapret_domains {
-        let domain = domain
-            .trim()
+    for entry in zapret_domains {
+        let entry = entry.trim();
+        if entry.is_empty() || entry.contains('/') {
+            continue;
+        }
+        if entry.starts_with("rule-set:") {
+            continue;
+        }
+        if entry.starts_with("+.") || entry.starts_with("*.") || entry.contains('*') {
+            filters.insert(entry.to_ascii_lowercase());
+            continue;
+        }
+        let domain = entry
             .trim_start_matches('.')
             .trim_end_matches('.')
             .to_ascii_lowercase();
-        if domain.is_empty() || domain.contains('/') || domain.contains('*') {
+        if domain.is_empty() || domain.contains('*') {
             continue;
         }
         filters.insert(format!("+.{domain}"));
     }
 
     serde_yaml::Value::Sequence(filters.into_iter().map(serde_yaml::Value::String).collect())
+}
+
+fn is_safe_provider_fake_ip_filter(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty() || value.starts_with("rule-set:") {
+        return false;
+    }
+    let bare = value
+        .trim_start_matches("+.")
+        .trim_start_matches("*.")
+        .trim_start_matches('.');
+    // Drop country/public TLD bypasses that force real IPs for huge domains.
+    if !bare.contains('.')
+        && matches!(
+            bare,
+            "ru" | "su" | "by" | "kz" | "ua" | "cn" | "xn--p1ai" | "com" | "net" | "org" | "info"
+        )
+    {
+        return false;
+    }
+    bare == "lan"
+        || bare == "local"
+        || bare.ends_with(".lan")
+        || bare.ends_with(".local")
+        || bare.contains("msftconnecttest")
+        || bare.contains("msftncsi")
+        || bare.contains("ntp.org")
+        || bare.contains("pool.ntp.org")
+        || bare.contains("time.windows.com")
+        || bare.contains("time.nist.gov")
+        || bare.contains("time.apple.com")
+        || bare.contains("connectivitycheck.gstatic.com")
+        || bare.contains("detectportal.firefox.com")
+        || bare.contains("localhost.ptlogin2.qq.com")
+        || bare.ends_with(".badvpn.pro")
+        || bare == "badvpn.pro"
+}
+
+/// Remove GEOSITE/GEOIP rules when local geodata assets are missing.
+/// Prevents Mihomo `mihomo -t` / startup from downloading GeoSite.dat / GeoIP.dat
+/// via unreachable mirrors (which fails DNS and blocks connect).
+pub fn strip_missing_geodata_rules(
+    yaml: &mut String,
+    geosite_available: bool,
+    geoip_available: bool,
+) -> Result<Vec<String>, String> {
+    if geosite_available && geoip_available {
+        return Ok(Vec::new());
+    }
+
+    let mut value: serde_yaml::Value = serde_yaml::from_str(yaml)
+        .map_err(|error| format!("failed to parse generated Mihomo YAML: {error}"))?;
+    let mut removed_geosite = 0usize;
+    let mut removed_geoip = 0usize;
+
+    if let Some(map) = value.as_mapping_mut() {
+        if let Some(rules) = map
+            .get_mut(serde_yaml::Value::String("rules".to_string()))
+            .and_then(serde_yaml::Value::as_sequence_mut)
+        {
+            rules.retain(|rule| {
+                let Some(text) = rule.as_str() else {
+                    return true;
+                };
+                let normalized = text.trim_start().to_ascii_uppercase();
+                if !geosite_available && normalized.starts_with("GEOSITE,") {
+                    removed_geosite += 1;
+                    return false;
+                }
+                if !geoip_available && normalized.starts_with("GEOIP,") {
+                    removed_geoip += 1;
+                    return false;
+                }
+                true
+            });
+        }
+    }
+
+    let mut messages = Vec::new();
+    if removed_geosite > 0 {
+        messages.push(format!(
+            "Disabled {removed_geosite} GEOSITE provider rules because no local GeoSite.dat asset is installed; this prevents Mihomo startup-time downloads."
+        ));
+    }
+    if removed_geoip > 0 {
+        messages.push(format!(
+            "Disabled {removed_geoip} GEOIP provider rules because no local GeoIP.dat asset is installed; this prevents Mihomo startup-time downloads."
+        ));
+    }
+    if !messages.is_empty() {
+        *yaml = serde_yaml::to_string(&value)
+            .map_err(|error| format!("failed to render Mihomo YAML: {error}"))?;
+    }
+    Ok(messages)
+}
+
+pub fn geodata_asset_exists(home: &std::path::Path, names: &[&str]) -> bool {
+    names.iter().any(|name| {
+        let path = home.join(name);
+        path.is_file()
+            && std::fs::metadata(&path)
+                .map(|metadata| metadata.len() > 0)
+                .unwrap_or(false)
+    }) || std::fs::read_dir(home)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .any(|entry| {
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            names
+                .iter()
+                .any(|name| file_name.eq_ignore_ascii_case(name))
+                && entry
+                    .metadata()
+                    .map(|metadata| metadata.len() > 0)
+                    .unwrap_or(false)
+        })
 }
 
 fn base_config_yaml(secret: &str, options: &MihomoConfigOptions) -> String {
@@ -1748,7 +1932,7 @@ rules:
     #[test]
     fn clash_yaml_overlay_excludes_zapret_domains_from_fake_ip() {
         let generated = overlay_mihomo_config_yaml(
-            "dns:\n  fake-ip-filter:\n    - +.existing.example\nproxies:\n  - name: Test\n    type: direct\nproxy-groups:\n  - name: PROXY\n    type: select\n    proxies:\n      - Test\nrules:\n  - MATCH,PROXY\n",
+            "dns:\n  fake-ip-filter:\n    - +.existing.example\n    - +.ru\n    - +.lan\n    - rule-set:category-ru\nproxies:\n  - name: Test\n    type: direct\nproxy-groups:\n  - name: PROXY\n    type: select\n    proxies:\n      - Test\nrules:\n  - MATCH,PROXY\n",
             "secret",
             &MihomoConfigOptions::default(),
         )
@@ -1763,11 +1947,64 @@ rules:
             .filter_map(serde_yaml::Value::as_str)
             .collect::<std::collections::BTreeSet<_>>();
 
-        assert!(filters.contains("+.existing.example"));
+        assert!(filters.contains("+.lan"));
+        assert!(!filters.contains("+.ru"));
+        assert!(!filters.contains("+.existing.example"));
+        assert!(!filters.contains("rule-set:category-ru"));
         assert!(filters.contains("+.discord.com"));
         assert!(filters.contains("+.discord.gg"));
         assert!(filters.contains("+.googlevideo.com"));
         assert!(filters.contains("+.youtube.com"));
+    }
+
+    #[test]
+    fn vpn_only_strips_provider_country_tld_fake_ip_filters() {
+        let body = r#"
+dns:
+  enhanced-mode: fake-ip
+  fake-ip-filter:
+    - +.ru
+    - +.su
+    - +.lan
+    - rule-set:category-ru
+proxies:
+  - name: Germany
+    type: vless
+    server: germany.example.com
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000000
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - Germany
+rules:
+  - MATCH,PROXY
+"#;
+        let options = MihomoConfigOptions {
+            route_mode: RouteMode::VpnOnly,
+            dns_fake_ip_filter: vec!["+.local".to_string()],
+            ..MihomoConfigOptions::default()
+        };
+        let generated =
+            generate_mihomo_config_from_subscription_with_options(body, "secret", &options)
+                .unwrap();
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(&generated.yaml).unwrap();
+        let filters = yaml
+            .get("dns")
+            .and_then(|dns| dns.get("fake-ip-filter"))
+            .and_then(serde_yaml::Value::as_sequence)
+            .unwrap()
+            .iter()
+            .filter_map(serde_yaml::Value::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(filters.contains("+.lan"));
+        assert!(filters.contains("+.local"));
+        assert!(!filters.contains("+.ru"));
+        assert!(!filters.contains("+.su"));
+        assert!(!filters.contains("rule-set:category-ru"));
+        assert!(!filters.contains("+.discord.com"));
     }
 
     #[test]
@@ -1917,5 +2154,56 @@ vless://00000000-0000-0000-0000-000000000001@turkey.example.com:443?encryption=n
             .unwrap();
 
         assert_eq!(proxies[0].as_str(), Some("Turkey"));
+    }
+
+    #[test]
+    fn strip_missing_geodata_rules_removes_geosite_when_asset_absent() {
+        let mut yaml = r#"
+rules:
+  - GEOSITE,private,DIRECT
+  - DOMAIN-SUFFIX,example.com,PROXY
+  - MATCH,PROXY
+"#
+        .to_string();
+        let messages = strip_missing_geodata_rules(&mut yaml, false, true).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(!yaml.to_ascii_uppercase().contains("GEOSITE,"));
+        assert!(yaml.contains("DOMAIN-SUFFIX,example.com,PROXY"));
+    }
+
+    #[test]
+    fn proxy_endpoints_are_excluded_from_zapret_artifacts() {
+        let profile = r#"
+proxies:
+  - name: IpNode
+    type: http
+    server: 203.0.113.10
+    port: 443
+  - name: HostNode
+    type: http
+    server: Edge.Example.COM.
+    port: 443
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - IpNode
+      - HostNode
+rules:
+  - MATCH,PROXY
+"#;
+        let (_yaml, policy) = overlay_mihomo_config_yaml_with_policy(
+            profile,
+            "test-secret",
+            &MihomoConfigOptions::default(),
+        )
+        .unwrap();
+
+        assert!(policy
+            .zapret_ipset_exclude
+            .contains(&"203.0.113.10/32".to_string()));
+        assert!(policy
+            .zapret_hostlist_exclude
+            .contains(&"edge.example.com".to_string()));
     }
 }

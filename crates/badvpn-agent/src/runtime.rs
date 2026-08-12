@@ -51,12 +51,14 @@ impl RuntimeManager {
 
     pub fn snapshot(&mut self) -> AgentRuntimeSnapshot {
         self.refresh_process_state();
+        self.handle_late_mihomo_death();
         self.record_late_zapret_death_if_needed();
         self.snapshot.clone()
     }
 
     pub async fn status_snapshot(&mut self) -> AgentRuntimeSnapshot {
         self.refresh_process_state();
+        self.handle_late_mihomo_death();
         if self.late_zapret_death_requires_fallback() {
             if let Err(error) = self.fallback_to_vpn_only_after_late_zapret_death().await {
                 tracing::error!(%error, "failed to apply VPN-only fallback after late zapret death");
@@ -300,6 +302,25 @@ impl RuntimeManager {
         timeline.mark("mihomo_ready_ms");
 
         self.snapshot.phase = RuntimePhase::Verifying;
+        if let Err(error) = self
+            .mihomo
+            .verify_proxy_egress(
+                &runtime_config.policy.main_proxy_group,
+                request.settings.mihomo.controller_port,
+                &runtime_config.secret,
+            )
+            .await
+        {
+            tracing::error!(%error, "Mihomo proxy egress verification failed");
+            let _ = self.mihomo.stop();
+            let _ = self.zapret.stop();
+            let _ = self.config_store.rollback_run();
+            self.set_error(format!(
+                "Mihomo started, but the selected VPN path cannot reach the internet: {error}"
+            ));
+            return Ok(self.snapshot.clone());
+        }
+        timeline.mark("proxy_egress_ms");
         if request.settings.diagnostics.discord_youtube_probes
             && effective_mode == RuntimeMode::Smart
         {
@@ -718,10 +739,22 @@ impl RuntimeManager {
         config: &mut RuntimeConfig,
     ) -> Result<()> {
         let home = self.config_store.home_dir();
-        let geosite_available = geodata_asset_exists(home, &["GeoSite.dat", "geosite.dat"]);
-        let geoip_available = geodata_asset_exists(home, &["GeoIP.dat", "geoip.dat"]);
-        let messages =
-            strip_missing_geodata_rules(&mut config.yaml, geosite_available, geoip_available)?;
+        let geosite_available =
+            badvpn_common::geodata_asset_exists(home, &["GeoSite.dat", "geosite.dat"]);
+        let geoip_available =
+            badvpn_common::geodata_asset_exists(home, &["GeoIP.dat", "geoip.dat"]);
+        let messages = badvpn_common::strip_missing_geodata_rules(
+            &mut config.yaml,
+            geosite_available,
+            geoip_available,
+        )
+        .map_err(|error| anyhow!(error))?;
+        let (provider_messages, disabled_providers) = prepare_cached_rule_providers(
+            &mut config.yaml,
+            home,
+            geosite_available,
+            geoip_available,
+        )?;
         if !messages.is_empty() {
             sync_policy_after_missing_geodata_strip(
                 &mut config.policy,
@@ -729,8 +762,15 @@ impl RuntimeManager {
                 geoip_available,
             )?;
         }
+        if !disabled_providers.is_empty() {
+            sync_policy_after_rule_provider_strip(&mut config.policy, &disabled_providers)?;
+        }
         for message in messages {
             tracing::warn!(message, "mihomo geodata rule disabled");
+            self.snapshot.diagnostics.push(message);
+        }
+        for message in provider_messages {
+            tracing::warn!(message, "mihomo provider geodata rule disabled");
             self.snapshot.diagnostics.push(message);
         }
         Ok(())
@@ -821,6 +861,32 @@ impl RuntimeManager {
             .diagnostics
             .push(format!("Runtime error: {message}"));
         self.refresh_process_state();
+    }
+
+    fn handle_late_mihomo_death(&mut self) {
+        if !matches!(
+            self.snapshot.phase,
+            RuntimePhase::Running | RuntimePhase::DegradedVpnOnly
+        ) || self.snapshot.mihomo.state == RuntimeComponentState::Running
+        {
+            return;
+        }
+
+        let detail = self
+            .snapshot
+            .mihomo
+            .detail
+            .clone()
+            .unwrap_or_else(|| "Mihomo is no longer running.".to_string());
+        if let Err(error) = self.zapret.stop() {
+            self.snapshot
+                .diagnostics
+                .push(format!("Failed to stop winws after Mihomo exited: {error}"));
+        }
+        self.refresh_process_state();
+        self.set_error(format!(
+            "Mihomo stopped unexpectedly; VPN routing is no longer active. {detail} Reconnect to restore the connection."
+        ));
     }
 
     fn preflight_summary(&self) -> String {
@@ -1003,6 +1069,117 @@ impl RuntimeManager {
             .map(|request| request.settings.mihomo.controller_port)
             .unwrap_or(9090)
     }
+
+    pub async fn select_proxy(&mut self, group: &str, proxy: &str) -> Result<AgentRuntimeSnapshot> {
+        if group.is_empty() || proxy.is_empty() {
+            return Err(anyhow!("proxy group and proxy name are required"));
+        }
+        self.refresh_process_state();
+        self.handle_late_mihomo_death();
+        if self.snapshot.mihomo.state != RuntimeComponentState::Running {
+            return Err(anyhow!(
+                "Mihomo is not running; reconnect before selecting a proxy"
+            ));
+        }
+
+        let controller_port = self.last_controller_port();
+        let secret = self.config_store.controller_secret().unwrap_or_default();
+        let client = reqwest::Client::builder()
+            .timeout(MIHOMO_CONTROLLER_REQUEST_TIMEOUT)
+            .build()?;
+        let base = format!("http://{LOCALHOST}:{controller_port}");
+        let mut list_request = client.get(format!("{base}/proxies"));
+        if !secret.is_empty() {
+            list_request = list_request.bearer_auth(&secret);
+        }
+        let list_response = list_request
+            .send()
+            .await
+            .context("failed to read active Mihomo proxy groups")?;
+        let list_status = list_response.status();
+        if !list_status.is_success() {
+            return Err(anyhow!("Mihomo proxy catalog returned HTTP {list_status}"));
+        }
+        let catalog = list_response
+            .json::<serde_json::Value>()
+            .await
+            .context("failed to decode active Mihomo proxy groups")?;
+        validate_active_proxy_selection(&catalog, group, proxy)?;
+
+        let mut url = reqwest::Url::parse(&format!("{base}/proxies/"))?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow!("Mihomo controller URL cannot contain path segments"))?
+            .pop_if_empty()
+            .push(group);
+        let mut select_request = client.put(url).json(&serde_json::json!({ "name": proxy }));
+        if !secret.is_empty() {
+            select_request = select_request.bearer_auth(&secret);
+        }
+        let response = select_request
+            .send()
+            .await
+            .context("failed to send Mihomo proxy selection")?;
+        let status = response.status();
+        if !status.is_success() {
+            let detail = response.text().await.unwrap_or_default();
+            let detail = detail.trim().chars().take(512).collect::<String>();
+            return Err(if detail.is_empty() {
+                anyhow!("Mihomo rejected proxy selection with HTTP {status}")
+            } else {
+                anyhow!("Mihomo rejected proxy selection with HTTP {status}: {detail}")
+            });
+        }
+        self.remember_proxy_selection(group, proxy);
+        self.snapshot
+            .diagnostics
+            .push(format!("Selected a new proxy in Mihomo group '{group}'."));
+        Ok(self.snapshot.clone())
+    }
+
+    fn remember_proxy_selection(&mut self, group: &str, proxy: &str) {
+        if let Some(request) = self.last_request.as_mut() {
+            request
+                .selected_proxies
+                .insert(group.to_string(), proxy.to_string());
+        }
+    }
+}
+
+fn validate_active_proxy_selection(
+    catalog: &serde_json::Value,
+    group: &str,
+    proxy: &str,
+) -> Result<()> {
+    let state = catalog
+        .get("proxies")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|proxies| proxies.get(group))
+        .ok_or_else(|| {
+            anyhow!(
+                "Proxy group '{group}' is not present in the active Mihomo runtime; refresh the server list or reconnect"
+            )
+        })?;
+    if state
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| !kind.eq_ignore_ascii_case("selector"))
+    {
+        return Err(anyhow!(
+            "Proxy group '{group}' is not selectable in the active Mihomo runtime"
+        ));
+    }
+    if let Some(members) = state.get("all").and_then(serde_json::Value::as_array) {
+        if !members
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(|member| member == proxy)
+        {
+            return Err(anyhow!(
+                "Proxy '{proxy}' is not a member of active Mihomo group '{group}'; refresh the server list"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn stopped_component_detail(
@@ -1482,6 +1659,57 @@ impl MihomoManager {
         }
     }
 
+    async fn verify_proxy_egress(
+        &self,
+        proxy_group: &str,
+        controller_port: u16,
+        secret: &str,
+    ) -> Result<()> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()?;
+        let mut failures = Vec::new();
+        for attempt in 1..=2 {
+            failures.clear();
+            for test_url in [
+                "https://www.gstatic.com/generate_204",
+                "https://cp.cloudflare.com/generate_204",
+            ] {
+                let url = mihomo_proxy_delay_url(controller_port, proxy_group, test_url, 3_500)?;
+                let mut request = client.get(url);
+                if !secret.is_empty() {
+                    request = request.bearer_auth(secret);
+                }
+                match request.send().await {
+                    Ok(response) if response.status().is_success() => {
+                        tracing::info!(
+                            proxy_group,
+                            test_url,
+                            attempt,
+                            "Mihomo proxy egress verified"
+                        );
+                        return Ok(());
+                    }
+                    Ok(response) => {
+                        let status = response.status();
+                        let detail = response.text().await.unwrap_or_default();
+                        let detail = detail.trim().chars().take(256).collect::<String>();
+                        failures.push(if detail.is_empty() {
+                            format!("{test_url} returned HTTP {status}")
+                        } else {
+                            format!("{test_url} returned HTTP {status}: {detail}")
+                        });
+                    }
+                    Err(error) => failures.push(format!("{test_url} failed: {error}")),
+                }
+            }
+            if attempt < 2 {
+                sleep(Duration::from_millis(500)).await;
+            }
+        }
+        Err(anyhow!(failures.join("; ")))
+    }
+
     async fn close_connections(&self, controller_port: u16, secret: &str) -> Result<()> {
         tracing::debug!(controller_port, "closing Mihomo controller connections");
         let client = reqwest::Client::builder()
@@ -1508,6 +1736,24 @@ impl MihomoManager {
         }
         Ok(())
     }
+}
+
+fn mihomo_proxy_delay_url(
+    controller_port: u16,
+    proxy_group: &str,
+    test_url: &str,
+    timeout_ms: u32,
+) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(&format!("http://{LOCALHOST}:{controller_port}/proxies/"))?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow!("Mihomo controller URL cannot contain path segments"))?
+        .pop_if_empty()
+        .extend([proxy_group, "delay"]);
+    url.query_pairs_mut()
+        .append_pair("url", test_url)
+        .append_pair("timeout", &timeout_ms.to_string())
+        .append_pair("expected", "200-204");
+    Ok(url)
 }
 
 fn read_output_pipe<R>(mut pipe: R) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>>
@@ -2325,7 +2571,9 @@ fn normalize_overlay_cidr(value: &str) -> Option<String> {
 }
 
 fn ensure_list_file(path: &Path, values: Vec<&'static str>) -> Result<PathBuf> {
-    if !path.exists() {
+    let missing_or_empty =
+        !path.exists() || fs::metadata(path).map_or(true, |metadata| metadata.len() == 0);
+    if missing_or_empty {
         write_file_atomically(path, &values.join("\n"))?;
     }
     Ok(path.to_path_buf())
@@ -2451,19 +2699,48 @@ fn write_compiled_zapret_lists(
         &policy.zapret_ipset_exclude,
     )?;
 
-    write_policy_list_file(&lists.join("list-general.txt"), &general_hostlist)?;
-    write_policy_list_file(&lists.join("list-google.txt"), &google_hostlist)?;
-    write_policy_list_file(
-        &lists.join("list-exclude.txt"),
-        &policy.zapret_hostlist_exclude,
-    )?;
-    write_policy_list_file(
-        &lists.join("ipset-exclude.txt"),
-        &policy.zapret_ipset_exclude,
-    )?;
-    write_policy_list_file(&lists.join("list-general-user.txt"), &[])?;
-    write_policy_list_file(&lists.join("list-exclude-user.txt"), &[])?;
-    write_policy_list_file(&lists.join("ipset-exclude-user.txt"), &[])?;
+    // VPN Only clears policy hosts; keep Flowseal defaults so a later Smart
+    // start (or ensure_list_file) never inherits empty ProgramData lists.
+    let general_values = if general_hostlist.is_empty() {
+        badvpn_common::flowseal_general_hostlist()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    } else {
+        general_hostlist
+    };
+    let google_values = if google_hostlist.is_empty() {
+        badvpn_common::flowseal_google_hostlist()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    } else {
+        google_hostlist
+    };
+    let exclude_values = if policy.zapret_hostlist_exclude.is_empty() {
+        badvpn_common::flowseal_exclude_hostlist()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    } else {
+        policy.zapret_hostlist_exclude.clone()
+    };
+    let ipset_exclude_values = if policy.zapret_ipset_exclude.is_empty() {
+        badvpn_common::flowseal_ipset_exclude()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    } else {
+        policy.zapret_ipset_exclude.clone()
+    };
+
+    write_policy_list_file(&lists.join("list-general.txt"), &general_values)?;
+    write_policy_list_file(&lists.join("list-google.txt"), &google_values)?;
+    write_policy_list_file(&lists.join("list-exclude.txt"), &exclude_values)?;
+    write_policy_list_file(&lists.join("ipset-exclude.txt"), &ipset_exclude_values)?;
+    ensure_empty_list_file(&lists.join("list-general-user.txt"))?;
+    ensure_empty_list_file(&lists.join("list-exclude-user.txt"))?;
+    ensure_empty_list_file(&lists.join("ipset-exclude-user.txt"))?;
     Ok(())
 }
 
@@ -2623,54 +2900,128 @@ fn preflight_failed(
     )
 }
 
-fn strip_missing_geodata_rules(
+fn prepare_cached_rule_providers(
     yaml: &mut String,
-    geosite_available: bool,
-    geoip_available: bool,
-) -> Result<Vec<String>> {
-    let mut value: YamlValue =
-        serde_yaml::from_str(yaml).context("failed to parse generated Mihomo YAML")?;
-    let mut removed_geosite = 0usize;
-    let mut removed_geoip = 0usize;
+    _home: &Path,
+    _geosite_available: bool,
+    _geoip_available: bool,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let mut root = serde_yaml::from_str::<serde_yaml::Value>(yaml)
+        .context("failed to parse generated Mihomo YAML for provider preparation")?;
+    let mut messages = Vec::new();
+    let mut disabled = Vec::new();
+    {
+        let Some(providers) = root
+            .as_mapping_mut()
+            .and_then(|map| map.get_mut(serde_yaml::Value::String("rule-providers".to_string())))
+            .and_then(serde_yaml::Value::as_mapping_mut)
+        else {
+            return Ok((Vec::new(), Vec::new()));
+        };
 
-    if let Some(map) = value.as_mapping_mut() {
-        if let Some(rules) = map
-            .get_mut(YamlValue::String("rules".to_string()))
-            .and_then(YamlValue::as_sequence_mut)
-        {
-            rules.retain(|rule| {
-                let Some(text) = rule.as_str() else {
-                    return true;
-                };
-                let normalized = text.trim_start().to_ascii_uppercase();
-                if !geosite_available && normalized.starts_with("GEOSITE,") {
-                    removed_geosite += 1;
-                    return false;
-                }
-                if !geoip_available && normalized.starts_with("GEOIP,") {
-                    removed_geoip += 1;
-                    return false;
-                }
-                true
-            });
+        let provider_names = providers
+            .keys()
+            .filter_map(serde_yaml::Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        for provider_name in provider_names {
+            let key = serde_yaml::Value::String(provider_name.clone());
+            let Some(provider) = providers
+                .get_mut(&key)
+                .and_then(serde_yaml::Value::as_mapping_mut)
+            else {
+                continue;
+            };
+            let is_http = provider
+                .get(serde_yaml::Value::String("type".to_string()))
+                .and_then(serde_yaml::Value::as_str)
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("http"));
+            if !is_http {
+                continue;
+            }
+            disabled.push(provider_name);
+        }
+
+        for provider_name in &disabled {
+            providers.remove(serde_yaml::Value::String(provider_name.clone()));
+            messages.push(format!(
+                "Disabled HTTP rule provider '{provider_name}' for offline-safe startup; managed provider updates require a separately verified resource update."
+            ));
         }
     }
 
-    let mut messages = Vec::new();
-    if removed_geosite > 0 {
-        messages.push(format!(
-            "Disabled {removed_geosite} GEOSITE provider rules because no local GeoSite.dat asset is installed; this prevents Mihomo startup-time downloads."
-        ));
+    if !disabled.is_empty() {
+        remove_rule_set_entries_from_yaml(&mut root, &disabled);
     }
-    if removed_geoip > 0 {
-        messages.push(format!(
-            "Disabled {removed_geoip} GEOIP provider rules because no local GeoIP.dat asset is installed; this prevents Mihomo startup-time downloads."
-        ));
+    if !disabled.is_empty() {
+        *yaml = serde_yaml::to_string(&root)
+            .context("failed to render Mihomo YAML after provider preparation")?;
     }
-    if !messages.is_empty() {
-        *yaml = serde_yaml::to_string(&value).context("failed to render Mihomo YAML")?;
+    Ok((messages, disabled))
+}
+
+fn remove_rule_set_entries_from_yaml(root: &mut serde_yaml::Value, disabled: &[String]) {
+    let Some(rules) = root
+        .as_mapping_mut()
+        .and_then(|map| map.get_mut(serde_yaml::Value::String("rules".to_string())))
+        .and_then(serde_yaml::Value::as_sequence_mut)
+    else {
+        return;
+    };
+    rules.retain(|rule| {
+        rule.as_str().is_none_or(|rule| {
+            !disabled
+                .iter()
+                .any(|name| rule_references_rule_set(rule, name))
+        })
+    });
+}
+
+fn rule_references_rule_set(rule: &str, provider_name: &str) -> bool {
+    const PREFIX: &str = "rule-set,";
+    let lowercase = rule.to_ascii_lowercase();
+    let mut search_from = 0usize;
+    while let Some(offset) = lowercase[search_from..].find(PREFIX) {
+        let name_start = search_from + offset + PREFIX.len();
+        let name = rule[name_start..]
+            .split([',', ')', '('])
+            .next()
+            .map(str::trim)
+            .unwrap_or_default();
+        if name == provider_name {
+            return true;
+        }
+        search_from = name_start;
     }
-    Ok(messages)
+    false
+}
+
+fn sync_policy_after_rule_provider_strip(
+    policy: &mut CompiledPolicy,
+    disabled: &[String],
+) -> Result<()> {
+    let references_disabled = |rule: &str| {
+        disabled
+            .iter()
+            .any(|name| rule_references_rule_set(rule, name))
+    };
+    policy
+        .mihomo_rules
+        .retain(|rule| !references_disabled(rule));
+    policy.policy_rules.retain(|rule| {
+        rule.target.kind != PolicyTargetKind::RuleSet
+            || !disabled.iter().any(|value| value == &rule.target.value)
+    });
+    policy
+        .diagnostics_expectations
+        .retain(|expectation| !references_disabled(&expectation.target));
+    policy.suppressed_rules.retain(|rule| {
+        !references_disabled(&rule.original_rule) && !references_disabled(&rule.chosen_rule)
+    });
+    policy
+        .validate_invariants()
+        .map_err(|error| anyhow!("policy became invalid after rule-provider stripping: {error}"))?;
+    Ok(())
 }
 
 fn sync_policy_after_missing_geodata_strip(
@@ -2710,22 +3061,6 @@ fn missing_geodata_target_kind(
 ) -> bool {
     (!geosite_available && kind == PolicyTargetKind::GeoSite)
         || (!geoip_available && kind == PolicyTargetKind::GeoIp)
-}
-
-fn geodata_asset_exists(home: &Path, names: &[&str]) -> bool {
-    names.iter().any(|name| home.join(name).is_file())
-        || fs::read_dir(home)
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| entry.ok())
-            .any(|entry| {
-                let file_name = entry.file_name();
-                let file_name = file_name.to_string_lossy();
-                names
-                    .iter()
-                    .any(|name| file_name.eq_ignore_ascii_case(name))
-            })
 }
 
 fn tcp_port_is_busy(port: u16) -> bool {
@@ -3384,6 +3719,82 @@ mod tests {
     }
 
     #[test]
+    fn late_mihomo_death_transitions_connected_runtime_to_error() {
+        let mut manager = RuntimeManager::new();
+        manager.snapshot.phase = RuntimePhase::Running;
+        manager.snapshot.mihomo = RuntimeComponentSnapshot::new(
+            RuntimeComponentState::Stopped,
+            Some("Mihomo exited unexpectedly with exit code: 1".to_string()),
+        );
+        manager.snapshot.zapret =
+            RuntimeComponentSnapshot::new(RuntimeComponentState::Running, None);
+
+        manager.handle_late_mihomo_death();
+
+        assert_eq!(manager.snapshot.phase, RuntimePhase::Error);
+        assert_eq!(
+            manager.snapshot.zapret.state,
+            RuntimeComponentState::Stopped
+        );
+        assert!(manager
+            .snapshot
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("VPN routing is no longer active"));
+        let state = snapshot_to_agent_state(&manager.snapshot, SubscriptionState::default());
+        assert!(!state.running);
+        assert!(!state.connection.connected);
+        assert_eq!(state.phase, badvpn_common::AppPhase::Error);
+    }
+
+    #[test]
+    fn active_proxy_selection_rejects_stale_group_and_unknown_member() {
+        let catalog = serde_json::json!({
+            "proxies": {
+                "__BADVPN_VPN_ONLY__": {
+                    "type": "Selector",
+                    "all": ["Germany", "Switzerland"]
+                }
+            }
+        });
+
+        let stale = validate_active_proxy_selection(&catalog, "Выбор сервера", "Germany")
+            .unwrap_err()
+            .to_string();
+        assert!(stale.contains("not present in the active Mihomo runtime"));
+
+        let unknown = validate_active_proxy_selection(&catalog, "__BADVPN_VPN_ONLY__", "Poland")
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains("not a member"));
+
+        validate_active_proxy_selection(&catalog, "__BADVPN_VPN_ONLY__", "Germany").unwrap();
+    }
+
+    #[test]
+    fn proxy_delay_url_encodes_unicode_group_as_one_path_segment() {
+        let url = mihomo_proxy_delay_url(
+            9090,
+            "Выбор сервера/основной",
+            "https://www.gstatic.com/generate_204",
+            4_500,
+        )
+        .unwrap();
+
+        assert!(url
+            .as_str()
+            .contains("/proxies/%D0%92%D1%8B%D0%B1%D0%BE%D1%80%20%D1%81%D0%B5%D1%80%D0%B2%D0%B5%D1%80%D0%B0%2F%D0%BE%D1%81%D0%BD%D0%BE%D0%B2%D0%BD%D0%BE%D0%B9/delay"), "unexpected URL: {url}");
+        assert_eq!(
+            url.query_pairs()
+                .find(|(key, _)| key == "timeout")
+                .map(|(_, value)| value.into_owned())
+                .as_deref(),
+            Some("4500")
+        );
+    }
+
+    #[test]
     fn corrupt_draft_does_not_replace_last_working() {
         let root = std::env::temp_dir().join(format!("badvpn-config-test-{}", now_unix()));
         let store = RuntimeConfigStore { root: root.clone() };
@@ -3604,6 +4015,9 @@ start "zapret: general (ALT9)" /min "%BIN%winws.exe" --wf-tcp=80,443,%GameFilter
         let lists = components.join("zapret").join("lists");
         fs::create_dir_all(&lists).unwrap();
         fs::write(lists.join("ipset-all.txt"), "198.51.100.0/24\n").unwrap();
+        fs::write(lists.join("list-general-user.txt"), "custom.example\n").unwrap();
+        fs::write(lists.join("list-exclude-user.txt"), "exclude.example\n").unwrap();
+        fs::write(lists.join("ipset-exclude-user.txt"), "203.0.113.99\n").unwrap();
 
         write_compiled_zapret_lists(&store, &policy).unwrap();
 
@@ -3634,6 +4048,89 @@ start "zapret: general (ALT9)" /min "%BIN%winws.exe" --wf-tcp=80,443,%GameFilter
             fs::read_to_string(lists.join("ipset-all.effective.txt")).unwrap(),
             "198.51.100.0/24\n203.0.113.0/24\n"
         );
+        assert_eq!(
+            fs::read_to_string(lists.join("list-general-user.txt")).unwrap(),
+            "custom.example\n"
+        );
+        assert_eq!(
+            fs::read_to_string(lists.join("list-exclude-user.txt")).unwrap(),
+            "exclude.example\n"
+        );
+        assert_eq!(
+            fs::read_to_string(lists.join("ipset-exclude-user.txt")).unwrap(),
+            "203.0.113.99\n"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remembered_proxy_selection_is_kept_for_late_fallback_request() {
+        let mut manager = RuntimeManager::new();
+        manager.last_request = Some(test_request());
+
+        manager.remember_proxy_selection("PROXY", "Backup node");
+
+        let fallback_request = manager
+            .last_request
+            .clone()
+            .expect("late fallback request should remain available");
+        assert_eq!(
+            fallback_request.selected_proxies.get("PROXY"),
+            Some(&"Backup node".to_string())
+        );
+    }
+
+    #[test]
+    fn vpn_only_list_write_keeps_flowseal_defaults() {
+        let root = std::env::temp_dir().join(format!("badvpn-vpn-only-lists-{}", now_unix()));
+        let components = root.join("components");
+        let store = ComponentStore {
+            root: components.clone(),
+            appdata_fallback: None,
+        };
+        let policy = compile_policy(PolicyCompileInput {
+            mode: AppRouteMode::VpnOnly,
+            provider_rules: vec!["MATCH,PROXY".to_string()],
+            proxy_groups: vec![ProxyGroupInfo {
+                name: "PROXY".to_string(),
+                group_type: Some("select".to_string()),
+                proxies: vec!["Germany".to_string()],
+            }],
+            proxy_count: 1,
+            routing: RoutingPolicySettings::default(),
+            runtime_facts: RuntimeFacts::default(),
+        })
+        .unwrap();
+
+        let lists = components.join("zapret").join("lists");
+        fs::create_dir_all(&lists).unwrap();
+        fs::write(lists.join("list-general.txt"), "").unwrap();
+        fs::write(lists.join("list-google.txt"), "").unwrap();
+
+        write_compiled_zapret_lists(&store, &policy).unwrap();
+
+        assert!(policy.zapret_hostlist.is_empty());
+        assert!(fs::read_to_string(lists.join("zapret_hostlist.txt"))
+            .unwrap()
+            .trim()
+            .is_empty());
+        let general = fs::read_to_string(lists.join("list-general.txt")).unwrap();
+        let google = fs::read_to_string(lists.join("list-google.txt")).unwrap();
+        assert!(general.contains("discord.com"));
+        assert!(google.contains("googlevideo.com"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ensure_list_file_refills_empty_hostlists() {
+        let root = std::env::temp_dir().join(format!("badvpn-ensure-list-{}", now_unix()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("list-general.txt");
+        fs::write(&path, "").unwrap();
+
+        ensure_list_file(&path, badvpn_common::flowseal_general_hostlist()).unwrap();
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(body.contains("discord.com"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3813,6 +4310,236 @@ rules:
             .diagnostics
             .iter()
             .any(|message| { message.contains("GEOIP provider rules") }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cached_classical_provider_with_missing_geodata_is_disabled() {
+        let root = std::env::temp_dir().join(format!("badvpn-provider-sanitize-{}", now_unix()));
+        let ruleset = root.join("ruleset");
+        fs::create_dir_all(&ruleset).unwrap();
+        fs::write(
+            ruleset.join("ai.yaml"),
+            "payload:\n  - GEOSITE,openai\n  - GEOIP,private\n  - DOMAIN-SUFFIX,openai.com\n",
+        )
+        .unwrap();
+        let mut yaml = r#"
+rule-providers:
+  AI:
+    type: http
+    behavior: classical
+    format: yaml
+    url: https://example.invalid/ai.yaml
+    path: ./ruleset/ai.yaml
+    proxy: PROXY
+    interval: 86400
+rules:
+  - RULE-SET,AI,PROXY
+  - MATCH,PROXY
+"#
+        .to_string();
+
+        let (messages, disabled) =
+            prepare_cached_rule_providers(&mut yaml, &root, false, false).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(disabled, vec!["AI".to_string()]);
+        assert!(!yaml.contains("example.invalid"));
+        assert!(!yaml.contains("RULE-SET,AI"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn http_provider_is_disabled_even_when_an_unverified_cache_exists() {
+        let root = std::env::temp_dir().join(format!("badvpn-provider-local-{}", now_unix()));
+        let ruleset = root.join("ruleset");
+        fs::create_dir_all(&ruleset).unwrap();
+        fs::write(
+            ruleset.join("domains.yaml"),
+            "payload:\n  - DOMAIN-SUFFIX,example.com\n",
+        )
+        .unwrap();
+        let mut yaml = r#"
+rule-providers:
+  Domains:
+    type: http
+    behavior: classical
+    format: yaml
+    url: https://example.invalid/domains.yaml
+    path: ./ruleset/domains.yaml
+    interval: 86400
+rules:
+  - RULE-SET,Domains,PROXY
+  - MATCH,PROXY
+"#
+        .to_string();
+
+        let (_messages, disabled) =
+            prepare_cached_rule_providers(&mut yaml, &root, false, false).unwrap();
+
+        assert_eq!(disabled, vec!["Domains".to_string()]);
+        assert!(!yaml.contains("example.invalid"));
+        assert!(!yaml.contains("RULE-SET,Domains"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn malformed_yaml_provider_cache_is_disabled() {
+        for body in [
+            "payload: broken\n",
+            "foo: bar\n",
+            "payload:\n  - ok\n  - 7\n",
+            "payload:\n  - NOT-A-MIHOMO-RULE\n",
+        ] {
+            let root = std::env::temp_dir().join(format!("badvpn-provider-invalid-{}", now_unix()));
+            let ruleset = root.join("ruleset");
+            fs::create_dir_all(&ruleset).unwrap();
+            fs::write(ruleset.join("invalid.yaml"), body).unwrap();
+            let mut yaml = "rule-providers:\n  Invalid:\n    type: http\n    behavior: classical\n    format: yaml\n    url: https://example.invalid/provider.yaml\n    path: ./ruleset/invalid.yaml\nrules:\n  - RULE-SET,Invalid,PROXY\n  - MATCH,PROXY\n".to_string();
+
+            let (_messages, disabled) =
+                prepare_cached_rule_providers(&mut yaml, &root, true, true).unwrap();
+
+            assert_eq!(disabled, vec!["Invalid".to_string()]);
+            assert!(!yaml.contains("example.invalid"));
+            assert!(!yaml.contains("RULE-SET,Invalid"));
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn unvalidated_mrs_provider_cache_is_disabled() {
+        let root = std::env::temp_dir().join(format!("badvpn-provider-mrs-{}", now_unix()));
+        let ruleset = root.join("ruleset");
+        fs::create_dir_all(&ruleset).unwrap();
+        fs::write(
+            ruleset.join("invalid.mrs"),
+            [0x28, 0xB5, 0x2F, 0xFD, 0, 1, 2, 3],
+        )
+        .unwrap();
+        let mut yaml = "rule-providers:\n  InvalidMrs:\n    type: http\n    behavior: domain\n    format: mrs\n    url: https://example.invalid/provider.mrs\n    path: ./ruleset/invalid.mrs\nrules:\n  - RULE-SET,InvalidMrs,PROXY\n  - MATCH,PROXY\n".to_string();
+
+        let (_messages, disabled) =
+            prepare_cached_rule_providers(&mut yaml, &root, true, true).unwrap();
+
+        assert_eq!(disabled, vec!["InvalidMrs".to_string()]);
+        assert!(!yaml.contains("example.invalid"));
+        assert!(!yaml.contains("RULE-SET,InvalidMrs"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_http_provider_cache_disables_provider_and_rule() {
+        let root = std::env::temp_dir().join(format!("badvpn-provider-missing-{}", now_unix()));
+        fs::create_dir_all(&root).unwrap();
+        let mut yaml = r#"
+rule-providers:
+  TikTok:
+    type: http
+    behavior: classical
+    format: yaml
+    url: https://example.invalid/missing.yaml
+    path: ./ruleset/missing.yaml
+    interval: 86400
+rules:
+  - RULE-SET,TikTok,PROXY
+  - MATCH,PROXY
+"#
+        .to_string();
+
+        let (messages, disabled) =
+            prepare_cached_rule_providers(&mut yaml, &root, false, false).unwrap();
+
+        assert_eq!(disabled, vec!["TikTok".to_string()]);
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("offline-safe startup")));
+        assert!(!yaml.contains("example.invalid"));
+        assert!(!yaml.contains("RULE-SET,TikTok"));
+        assert!(yaml.contains("MATCH,PROXY"));
+        let mut policy = compile_policy(PolicyCompileInput {
+            mode: AppRouteMode::VpnOnly,
+            provider_rules: vec![
+                "RULE-SET,TikTok,PROXY".to_string(),
+                "MATCH,PROXY".to_string(),
+            ],
+            proxy_groups: vec![ProxyGroupInfo {
+                name: "PROXY".to_string(),
+                group_type: Some("select".to_string()),
+                proxies: vec!["Germany".to_string()],
+            }],
+            proxy_count: 1,
+            routing: RoutingPolicySettings::default(),
+            runtime_facts: RuntimeFacts::default(),
+        })
+        .unwrap();
+        sync_policy_after_rule_provider_strip(&mut policy, &disabled).unwrap();
+        assert!(!policy
+            .mihomo_rules
+            .iter()
+            .any(|rule| rule.contains("RULE-SET,TikTok")));
+        assert!(policy.mihomo_rules.iter().any(|rule| rule == "MATCH,PROXY"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn disabling_http_provider_preserves_case_distinct_local_provider() {
+        let root = std::env::temp_dir().join(format!("badvpn-provider-case-{}", now_unix()));
+        fs::create_dir_all(&root).unwrap();
+        let mut yaml = r#"
+rule-providers:
+  Foo:
+    type: http
+    behavior: classical
+    format: yaml
+    url: https://example.invalid/Foo.yaml
+    path: ./ruleset/Foo.yaml
+  foo:
+    type: file
+    behavior: classical
+    format: yaml
+    path: ./ruleset/foo.yaml
+rules:
+  - RULE-SET,Foo,PROXY
+  - RULE-SET,foo,DIRECT
+  - MATCH,PROXY
+"#
+        .to_string();
+
+        let (_messages, disabled) =
+            prepare_cached_rule_providers(&mut yaml, &root, false, false).unwrap();
+
+        assert_eq!(disabled, vec!["Foo".to_string()]);
+        assert!(!yaml.contains("RULE-SET,Foo,PROXY"));
+        assert!(yaml.contains("RULE-SET,foo,DIRECT"));
+        assert!(yaml.contains("foo:"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn disabling_http_provider_removes_nested_rule_set_reference() {
+        let root = std::env::temp_dir().join(format!("badvpn-provider-nested-{}", now_unix()));
+        fs::create_dir_all(&root).unwrap();
+        let mut yaml = r#"
+rule-providers:
+  Remote:
+    type: http
+    behavior: classical
+    format: yaml
+    url: https://example.invalid/remote.yaml
+    path: ./ruleset/remote.yaml
+rules:
+  - AND,((RULE-SET,Remote),(NETWORK,TCP)),PROXY
+  - MATCH,PROXY
+"#
+        .to_string();
+
+        let (_messages, disabled) =
+            prepare_cached_rule_providers(&mut yaml, &root, false, false).unwrap();
+
+        assert_eq!(disabled, vec!["Remote".to_string()]);
+        assert!(!yaml.contains("RULE-SET,Remote"));
+        assert!(yaml.contains("MATCH,PROXY"));
         let _ = fs::remove_dir_all(root);
     }
 
