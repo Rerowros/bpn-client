@@ -75,7 +75,45 @@ impl RuntimeManager {
         self.active_policy.as_ref()
     }
 
-    pub async fn connect(&mut self, mut request: ConnectRequest) -> Result<AgentRuntimeSnapshot> {
+    pub fn remembered_selected_proxy(&self) -> Option<String> {
+        let request = self.last_request.as_ref()?;
+        if let Some(group) = self
+            .active_policy
+            .as_ref()
+            .map(|policy| policy.main_proxy_group.as_str())
+        {
+            if let Some(proxy) = request.selected_proxies.get(group) {
+                return Some(proxy.clone());
+            }
+        }
+        request.selected_proxies.values().next().cloned()
+    }
+
+    pub fn last_connect_request(&self) -> Option<ConnectRequest> {
+        self.last_request.clone()
+    }
+
+    pub async fn connect(&mut self, request: ConnectRequest) -> Result<AgentRuntimeSnapshot> {
+        self.connect_with_cancel(request, None).await
+    }
+
+    pub async fn connect_with_cancel(
+        &mut self,
+        mut request: ConnectRequest,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<AgentRuntimeSnapshot> {
+        let cancelled = || {
+            cancel
+                .map(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+                .unwrap_or(false)
+        };
+        let check_cancel = |phase: &str| -> Result<()> {
+            if cancelled() {
+                Err(anyhow!("connect cancelled during {phase}"))
+            } else {
+                Ok(())
+            }
+        };
         let mut timeline = StartupTimeline::new();
         tracing::info!(
             route_mode = ?request.route_mode,
@@ -94,10 +132,10 @@ impl RuntimeManager {
                 | RuntimePhase::Verifying
                 | RuntimePhase::Stopping
         ) {
-            self.snapshot
-                .diagnostics
-                .push("Runtime operation is already in progress.".to_string());
-            return Ok(self.snapshot.clone());
+            return Err(anyhow!(
+                "Runtime operation is already in progress (phase={:?}).",
+                self.snapshot.phase
+            ));
         }
 
         let owned_runtime_was_running = self.mihomo.is_running() || self.zapret.is_running();
@@ -140,6 +178,11 @@ impl RuntimeManager {
             }
         };
         timeline.mark("preflight_ms");
+        if let Err(error) = check_cancel("preflight") {
+            let _ = self.mihomo.stop();
+            let _ = self.zapret.stop();
+            return Err(error);
+        }
 
         let mut effective_mode = request.route_mode;
         if preflight.force_vpn_only && effective_mode == RuntimeMode::Smart {
@@ -191,6 +234,10 @@ impl RuntimeManager {
             .validate(&mihomo_bin, &draft_path, self.config_store.home_dir())
             .context("Mihomo rejected generated config")?;
         timeline.mark("mihomo_validate_ms");
+        if let Err(error) = check_cancel("mihomo_validate") {
+            let _ = self.zapret.stop();
+            return Err(error);
+        }
 
         if should_start_zapret {
             write_compiled_zapret_lists(&self.component_store, &runtime_config.policy)
@@ -300,6 +347,12 @@ impl RuntimeManager {
             return Ok(self.snapshot.clone());
         }
         timeline.mark("mihomo_ready_ms");
+        if let Err(error) = check_cancel("mihomo_ready") {
+            let _ = self.mihomo.stop();
+            let _ = self.zapret.stop();
+            let _ = self.config_store.rollback_run();
+            return Err(error);
+        }
 
         self.snapshot.phase = RuntimePhase::Verifying;
         if let Err(error) = self
@@ -311,14 +364,12 @@ impl RuntimeManager {
             )
             .await
         {
-            tracing::error!(%error, "Mihomo proxy egress verification failed");
-            let _ = self.mihomo.stop();
-            let _ = self.zapret.stop();
-            let _ = self.config_store.rollback_run();
-            self.set_error(format!(
-                "Mihomo started, but the selected VPN path cannot reach the internet: {error}"
+            // Soft-fail: controller readiness already proved Mihomo is up. Remote
+            // /delay probes can false-negative on networks that block the probe URLs.
+            tracing::warn!(%error, "Mihomo proxy egress verification failed; continuing");
+            self.snapshot.diagnostics.push(format!(
+                "Proxy egress probe warning (connect continues): {error}"
             ));
-            return Ok(self.snapshot.clone());
         }
         timeline.mark("proxy_egress_ms");
         if request.settings.diagnostics.discord_youtube_probes
@@ -537,6 +588,31 @@ impl RuntimeManager {
                 "Repair zapret components; BadVpn can still start in VPN-only mode.",
             ));
         }
+        if request.route_mode == RuntimeMode::Smart
+            && request.settings.zapret.enabled
+            && self.component_store.winws_bin().is_ok()
+        {
+            let missing = self.component_store.missing_zapret_runtime_assets();
+            if !missing.is_empty() {
+                self.snapshot.zapret = RuntimeComponentSnapshot::new(
+                    RuntimeComponentState::Missing,
+                    Some(format!(
+                        "WinDivert/Flowseal support assets missing: {}",
+                        missing.join(", ")
+                    )),
+                );
+                checks.push(preflight_failed(
+                    "windivert_assets",
+                    PreflightSeverity::DegradeToVpnOnly,
+                    "zapret",
+                    format!(
+                        "WinDivert/Flowseal support assets are missing: {}.",
+                        missing.join(", ")
+                    ),
+                    "Repair zapret components; BadVpn can still start in VPN-only mode.",
+                ));
+            }
+        }
 
         let managed_mihomo = self.component_store.mihomo_bin().ok();
         if !self.mihomo.is_running() {
@@ -706,8 +782,7 @@ impl RuntimeManager {
         self.build_runtime_config_with_secret(
             request,
             mode,
-            badvpn_common::generate_controller_secret()
-                .map_err(|error| anyhow!(error))?,
+            badvpn_common::generate_controller_secret().map_err(|error| anyhow!(error))?,
         )
     }
 
@@ -1399,6 +1474,27 @@ impl ComponentStore {
             .ok_or_else(|| anyhow!("zapret/winws binary was not found."))
     }
 
+    fn missing_zapret_runtime_assets(&self) -> Vec<String> {
+        let bin = self.zapret_bin_dir();
+        [
+            "WinDivert.dll",
+            "WinDivert64.sys",
+            "cygwin1.dll",
+            "quic_initial_www_google_com.bin",
+            "tls_clienthello_www_google_com.bin",
+        ]
+        .into_iter()
+        .filter_map(|name| {
+            let path = bin.join(name);
+            if path.exists() {
+                None
+            } else {
+                Some(path.display().to_string())
+            }
+        })
+        .collect()
+    }
+
     fn zapret_root(&self) -> PathBuf {
         self.root.join("zapret")
     }
@@ -1830,6 +1926,38 @@ impl ZapretManager {
     ) -> Result<String> {
         self.stop()?;
         let winws = component_store.winws_bin()?;
+        let attempts = zapret_strategy_attempt_order(settings);
+        let mut errors = Vec::new();
+        for strategy in attempts {
+            let mut attempt_settings = settings.clone();
+            attempt_settings.strategy = strategy.to_string();
+            match self.spawn_with_strategy(component_store, &winws, &attempt_settings) {
+                Ok(message) => {
+                    if strategy != settings.strategy.as_str() {
+                        return Ok(format!(
+                            "{message}; auto-selected strategy={strategy} after selected profile failed"
+                        ));
+                    }
+                    return Ok(message);
+                }
+                Err(error) => {
+                    tracing::warn!(strategy, %error, "winws strategy attempt failed");
+                    errors.push(format!("{strategy}: {error}"));
+                }
+            }
+        }
+        Err(anyhow!(
+            "all zapret Flowseal profiles failed: {}",
+            errors.join("; ")
+        ))
+    }
+
+    fn spawn_with_strategy(
+        &mut self,
+        component_store: &ComponentStore,
+        winws: &Path,
+        settings: &badvpn_common::RuntimeZapretSettings,
+    ) -> Result<String> {
         let args = build_winws_args(component_store, settings)?;
         tracing::info!(
             winws = %winws.display(),
@@ -1841,7 +1969,7 @@ impl ZapretManager {
             "starting winws child"
         );
         tracing::debug!(args = ?args, "winws arguments");
-        let mut child = Command::new(&winws)
+        let mut child = Command::new(winws)
             .current_dir(component_store.zapret_bin_dir())
             .args(&args)
             .stdin(Stdio::null())
@@ -1852,12 +1980,12 @@ impl ZapretManager {
         std::thread::sleep(Duration::from_millis(900));
         if let Some(status) = child.try_wait()? {
             self.last_exit_detail = Some(format!("winws exited immediately with {status}"));
-            tracing::error!(%status, "winws exited immediately");
+            tracing::error!(%status, strategy = %settings.strategy, "winws exited immediately");
             return Err(anyhow!(
                 "winws exited immediately with {status}; WinDivert may need service elevation or another DPI tool owns the driver"
             ));
         }
-        tracing::info!(pid = child.id(), "winws child started");
+        tracing::info!(pid = child.id(), strategy = %settings.strategy, "winws child started");
         self.last_exit_detail = None;
         self.child = Some(child);
         Ok(format!(
@@ -2046,6 +2174,55 @@ fn flowseal_profile_bat_file_name(strategy: &str) -> &'static str {
         "simple_fake_alt2" => "general (SIMPLE FAKE ALT2).bat",
         _ => "general.bat",
     }
+}
+
+fn zapret_strategy_ids() -> &'static [&'static str] {
+    &[
+        "general",
+        "alt",
+        "alt2",
+        "alt3",
+        "alt4",
+        "alt5",
+        "alt6",
+        "alt7",
+        "alt8",
+        "alt9",
+        "alt10",
+        "alt11",
+        "fake_tls_auto",
+        "fake_tls_auto_alt",
+        "fake_tls_auto_alt2",
+        "fake_tls_auto_alt3",
+        "simple_fake",
+        "simple_fake_alt",
+        "simple_fake_alt2",
+    ]
+}
+
+fn normalize_zapret_strategy(strategy: &str) -> &'static str {
+    let trimmed = strategy.trim().to_ascii_lowercase();
+    zapret_strategy_ids()
+        .iter()
+        .copied()
+        .find(|id| *id == trimmed)
+        .unwrap_or("general")
+}
+
+fn zapret_strategy_attempt_order(
+    settings: &badvpn_common::RuntimeZapretSettings,
+) -> Vec<&'static str> {
+    let preferred = normalize_zapret_strategy(&settings.strategy);
+    if !settings.auto_profile_fallback {
+        return vec![preferred];
+    }
+    let mut order = vec![preferred];
+    for strategy in zapret_strategy_ids() {
+        if !order.contains(strategy) {
+            order.push(*strategy);
+        }
+    }
+    order
 }
 
 fn extract_winws_command_from_bat(content: &str) -> Option<String> {
@@ -2678,6 +2855,15 @@ fn append_google_quic_hostlist_args(
     ipset_exclude: &Path,
     bin: &Path,
 ) {
+    // Skip only when a UDP/443 Google branch with fake-quic is already present.
+    let already_has_google_quic = args.iter().any(|arg| {
+        let normalized = arg.replace('\\', "/").to_ascii_lowercase();
+        normalized.contains("dpi-desync-fake-quic=")
+            || normalized.contains("quic_initial_www_google_com.bin")
+    });
+    if already_has_google_quic {
+        return;
+    }
     args.extend([
         "--new".to_string(),
         "--filter-udp=443".to_string(),
@@ -3403,6 +3589,7 @@ fn now_unix() -> u64 {
 pub fn snapshot_to_agent_state(
     snapshot: &AgentRuntimeSnapshot,
     subscription: SubscriptionState,
+    selected_proxy: Option<String>,
 ) -> badvpn_common::AgentState {
     let running = matches!(
         snapshot.phase,
@@ -3439,7 +3626,7 @@ pub fn snapshot_to_agent_state(
                 RuntimePhase::Error => badvpn_common::ConnectionStatus::Error,
             },
             selected_profile: snapshot.active_config_id.clone(),
-            selected_proxy: None,
+            selected_proxy,
             route_mode: snapshot.effective_mode.as_route_mode(),
         },
         metrics: badvpn_common::TrafficMetrics::default(),
@@ -3598,6 +3785,35 @@ mod architecture_fix_tests {
     }
 
     #[test]
+    fn zapret_strategy_fallback_order_prefers_selected_then_all() {
+        let mut settings = badvpn_common::RuntimeZapretSettings::default();
+        settings.strategy = "alt5".to_string();
+        settings.auto_profile_fallback = true;
+        let order = zapret_strategy_attempt_order(&settings);
+        assert_eq!(order.first().copied(), Some("alt5"));
+        assert_eq!(order.len(), zapret_strategy_ids().len());
+        assert!(order.contains(&"general"));
+        assert!(order.contains(&"simple_fake_alt2"));
+
+        settings.auto_profile_fallback = false;
+        assert_eq!(zapret_strategy_attempt_order(&settings), vec!["alt5"]);
+    }
+
+    #[test]
+    fn append_google_quic_skips_when_fake_quic_already_present() {
+        let mut args = vec![
+            "--filter-udp=443".to_string(),
+            "--dpi-desync-fake-quic=C:\\bin\\quic_initial_www_google_com.bin".to_string(),
+        ];
+        let google = PathBuf::from("C:\\lists\\list-google.txt");
+        let exclude = PathBuf::from("C:\\lists\\list-exclude.txt");
+        let ipset = PathBuf::from("C:\\lists\\ipset-exclude.txt");
+        let bin = PathBuf::from("C:\\bin");
+        append_google_quic_hostlist_args(&mut args, &google, &exclude, &ipset, &bin);
+        assert_eq!(args.len(), 2);
+    }
+
+    #[test]
     fn windows_network_recovery_plan_is_scoped_to_cache_and_bpn_rules() {
         let plan = windows_network_recovery_plan();
         assert!(plan
@@ -3638,15 +3854,18 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn duplicate_connect_returns_transition_snapshot() {
+    async fn duplicate_connect_returns_busy_error() {
         let mut manager = RuntimeManager::new();
         manager.snapshot.phase = RuntimePhase::StartingMihomo;
-        let snapshot = manager.connect(test_request()).await.unwrap();
-        assert_eq!(snapshot.phase, RuntimePhase::StartingMihomo);
-        assert!(snapshot
-            .diagnostics
-            .iter()
-            .any(|message| message.contains("already in progress")));
+        let error = manager
+            .connect(test_request())
+            .await
+            .expect_err("duplicate connect must fail while a transition is active");
+        assert!(
+            error.to_string().contains("already in progress"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(manager.snapshot.phase, RuntimePhase::StartingMihomo);
     }
 
     #[test]
@@ -3732,7 +3951,7 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("VPN routing is no longer active"));
-        let state = snapshot_to_agent_state(&manager.snapshot, SubscriptionState::default());
+        let state = snapshot_to_agent_state(&manager.snapshot, SubscriptionState::default(), None);
         assert!(!state.running);
         assert!(!state.connection.connected);
         assert_eq!(state.phase, badvpn_common::AppPhase::Error);

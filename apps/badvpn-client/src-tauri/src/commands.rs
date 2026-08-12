@@ -871,6 +871,8 @@ fn write_pipe_all(
 fn read_pipe_line(handle: windows_sys::Win32::Foundation::HANDLE) -> Result<String, String> {
     let mut data = Vec::new();
     let mut buffer = [0_u8; 4096];
+    let started = SystemTime::now();
+    let timeout = Duration::from_secs(30);
     loop {
         let mut read = 0_u32;
         let ok = unsafe {
@@ -885,6 +887,11 @@ fn read_pipe_line(handle: windows_sys::Win32::Foundation::HANDLE) -> Result<Stri
         if !ok {
             let error = unsafe { GetLastError() };
             if error == ERROR_NO_DATA {
+                if started.elapsed().map_or(true, |elapsed| elapsed >= timeout) {
+                    return Err(
+                        "Timed out waiting for BadVpn agent named pipe response.".to_string()
+                    );
+                }
                 std::thread::sleep(Duration::from_millis(20));
                 continue;
             }
@@ -905,6 +912,9 @@ fn read_pipe_line(handle: windows_sys::Win32::Foundation::HANDLE) -> Result<Stri
         }
         if data.len() > 1024 * 1024 {
             return Err("Agent response exceeded maximum IPC frame size.".to_string());
+        }
+        if started.elapsed().map_or(true, |elapsed| elapsed >= timeout) {
+            return Err("Timed out reading BadVpn agent named pipe response.".to_string());
         }
     }
     String::from_utf8(data)
@@ -5772,6 +5782,15 @@ $serviceAgent = '{service_agent}'
 $serviceAgentDir = Split-Path -Parent $serviceAgent
 {staging_script}
 New-Item -ItemType Directory -Path $serviceAgentDir -Force | Out-Null
+try {{
+  $u = (Get-CimInstance Win32_ComputerSystem).UserName
+  if ($u) {{
+    $sid = ([System.Security.Principal.NTAccount]$u).Translate([System.Security.Principal.SecurityIdentifier]).Value
+    if ($sid -like 'S-1-*') {{
+      Set-Content -LiteralPath (Join-Path $serviceAgentDir 'allowed-user.sid') -Value $sid -Encoding ascii -NoNewline
+    }}
+  }}
+}} catch {{}}
 $service = Get-Service -Name '{service_name}' -ErrorAction SilentlyContinue
 if ($service -and $service.Status -ne 'Stopped') {{
   sc.exe stop '{service_name}' | Out-Null

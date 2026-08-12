@@ -14,6 +14,9 @@ This document owns runtime behavior: `badvpn-agent`, IPC, Mihomo/winws lifecycle
 
 - Primary Windows IPC: `\\.\pipe\badvpn-agent`.
 - Pipe access must be limited to LocalSystem, Administrators, and the installing/current user SID. Blanket interactive-user write access is not release-safe.
+- The installing user SID is persisted to `%PROGRAMDATA%\BadVpn\agent\allowed-user.sid` during service install/repair and cached by the agent. `BADVPN_AGENT_ALLOWED_USER_SID` still overrides when set.
+- Named-pipe and TCP command reads use idle timeouts so hung clients cannot block the control plane forever.
+- `Connect` starts in the background and returns a connecting snapshot immediately so `RuntimeStatus` can be served while startup continues. `Stop` cancels an in-flight connect.
 - Localhost TCP `127.0.0.1:38790` is a development fallback only and requires `BADVPN_AGENT_TCP_FALLBACK=1`.
 - Wire format: one JSON `AgentCommand` per line and one JSON response per line.
 
@@ -82,8 +85,9 @@ Checks include:
 
 ## Open Runtime Gaps
 
-- Persist the installing user SID for named-pipe ACLs instead of relying on active-console-user discovery.
 - Move final component update download/verify/swap ownership from GUI-assisted staging into `badvpn-agent`.
 - Finish reboot recovery and reattach-to-existing-owned-process logic.
 - Move late winws death detection from status polling into an agent-owned background watchdog. Status polling already triggers VPN-only fallback, but recovery must not depend on the GUI being open.
 - Expand `RunDiagnostics` beyond the current component snapshot into WinDivert/BFE, route, DNS, controller traffic, and HTTPS checks.
+- Replace robocopy `/MIR` staging with verify-then-swap so incomplete AppData sources cannot wipe ProgramData assets.
+- Include `proxy-providers` endpoint hosts in runtime facts / zapret excludes.

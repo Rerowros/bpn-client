@@ -5,7 +5,12 @@ use badvpn_common::{
 use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
+use tokio::sync::Mutex;
 
 use crate::{
     runtime::{
@@ -17,10 +22,33 @@ use crate::{
     state::AgentRuntimeState,
 };
 
-#[derive(Debug, Default)]
-pub struct AgentController {
+struct AgentInner {
     runtime: AgentRuntimeState,
     manager: RuntimeManager,
+}
+
+pub struct AgentController {
+    inner: Arc<Mutex<AgentInner>>,
+    connecting: Arc<AtomicBool>,
+    cancel_connect: Arc<AtomicBool>,
+    connect_task: Option<tokio::task::JoinHandle<()>>,
+    /// Progress visible to Status while connect holds the runtime lock.
+    progress: Arc<std::sync::RwLock<AgentState>>,
+}
+
+impl Default for AgentController {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(AgentInner {
+                runtime: AgentRuntimeState::default(),
+                manager: RuntimeManager::new(),
+            })),
+            connecting: Arc::new(AtomicBool::new(false)),
+            cancel_connect: Arc::new(AtomicBool::new(false)),
+            connect_task: None,
+            progress: Arc::new(std::sync::RwLock::new(AgentState::default())),
+        }
+    }
 }
 
 impl AgentController {
@@ -31,9 +59,11 @@ impl AgentController {
             AgentCommand::RuntimeStatus => self.runtime_status().await,
             AgentCommand::Connect { request } => self.connect(*request).await,
             AgentCommand::Start => {
-                self.runtime
+                let mut guard = self.inner.lock().await;
+                guard
+                    .runtime
                     .set_error("ConnectRequest is required for service-first runtime start");
-                Ok(self.runtime.snapshot())
+                Ok(guard.runtime.snapshot())
             }
             AgentCommand::Stop => self.stop().await,
             AgentCommand::Restart => self.restart().await,
@@ -49,24 +79,45 @@ impl AgentController {
             | AgentCommand::UpdateComponents
             | AgentCommand::RollbackComponent { .. }
             | AgentCommand::PolicySummary => {
-                self.runtime
+                let mut guard = self.inner.lock().await;
+                guard
+                    .runtime
                     .set_error("command is planned but not implemented in M1 scaffold");
-                Ok(self.runtime.snapshot())
+                Ok(guard.runtime.snapshot())
             }
         }
     }
 
     async fn runtime_status(&mut self) -> BadVpnResult<AgentState> {
-        let snapshot = self.manager.status_snapshot().await;
-        self.runtime = AgentRuntimeState::from_agent_state(snapshot_to_agent_state(
+        // Prefer a non-blocking view while connect is running so status polling
+        // cannot wait behind a long Connect on the serial named-pipe loop.
+        if self.connecting.load(Ordering::SeqCst) {
+            if let Ok(progress) = self.progress.read() {
+                return Ok(progress.clone());
+            }
+        }
+
+        let mut guard = self.inner.lock().await;
+        let snapshot = guard.manager.status_snapshot().await;
+        guard.runtime = AgentRuntimeState::from_agent_state(snapshot_to_agent_state(
             &snapshot,
-            self.runtime.subscription.clone(),
+            guard.runtime.subscription.clone(),
+            guard.manager.remembered_selected_proxy(),
         ));
-        Ok(self.runtime.snapshot())
+        let state = guard.runtime.snapshot();
+        if let Ok(mut progress) = self.progress.write() {
+            *progress = state.clone();
+        }
+        Ok(state)
     }
 
     pub fn policy_summary(&self) -> anyhow::Result<badvpn_common::ipc::PolicySummaryResponse> {
-        if let Some(policy) = self.manager.active_policy() {
+        // Blocking path for sync IPC PolicySummary; try_lock avoids waiting on connect.
+        let guard = self
+            .inner
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("runtime is busy"))?;
+        if let Some(policy) = guard.manager.active_policy() {
             let mut response: badvpn_common::ipc::PolicySummaryResponse = policy.into();
             response.source = "agent_runtime".to_string();
             Ok(response)
@@ -76,159 +127,247 @@ impl AgentController {
     }
 
     async fn connect(&mut self, request: ConnectRequest) -> BadVpnResult<AgentState> {
-        self.runtime.subscription = request.subscription.clone();
-        let snapshot = self
-            .manager
-            .connect(request)
-            .await
-            .map_err(|error| BadVpnError::OperationFailed(error.to_string()))?;
-        self.runtime = AgentRuntimeState::from_agent_state(snapshot_to_agent_state(
-            &snapshot,
-            self.runtime.subscription.clone(),
-        ));
-        Ok(self.runtime.snapshot())
+        if self.connecting.load(Ordering::SeqCst) {
+            return Err(BadVpnError::OperationFailed(
+                "Connect is already in progress".to_string(),
+            ));
+        }
+
+        // Ensure any previous task is finished before starting another.
+        if let Some(task) = self.connect_task.take() {
+            let _ = task.await;
+        }
+
+        self.cancel_connect.store(false, Ordering::SeqCst);
+        self.connecting.store(true, Ordering::SeqCst);
+
+        {
+            let mut guard = self.inner.lock().await;
+            guard.runtime.subscription = request.subscription.clone();
+            guard.runtime.set_phase(AppPhase::Connecting);
+            guard.runtime.connection.status = badvpn_common::ConnectionStatus::Starting;
+            guard.runtime.connection.connected = false;
+            guard.runtime.clear_error();
+            guard.runtime.diagnostics.message =
+                Some("Connect started in background; poll status for progress.".to_string());
+            if let Ok(mut progress) = self.progress.write() {
+                *progress = guard.runtime.snapshot();
+            }
+        }
+
+        let inner = Arc::clone(&self.inner);
+        let connecting = Arc::clone(&self.connecting);
+        let cancel = Arc::clone(&self.cancel_connect);
+        let progress = Arc::clone(&self.progress);
+        self.connect_task = Some(tokio::spawn(async move {
+            let result = {
+                let mut guard = inner.lock().await;
+                guard
+                    .manager
+                    .connect_with_cancel(request, Some(cancel.as_ref()))
+                    .await
+            };
+            let mut guard = inner.lock().await;
+            match result {
+                Ok(snapshot) => {
+                    guard.runtime = AgentRuntimeState::from_agent_state(snapshot_to_agent_state(
+                        &snapshot,
+                        guard.runtime.subscription.clone(),
+                        guard.manager.remembered_selected_proxy(),
+                    ));
+                }
+                Err(error) => {
+                    if cancel.load(Ordering::SeqCst) {
+                        guard.runtime.clear_error();
+                        guard.runtime.set_phase(AppPhase::Ready);
+                        guard.runtime.connection.status = badvpn_common::ConnectionStatus::Idle;
+                        guard.runtime.connection.connected = false;
+                        guard.runtime.diagnostics.message =
+                            Some(format!("Connect cancelled: {error}"));
+                    } else {
+                        guard.runtime.set_error(error.to_string());
+                    }
+                }
+            }
+            if let Ok(mut slot) = progress.write() {
+                *slot = guard.runtime.snapshot();
+            }
+            connecting.store(false, Ordering::SeqCst);
+        }));
+
+        let guard = self.inner.lock().await;
+        Ok(guard.runtime.snapshot())
     }
 
     async fn stop(&mut self) -> BadVpnResult<AgentState> {
-        let snapshot = self
+        self.cancel_connect.store(true, Ordering::SeqCst);
+        if let Some(task) = self.connect_task.take() {
+            // Give the connect loop a moment to observe cancel, then detach if stuck.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+            self.connecting.store(false, Ordering::SeqCst);
+        }
+
+        let mut guard = self.inner.lock().await;
+        let snapshot = guard
             .manager
             .stop()
             .await
             .map_err(|error| BadVpnError::OperationFailed(error.to_string()))?;
-        self.runtime = AgentRuntimeState::from_agent_state(snapshot_to_agent_state(
+        guard.runtime = AgentRuntimeState::from_agent_state(snapshot_to_agent_state(
             &snapshot,
-            self.runtime.subscription.clone(),
+            guard.runtime.subscription.clone(),
+            guard.manager.remembered_selected_proxy(),
         ));
-        self.runtime.clear_error();
-        Ok(self.runtime.snapshot())
+        guard.runtime.clear_error();
+        Ok(guard.runtime.snapshot())
     }
 
     pub async fn shutdown_cleanup(&mut self) -> anyhow::Result<()> {
-        let snapshot = self.manager.stop().await?;
-        self.runtime = AgentRuntimeState::from_agent_state(snapshot_to_agent_state(
+        self.cancel_connect.store(true, Ordering::SeqCst);
+        if let Some(task) = self.connect_task.take() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+            self.connecting.store(false, Ordering::SeqCst);
+        }
+        let mut guard = self.inner.lock().await;
+        let snapshot = guard.manager.stop().await?;
+        guard.runtime = AgentRuntimeState::from_agent_state(snapshot_to_agent_state(
             &snapshot,
-            self.runtime.subscription.clone(),
+            guard.runtime.subscription.clone(),
+            guard.manager.remembered_selected_proxy(),
         ));
-        self.runtime.clear_error();
+        guard.runtime.clear_error();
         Ok(())
     }
 
     async fn restart(&mut self) -> BadVpnResult<AgentState> {
-        let snapshot = self
-            .manager
-            .restart()
-            .await
-            .map_err(|error| BadVpnError::OperationFailed(error.to_string()))?;
-        self.runtime = AgentRuntimeState::from_agent_state(snapshot_to_agent_state(
-            &snapshot,
-            self.runtime.subscription.clone(),
-        ));
-        Ok(self.runtime.snapshot())
+        let request = {
+            let guard = self.inner.lock().await;
+            guard.manager.last_connect_request()
+        };
+        let Some(request) = request else {
+            let mut guard = self.inner.lock().await;
+            guard
+                .runtime
+                .set_error("Connect request is required before restart.".to_string());
+            return Ok(guard.runtime.snapshot());
+        };
+        let _ = self.stop().await?;
+        self.connect(request).await
     }
 
     async fn select_proxy(&mut self, group: String, proxy: String) -> BadVpnResult<AgentState> {
-        let snapshot = self
+        if self.connecting.load(Ordering::SeqCst) {
+            return Err(BadVpnError::OperationFailed(
+                "Cannot select proxy while connect is in progress".to_string(),
+            ));
+        }
+        let mut guard = self.inner.lock().await;
+        let snapshot = guard
             .manager
             .select_proxy(group.trim(), proxy.trim())
             .await
             .map_err(|error| BadVpnError::OperationFailed(error.to_string()))?;
-        self.runtime = AgentRuntimeState::from_agent_state(snapshot_to_agent_state(
+        guard.runtime = AgentRuntimeState::from_agent_state(snapshot_to_agent_state(
             &snapshot,
-            self.runtime.subscription.clone(),
+            guard.runtime.subscription.clone(),
+            guard.manager.remembered_selected_proxy(),
         ));
-        Ok(self.runtime.snapshot())
+        Ok(guard.runtime.snapshot())
     }
 
     async fn set_subscription(&mut self, url: String) -> BadVpnResult<AgentState> {
+        let mut guard = self.inner.lock().await;
         let trimmed = url.trim();
         if trimmed.is_empty() {
-            self.runtime
+            guard
+                .runtime
                 .set_subscription_error(BadVpnError::EmptySubscriptionUrl.to_string());
-            return Ok(self.runtime.snapshot());
+            return Ok(guard.runtime.snapshot());
         }
 
         if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
-            self.runtime
+            guard
+                .runtime
                 .set_subscription_error(BadVpnError::InvalidSubscriptionUrl.to_string());
-            return Ok(self.runtime.snapshot());
+            return Ok(guard.runtime.snapshot());
         }
 
-        self.runtime.subscription.url = Some(trimmed.to_string());
-        self.runtime.subscription.is_valid = Some(true);
-        self.runtime.subscription.validation_error = None;
-        self.runtime.set_phase(AppPhase::Ready);
-        self.runtime.clear_error();
+        guard.runtime.subscription.url = Some(trimmed.to_string());
+        guard.runtime.subscription.is_valid = Some(true);
+        guard.runtime.subscription.validation_error = None;
+        guard.runtime.set_phase(AppPhase::Ready);
+        guard.runtime.clear_error();
         tracing::info!(subscription = %redact_url(trimmed), "subscription accepted");
-        Ok(self.runtime.snapshot())
+        Ok(guard.runtime.snapshot())
     }
 
     async fn refresh_subscription(&mut self) -> BadVpnResult<AgentState> {
-        if self.runtime.subscription.url.is_none() {
-            self.runtime
+        let mut guard = self.inner.lock().await;
+        if guard.runtime.subscription.url.is_none() {
+            guard
+                .runtime
                 .set_subscription_error("subscription URL is required before refresh");
-            return Ok(self.runtime.snapshot());
+            return Ok(guard.runtime.snapshot());
         }
 
-        self.runtime.subscription.is_valid = Some(true);
-        self.runtime.subscription.validation_error = None;
-        Ok(self.runtime.snapshot())
+        // Agent does not fetch subscription bodies; the GUI owns refresh and reconnect.
+        guard.runtime.set_error(
+            "RefreshSubscription is not implemented in badvpn-agent; refresh from the UI and reconnect."
+                .to_string(),
+        );
+        Ok(guard.runtime.snapshot())
     }
 
     async fn run_diagnostics(&mut self) -> BadVpnResult<AgentState> {
-        self.runtime.diagnostics = DiagnosticSummary {
-            mihomo_healthy: self.manager.snapshot().mihomo.state
-                == badvpn_common::RuntimeComponentState::Running,
-            zapret_healthy: self.manager.snapshot().zapret.state
-                == badvpn_common::RuntimeComponentState::Running,
+        let mut guard = self.inner.lock().await;
+        let snapshot = guard.manager.snapshot();
+        guard.runtime.diagnostics = DiagnosticSummary {
+            mihomo_healthy: snapshot.mihomo.state == badvpn_common::RuntimeComponentState::Running,
+            zapret_healthy: snapshot.zapret.state == badvpn_common::RuntimeComponentState::Running,
             message: Some("Service-first runtime manager diagnostics are available.".to_string()),
         };
-        Ok(self.runtime.snapshot())
+        Ok(guard.runtime.snapshot())
     }
 
     async fn cleanup_legacy_zapret(&mut self) -> BadVpnResult<AgentState> {
+        let mut guard = self.inner.lock().await;
         match cleanup_legacy_zapret_service() {
             Ok(message) => {
-                self.runtime.diagnostics = DiagnosticSummary {
-                    mihomo_healthy: self.manager.snapshot().mihomo.state
+                let snapshot = guard.manager.snapshot();
+                guard.runtime.diagnostics = DiagnosticSummary {
+                    mihomo_healthy: snapshot.mihomo.state
                         == badvpn_common::RuntimeComponentState::Running,
-                    zapret_healthy: self.manager.snapshot().zapret.state
+                    zapret_healthy: snapshot.zapret.state
                         == badvpn_common::RuntimeComponentState::Running,
                     message: Some(message),
                 };
-                Ok(self.runtime.snapshot())
+                Ok(guard.runtime.snapshot())
             }
             Err(error) => {
-                self.runtime.set_error(format!(
+                guard.runtime.set_error(format!(
                     "failed to clean legacy BadVpnZapret service: {error}"
                 ));
-                Ok(self.runtime.snapshot())
+                Ok(guard.runtime.snapshot())
             }
         }
     }
 
     async fn repair_windows_network(&mut self) -> BadVpnResult<AgentState> {
-        let stop_snapshot = self
-            .manager
-            .stop()
-            .await
-            .map_err(|error| BadVpnError::OperationFailed(error.to_string()))?;
-        self.runtime = AgentRuntimeState::from_agent_state(snapshot_to_agent_state(
-            &stop_snapshot,
-            self.runtime.subscription.clone(),
-        ));
+        let _ = self.stop().await?;
+        let mut guard = self.inner.lock().await;
         match repair_windows_network_state() {
             Ok(message) => {
-                self.runtime.diagnostics = DiagnosticSummary {
+                guard.runtime.diagnostics = DiagnosticSummary {
                     mihomo_healthy: false,
                     zapret_healthy: false,
                     message: Some(message),
                 };
-                self.runtime.clear_error();
-                Ok(self.runtime.snapshot())
+                guard.runtime.clear_error();
+                Ok(guard.runtime.snapshot())
             }
             Err(error) => {
                 let message = format!("failed to repair Windows network state: {error}");
-                self.runtime.set_error(message.clone());
+                guard.runtime.set_error(message.clone());
                 Err(BadVpnError::OperationFailed(message))
             }
         }
@@ -236,13 +375,13 @@ impl AgentController {
 
     async fn verify_installed_agent(&mut self) -> BadVpnResult<AgentState> {
         let status = service::status();
-        self.runtime.installed = status.installed;
-        self.runtime.running = status.running;
-        self.runtime.diagnostics = DiagnosticSummary {
-            mihomo_healthy: self.manager.snapshot().mihomo.state
-                == badvpn_common::RuntimeComponentState::Running,
-            zapret_healthy: self.manager.snapshot().zapret.state
-                == badvpn_common::RuntimeComponentState::Running,
+        let mut guard = self.inner.lock().await;
+        guard.runtime.installed = status.installed;
+        guard.runtime.running = status.running;
+        let snapshot = guard.manager.snapshot();
+        guard.runtime.diagnostics = DiagnosticSummary {
+            mihomo_healthy: snapshot.mihomo.state == badvpn_common::RuntimeComponentState::Running,
+            zapret_healthy: snapshot.zapret.state == badvpn_common::RuntimeComponentState::Running,
             message: Some(format!(
                 "Installed agent verification: {}{}",
                 status.message,
@@ -251,7 +390,7 @@ impl AgentController {
                     .unwrap_or_default()
             )),
         };
-        Ok(self.runtime.snapshot())
+        Ok(guard.runtime.snapshot())
     }
 }
 
