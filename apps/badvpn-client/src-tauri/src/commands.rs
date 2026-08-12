@@ -6290,6 +6290,13 @@ fn proxy_groups_from_yaml(yaml: &YamlValue) -> Result<Vec<ProxyGroupView>, Strin
             ))
         })
         .collect::<BTreeMap<_, _>>();
+    let referenced_groups = group_members
+        .iter()
+        .filter(|(group, _)| !group.starts_with("__BADVPN_"))
+        .flat_map(|(_, members)| members.iter())
+        .filter(|member| group_members.contains_key(*member))
+        .cloned()
+        .collect::<BTreeSet<_>>();
 
     let groups = yaml
         .get("proxy-groups")
@@ -6304,9 +6311,8 @@ fn proxy_groups_from_yaml(yaml: &YamlValue) -> Result<Vec<ProxyGroupView>, Strin
                         let recovery_source =
                             group_members.iter().find_map(|(candidate, members)| {
                                 (!candidate.starts_with("__BADVPN_")
-                                    && !members
-                                        .iter()
-                                        .any(|member| proxy_meta.contains_key(member))
+                                    && !referenced_groups.contains(candidate)
+                                    && managed_leaves.iter().any(|leaf| !members.contains(leaf))
                                     && nested_group_reaches_any_leaf(
                                         candidate,
                                         managed_leaves,
@@ -10289,6 +10295,38 @@ proxy-groups:
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].name, "PROXY");
         assert_eq!(groups[0].api_name, "PROXY");
+    }
+
+    #[test]
+    fn mixed_source_catalog_exposes_otherwise_unreachable_nested_leaves() {
+        let yaml = serde_yaml::from_str::<YamlValue>(
+            r#"
+proxies:
+  - { name: A, type: vless, server: a.example }
+  - { name: B, type: vless, server: b.example }
+  - { name: C, type: vless, server: c.example }
+proxy-groups:
+  - { name: AUTO, type: url-test, proxies: [B, C] }
+  - { name: PROXY, type: select, proxies: [DIRECT, A, AUTO] }
+  - { name: __BADVPN_VPN_ONLY__, type: select, proxies: [A, B, C] }
+"#,
+        )
+        .unwrap();
+
+        let groups = proxy_groups_from_yaml(&yaml).unwrap();
+        let recovery = groups
+            .iter()
+            .find(|group| group.api_name == "__BADVPN_VPN_ONLY__")
+            .expect("mixed source must expose flattened managed leaves");
+        assert_eq!(recovery.name, "PROXY — VPN servers");
+        assert_eq!(
+            recovery
+                .nodes
+                .iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>(),
+            ["A", "B", "C"]
+        );
     }
 
     #[test]
