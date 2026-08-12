@@ -29,8 +29,9 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { CSSProperties, FormEvent, useEffect, useMemo, useState } from "react";
+import { CSSProperties, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
+import { primaryConnectionAction, primaryConnectionActionDisabled } from "./connectionControls";
 import {
   buildLocalOverridePatch,
   formatLocalOverrideKind,
@@ -384,6 +385,7 @@ export function App() {
   const [settingsRestartRequired, setSettingsRestartRequired] = useState(false);
   const [lastConnectionsError, setLastConnectionsError] = useState<string | null>(null);
   const [connectionAttempt, setConnectionAttempt] = useState<ConnectionAttempt | null>(null);
+  const statusEpochRef = useRef(0);
   const [progressNow, setProgressNow] = useState(() => Date.now());
   const [showConnectionDetails, setShowConnectionDetails] = useState(false);
   const [connectionFailureStage, setConnectionFailureStage] = useState<string | null>(null);
@@ -584,7 +586,9 @@ export function App() {
   const supportUrl = state.subscription.support_url;
   const providerAnnouncement = providerAnnouncementMetadata(state.subscription);
   const providerLinks = providerMetadataLinks(state.subscription);
-  const isRuntimeTransitioning = state.connection.status === "starting" || state.connection.status === "stopping";
+  const isStarting = state.connection.status === "starting";
+  const isStopping = state.connection.status === "stopping";
+  const isRuntimeTransitioning = isStarting || isStopping;
   const isConnected = state.connection.connected && state.connection.status === "running";
   const smartFallbackActive =
     isConnected && settings.core.route_mode === "smart" && state.connection.route_mode === "vpn_only";
@@ -659,13 +663,21 @@ export function App() {
     if (showBusy) {
       setBusy(true);
     }
+    const epoch = statusEpochRef.current;
     try {
       const nextState = await action();
+      // Drop stale background status polls that started before a connect/disconnect.
+      if (!showBusy && epoch !== statusEpochRef.current) {
+        return;
+      }
       setState(nextState);
       if (showBusy) {
         notifyAgentError("Action failed", nextState);
       }
     } catch (error) {
+      if (!showBusy && epoch !== statusEpochRef.current) {
+        return;
+      }
       const message = error instanceof Error ? error.message : String(error);
       setState((current) => ({
         ...current,
@@ -683,7 +695,8 @@ export function App() {
   }
 
   async function handlePrimaryConnectionAction() {
-    const action = isConnected ? "disconnect" : "connect";
+    // Starting is cancellable: never turn a second click into a duplicate Connect.
+    const action = primaryConnectionAction(isConnected, state.connection.status);
     if (action === "connect") {
       const readinessIssue = getConnectReadinessIssue(agentService, runtimeReadiness);
       if (readinessIssue) {
@@ -710,6 +723,7 @@ export function App() {
     setConnectReadinessPrompt(false);
     const attempt = { action, startedAt: Date.now() } satisfies ConnectionAttempt;
     setConnectionAttempt(attempt);
+    statusEpochRef.current += 1;
     setProgressNow(Date.now());
     setShowConnectionDetails(false);
     setConnectionFailureStage(null);
@@ -1994,10 +2008,10 @@ export function App() {
                 className={isConnected ? "connectButton connected" : isRuntimeTransitioning ? "connectButton pending" : "connectButton"}
                 type="button"
                 onClick={() => void handlePrimaryConnectionAction()}
-                disabled={busy || isRuntimeTransitioning}
-                aria-label={isConnected ? "Disconnect" : "Connect"}
+                disabled={primaryConnectionActionDisabled(busy, state.connection.status)}
+                aria-label={isStarting ? "Cancel connection" : isConnected ? "Disconnect" : "Connect"}
               >
-                {isRuntimeTransitioning ? <RefreshCw size={50} /> : isConnected ? <CirclePause size={52} /> : <Power size={52} />}
+                {isStopping ? <RefreshCw size={50} /> : isConnected || isStarting ? <CirclePause size={52} /> : <Power size={52} />}
               </button>
               <strong>{isConnected ? "Подключено" : statusLabel}</strong>
               <span className="slothStatusPill">{heroModeLabel}</span>

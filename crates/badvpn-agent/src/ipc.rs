@@ -3,8 +3,9 @@ use std::{
     process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
@@ -14,6 +15,8 @@ use serde::Serialize;
 use crate::command::AgentController;
 
 pub const PIPE_NAME: &str = AGENT_PIPE_NAME;
+const IPC_IDLE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+static CACHED_ALLOWED_USER_SID: OnceLock<Option<String>> = OnceLock::new();
 
 #[derive(Debug, Serialize)]
 struct AgentWireResponse {
@@ -47,11 +50,18 @@ async fn serve_agent_tcp_ipc(shutdown: Arc<AtomicBool>) -> anyhow::Result<()> {
         .set_nonblocking(true)
         .context("failed to switch BadVpn agent IPC listener to non-blocking mode")?;
     let mut controller = AgentController::default();
+    match crate::runtime::recover_after_agent_restart() {
+        Ok(message) => tracing::info!(message, "agent startup recovery finished"),
+        Err(error) => tracing::warn!(%error, "agent startup recovery failed"),
+    }
+    controller.start_background_watchdog();
     tracing::info!(addr = AGENT_LOCAL_ADDR, "BadVpn agent IPC server started");
 
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((mut stream, _addr)) => {
+                let _ = stream.set_read_timeout(Some(IPC_IDLE_READ_TIMEOUT));
+                let _ = stream.set_write_timeout(Some(IPC_IDLE_READ_TIMEOUT));
                 let mut line = String::new();
                 {
                     let mut reader = BufReader::new(&mut stream);
@@ -144,6 +154,11 @@ async fn serve_agent_named_pipe_ipc(shutdown: Arc<AtomicBool>) -> anyhow::Result
 
     const BUFFER_SIZE: u32 = 64 * 1024;
     let mut controller = AgentController::default();
+    match crate::runtime::recover_after_agent_restart() {
+        Ok(message) => tracing::info!(message, "agent startup recovery finished"),
+        Err(error) => tracing::warn!(%error, "agent startup recovery failed"),
+    }
+    controller.start_background_watchdog();
     tracing::info!(
         pipe = PIPE_NAME,
         "BadVpn agent named pipe IPC server started"
@@ -326,7 +341,12 @@ fn write_agent_response<W: Write>(
 }
 
 fn agent_pipe_sddl() -> String {
-    let sid = configured_allowed_user_sid().or_else(active_console_user_sid);
+    let sid = configured_allowed_user_sid()
+        .or_else(persisted_allowed_user_sid)
+        .or_else(active_console_user_sid);
+    if let Some(sid) = sid.as_deref() {
+        persist_allowed_user_sid(sid);
+    }
     agent_pipe_sddl_for_user_sid(sid.as_deref())
 }
 
@@ -343,6 +363,45 @@ fn configured_allowed_user_sid() -> Option<String> {
         .ok()
         .map(|sid| sid.trim().to_string())
         .filter(|sid| sid.starts_with("S-1-"))
+}
+
+fn allowed_user_sid_path() -> Option<std::path::PathBuf> {
+    let root = std::env::var("BADVPN_AGENT_DATA_DIR")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var("PROGRAMDATA")
+                .ok()
+                .map(|path| std::path::PathBuf::from(path).join("BadVpn"))
+        })?;
+    Some(root.join("agent").join("allowed-user.sid"))
+}
+
+fn persisted_allowed_user_sid() -> Option<String> {
+    if let Some(cached) = CACHED_ALLOWED_USER_SID.get() {
+        return cached.clone();
+    }
+    let path = allowed_user_sid_path()?;
+    let sid = std::fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|sid| sid.starts_with("S-1-"));
+    let _ = CACHED_ALLOWED_USER_SID.set(sid.clone());
+    sid
+}
+
+fn persist_allowed_user_sid(sid: &str) {
+    if !sid.starts_with("S-1-") {
+        return;
+    }
+    let _ = CACHED_ALLOWED_USER_SID.set(Some(sid.to_string()));
+    let Some(path) = allowed_user_sid_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, sid);
 }
 
 fn active_console_user_sid() -> Option<String> {
@@ -384,6 +443,15 @@ mod tests {
         assert!(sddl.contains("S-1-5-21-1-2-3-1001"));
         assert!(!sddl.contains(";;;IU"));
     }
+
+    #[test]
+    fn pipe_sddl_without_user_sid_is_system_and_admins_only() {
+        let sddl = agent_pipe_sddl_for_user_sid(None);
+        assert!(sddl.contains("SY"));
+        assert!(sddl.contains("BA"));
+        assert!(!sddl.contains(";;;IU"));
+        assert!(!sddl.contains("S-1-5-21"));
+    }
 }
 
 #[cfg(windows)]
@@ -395,6 +463,7 @@ fn read_pipe_line(handle: windows_sys::Win32::Foundation::HANDLE) -> anyhow::Res
 
     let mut data = Vec::new();
     let mut buffer = [0_u8; 4096];
+    let started = Instant::now();
     loop {
         let mut read = 0_u32;
         let ok = unsafe {
@@ -409,6 +478,9 @@ fn read_pipe_line(handle: windows_sys::Win32::Foundation::HANDLE) -> anyhow::Res
         if !ok {
             let error = unsafe { GetLastError() };
             if error == ERROR_NO_DATA {
+                if started.elapsed() >= IPC_IDLE_READ_TIMEOUT {
+                    anyhow::bail!("timed out waiting for agent command on named pipe");
+                }
                 std::thread::sleep(std::time::Duration::from_millis(20));
                 continue;
             }
@@ -426,6 +498,9 @@ fn read_pipe_line(handle: windows_sys::Win32::Foundation::HANDLE) -> anyhow::Res
         }
         if data.len() > 1024 * 1024 {
             anyhow::bail!("agent command exceeded maximum IPC frame size");
+        }
+        if started.elapsed() >= IPC_IDLE_READ_TIMEOUT {
+            anyhow::bail!("timed out reading agent command frame");
         }
     }
     Ok(String::from_utf8(data)?

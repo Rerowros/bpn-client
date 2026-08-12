@@ -14,6 +14,9 @@ This document owns runtime behavior: `badvpn-agent`, IPC, Mihomo/winws lifecycle
 
 - Primary Windows IPC: `\\.\pipe\badvpn-agent`.
 - Pipe access must be limited to LocalSystem, Administrators, and the installing/current user SID. Blanket interactive-user write access is not release-safe.
+- The installing user SID is persisted to `%PROGRAMDATA%\BadVpn\agent\allowed-user.sid` during service install/repair and cached by the agent. `BADVPN_AGENT_ALLOWED_USER_SID` still overrides when set.
+- Named-pipe and TCP command reads use idle timeouts so hung clients cannot block the control plane forever.
+- `Connect` starts in the background and returns a connecting snapshot immediately so `RuntimeStatus` can be served while startup continues. `Stop` cancels an in-flight connect.
 - Localhost TCP `127.0.0.1:38790` is a development fallback only and requires `BADVPN_AGENT_TCP_FALLBACK=1`.
 - Wire format: one JSON `AgentCommand` per line and one JSON response per line.
 
@@ -52,8 +55,14 @@ Preflight should cover mixed/controller ports, DNS port `1053` TCP/UDP, managed 
 - Service runtime assets/configs/logs: `%PROGRAMDATA%\BadVpn`.
 - The Tauri installer bundles the current `badvpn-agent.exe` under application resources so Install / Repair can stage it into `%PROGRAMDATA%\BadVpn\agent`.
 - Agent service install/repair stages the current BPN Client runtime assets into ProgramData.
+- ProgramData staging copies with robocopy `/E` (never `/MIR`) and refuses to stage when the AppData source is missing `mihomo.exe`, so incomplete downloads cannot wipe existing service assets.
 - Mihomo and zapret/winws are not bundled into the installer. On first connect or explicit runtime update, the GUI downloads them into user-scoped components, then stages verified assets into ProgramData for `badvpn-agent`.
 - Runtime update/repair should eventually download, verify, stage, swap, smoke-check, and rollback entirely inside `badvpn-agent`.
+- `badvpn-agent` resolves components only under ProgramData / `BADVPN_AGENT_DATA_DIR` (plus explicit `BADVPN_MIHOMO_BIN` / `BADVPN_WINWS_BIN` overrides). It does not fall back to `%APPDATA%`.
+- A background agent watchdog polls late winws death and applies VPN Only fallback even when the GUI is closed.
+- Desired runtime state is persisted under `%PROGRAMDATA%\BadVpn\runtime\desired-state.json` (no subscription URLs/secrets). After agent/service restart, orphaned owned processes are cleaned and the agent enters **Safe Mode** asking the UI to reconnect manually (no auto-reconnect).
+- Owned Mihomo/winws children are assigned to a Windows Job Object with `KILL_ON_JOB_CLOSE` so they terminate if the agent process exits abnormally.
+- Release builds force service-first runtime; `BADVPN_LEGACY_RUNTIME=1` is debug-only.
 
 ## Logs And Secrets
 
@@ -82,8 +91,5 @@ Checks include:
 
 ## Open Runtime Gaps
 
-- Persist the installing user SID for named-pipe ACLs instead of relying on active-console-user discovery.
 - Move final component update download/verify/swap ownership from GUI-assisted staging into `badvpn-agent`.
-- Finish reboot recovery and reattach-to-existing-owned-process logic.
-- Move late winws death detection from status polling into an agent-owned background watchdog. Status polling already triggers VPN-only fallback, but recovery must not depend on the GUI being open.
-- Expand `RunDiagnostics` beyond the current component snapshot into WinDivert/BFE, route, DNS, controller traffic, and HTTPS checks.
+- Optional deeper WinDivert.sys device-node load checks beyond `sc query` service state.

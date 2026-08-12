@@ -11,9 +11,9 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use badvpn_common::{
     generate_mihomo_config_from_subscription_with_options, AgentRuntimeSnapshot, AppRouteMode,
-    CompiledPolicy, ConnectRequest, PolicyTargetKind, PreflightCheck, PreflightSeverity,
-    PreflightStatus, RuntimeComponentSnapshot, RuntimeComponentState, RuntimeGameProfile,
-    RuntimeMode, RuntimePhase, SubscriptionState,
+    CompiledPolicy, ConnectRequest, PolicyPath, PolicySource, PolicyTargetKind, PreflightCheck,
+    PreflightSeverity, PreflightStatus, RuntimeComponentSnapshot, RuntimeComponentState,
+    RuntimeGameProfile, RuntimeMode, RuntimePhase, SubscriptionState,
 };
 use serde_yaml::Value as YamlValue;
 use tokio::time::sleep;
@@ -25,10 +25,67 @@ const LOCALHOST: &str = "127.0.0.1";
 const BADVPN_DNS_PORT: u16 = 1053;
 const POLICY_DIAGNOSTIC_SAMPLE_LIMIT: usize = 5;
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct DesiredRuntimeState {
+    connected: bool,
+    desired_mode: RuntimeMode,
+    effective_mode: RuntimeMode,
+    controller_port: u16,
+    mixed_port: u16,
+    updated_at_unix: u64,
+    /// Present after an unclean agent restart while a session was marked connected.
+    safe_mode: bool,
+    message: Option<String>,
+}
+
+impl DesiredRuntimeState {
+    fn path() -> PathBuf {
+        runtime_root_dir()
+            .join("runtime")
+            .join("desired-state.json")
+    }
+
+    fn write(&self) -> Result<()> {
+        self.write_to(&Self::path())
+    }
+
+    fn write_to(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(self)?;
+        write_file_atomically(&path, &json)
+    }
+
+    fn read() -> Option<Self> {
+        Self::read_from(&Self::path())
+    }
+
+    fn read_from(path: &Path) -> Option<Self> {
+        let content = fs::read_to_string(path).ok()?;
+        serde_json::from_str(&content).ok()
+    }
+
+    fn clear_connected() -> Result<()> {
+        let state = Self {
+            connected: false,
+            desired_mode: RuntimeMode::Smart,
+            effective_mode: RuntimeMode::Smart,
+            controller_port: 9090,
+            mixed_port: 7890,
+            updated_at_unix: now_unix(),
+            safe_mode: false,
+            message: None,
+        };
+        state.write()
+    }
+}
+
 #[derive(Debug)]
 pub struct RuntimeManager {
     snapshot: AgentRuntimeSnapshot,
     last_request: Option<ConnectRequest>,
+    last_metrics: badvpn_common::TrafficMetrics,
     config_store: RuntimeConfigStore,
     component_store: ComponentStore,
     mihomo: MihomoManager,
@@ -53,6 +110,7 @@ impl RuntimeManager {
         Self {
             snapshot: AgentRuntimeSnapshot::default(),
             last_request: None,
+            last_metrics: badvpn_common::TrafficMetrics::default(),
             config_store,
             component_store,
             mihomo: MihomoManager::default(),
@@ -74,21 +132,87 @@ impl RuntimeManager {
     pub async fn status_snapshot(&mut self) -> AgentRuntimeSnapshot {
         self.refresh_process_state();
         self.handle_late_mihomo_death();
-        if self.late_zapret_death_requires_fallback() {
-            if let Err(error) = self.fallback_to_vpn_only_after_late_zapret_death().await {
-                tracing::error!(%error, "failed to apply VPN-only fallback after late zapret death");
-                self.set_error(format!("Late zapret death fallback failed: {error}"));
-            }
-        }
+        // The watchdog owns the mutating late-zapret fallback. Status remains
+        // observational so it cannot monopolize the runtime lock for validation,
+        // reload, and readiness checks.
         self.record_late_zapret_death_if_needed();
+        if self.mihomo.is_running() {
+            let port = self.last_controller_port();
+            let secret = self.config_store.controller_secret().unwrap_or_default();
+            if let Ok(metrics) = self.mihomo.fetch_traffic_metrics(port, &secret).await {
+                self.last_metrics = metrics;
+            }
+        } else {
+            self.last_metrics = badvpn_common::TrafficMetrics::default();
+        }
         self.snapshot.clone()
+    }
+
+    pub fn last_metrics(&self) -> badvpn_common::TrafficMetrics {
+        self.last_metrics
+    }
+
+    pub fn to_agent_state(&self, subscription: SubscriptionState) -> badvpn_common::AgentState {
+        snapshot_to_agent_state(
+            &self.snapshot,
+            subscription,
+            self.remembered_selected_proxy(),
+            self.last_metrics,
+        )
     }
 
     pub fn active_policy(&self) -> Option<&CompiledPolicy> {
         self.active_policy.as_ref()
     }
 
-    pub async fn connect(&mut self, mut request: ConnectRequest) -> Result<AgentRuntimeSnapshot> {
+    pub fn remembered_selected_proxy(&self) -> Option<String> {
+        let request = self.last_request.as_ref()?;
+        if let Some(group) = self
+            .active_policy
+            .as_ref()
+            .map(|policy| policy.main_proxy_group.as_str())
+        {
+            if let Some(proxy) = request.selected_proxies.get(group) {
+                return Some(proxy.clone());
+            }
+        }
+        request.selected_proxies.values().next().cloned()
+    }
+
+    pub fn last_connect_request(&self) -> Option<ConnectRequest> {
+        self.last_request.clone()
+    }
+
+    pub(crate) fn persist_background_connect_failure(&mut self, message: String) {
+        self.abort_started_connect(message);
+        self.last_metrics = badvpn_common::TrafficMetrics::default();
+        // `abort_started_connect` refreshes both owned children after cleanup;
+        // refresh once more before publishing the final snapshot so callers never
+        // retain a stale transitional or connected component state.
+        self.refresh_process_state();
+    }
+
+    pub async fn connect(&mut self, request: ConnectRequest) -> Result<AgentRuntimeSnapshot> {
+        self.connect_with_cancel(request, None).await
+    }
+
+    pub async fn connect_with_cancel(
+        &mut self,
+        mut request: ConnectRequest,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<AgentRuntimeSnapshot> {
+        let cancelled = || {
+            cancel
+                .map(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+                .unwrap_or(false)
+        };
+        let check_cancel = |phase: &str| -> Result<()> {
+            if cancelled() {
+                Err(anyhow!("connect cancelled during {phase}"))
+            } else {
+                Ok(())
+            }
+        };
         let mut timeline = StartupTimeline::new();
         tracing::info!(
             route_mode = ?request.route_mode,
@@ -107,10 +231,10 @@ impl RuntimeManager {
                 | RuntimePhase::Verifying
                 | RuntimePhase::Stopping
         ) {
-            self.snapshot
-                .diagnostics
-                .push("Runtime operation is already in progress.".to_string());
-            return Ok(self.snapshot.clone());
+            return Err(anyhow!(
+                "Runtime operation is already in progress (phase={:?}).",
+                self.snapshot.phase
+            ));
         }
 
         let owned_runtime_was_running = self.mihomo.is_running() || self.zapret.is_running();
@@ -155,6 +279,11 @@ impl RuntimeManager {
             }
         };
         timeline.mark("preflight_ms");
+        if let Err(error) = check_cancel("preflight") {
+            let _ = self.mihomo.stop();
+            let _ = self.zapret.stop();
+            return Err(error);
+        }
 
         let mut effective_mode = request.route_mode;
         if preflight.force_vpn_only && effective_mode == RuntimeMode::Smart {
@@ -203,9 +332,18 @@ impl RuntimeManager {
             .context("failed to write Mihomo draft config")?;
         let mihomo_bin = self.component_store.mihomo_bin()?;
         self.mihomo
-            .validate(&mihomo_bin, &draft_path, self.config_store.home_dir())
+            .validate_with_cancel(
+                &mihomo_bin,
+                &draft_path,
+                self.config_store.home_dir(),
+                cancel,
+            )
             .context("Mihomo rejected generated config")?;
         timeline.mark("mihomo_validate_ms");
+        if let Err(error) = check_cancel("mihomo_validate") {
+            let _ = self.zapret.stop();
+            return Err(error);
+        }
 
         if should_start_zapret {
             write_compiled_zapret_lists(&self.component_store, &runtime_config.policy)
@@ -221,7 +359,7 @@ impl RuntimeManager {
             }
             match self
                 .zapret
-                .start(&self.component_store, &request.settings.zapret)
+                .start(&self.component_store, &request.settings.zapret, cancel)
             {
                 Ok(message) => {
                     timeline.mark("zapret_start_ms");
@@ -232,6 +370,10 @@ impl RuntimeManager {
                     );
                 }
                 Err(error) => {
+                    if cancelled() {
+                        let _ = self.zapret.stop();
+                        return Err(anyhow!("connect cancelled during zapret startup: {error}"));
+                    }
                     timeline.mark("zapret_start_ms");
                     tracing::warn!(%error, "zapret failed; falling back to VPN-only");
                     let _ = self.zapret.stop();
@@ -275,12 +417,6 @@ impl RuntimeManager {
         timeline.mark("config_promote_ms");
 
         self.active_policy = Some(runtime_config.policy.clone());
-        if let Err(error) = self
-            .config_store
-            .write_policy_summary(&runtime_config.policy)
-        {
-            tracing::warn!(%error, "failed to write policy summary JSON");
-        }
 
         self.snapshot.phase = RuntimePhase::StartingMihomo;
         self.snapshot.mihomo = RuntimeComponentSnapshot::new(RuntimeComponentState::Starting, None);
@@ -299,14 +435,16 @@ impl RuntimeManager {
         timeline.mark("mihomo_start_ms");
 
         if let Err(error) = self
-            .mihomo
-            .wait_ready(
+            .wait_for_initial_mihomo_ready(
                 request.settings.mihomo.controller_port,
-                MIHOMO_READY_TIMEOUT,
                 &runtime_config.secret,
+                cancel,
             )
             .await
         {
+            if cancelled() {
+                return Err(error);
+            }
             tracing::error!(%error, "mihomo controller readiness failed");
             let _ = self.mihomo.stop();
             let _ = self.config_store.rollback_run();
@@ -315,6 +453,12 @@ impl RuntimeManager {
             return Ok(self.snapshot.clone());
         }
         timeline.mark("mihomo_ready_ms");
+        if let Err(error) = check_cancel("mihomo_ready") {
+            let _ = self.mihomo.stop();
+            let _ = self.zapret.stop();
+            let _ = self.config_store.rollback_run();
+            return Err(error);
+        }
 
         self.snapshot.phase = RuntimePhase::Verifying;
         let tested_active_proxy = self
@@ -331,9 +475,14 @@ impl RuntimeManager {
                 &runtime_config.policy.main_proxy_group,
                 request.settings.mihomo.controller_port,
                 &runtime_config.secret,
+                cancel,
             )
             .await
         {
+            if cancelled() {
+                self.abort_started_connect(error.to_string());
+                return Err(error);
+            }
             tracing::error!(%error, "Mihomo proxy egress verification failed");
             // Keep Mihomo (and zapret) running so the user can recover via select_proxy
             // without tearing down the controller, and so reconnect can drop the dead
@@ -372,10 +521,26 @@ impl RuntimeManager {
             return Ok(self.snapshot.clone());
         }
         timeline.mark("proxy_egress_ms");
+        if let Err(error) = check_cancel("proxy_egress") {
+            self.abort_started_connect(error.to_string());
+            return Err(error);
+        }
         if request.settings.diagnostics.discord_youtube_probes
             && effective_mode == RuntimeMode::Smart
         {
-            if let Err(error) = run_discord_youtube_probes().await {
+            let probe_result = tokio::select! {
+                result = run_discord_youtube_probes() => result,
+                () = wait_for_connect_cancel(cancel), if cancel.is_some() => {
+                    let error = anyhow!("connect cancelled during Smart probes");
+                    self.abort_started_connect(error.to_string());
+                    return Err(error);
+                }
+            };
+            if let Err(error) = check_cancel("Smart probes") {
+                self.abort_started_connect(error.to_string());
+                return Err(error);
+            }
+            if let Err(error) = probe_result {
                 tracing::warn!(%error, "Smart probes failed");
                 self.snapshot
                     .diagnostics
@@ -404,9 +569,22 @@ impl RuntimeManager {
                     );
                     self.record_policy_diagnostics(&fallback.policy);
                     let fallback_draft = self.config_store.write_draft(&fallback.yaml)?;
+                    if let Err(error) = check_cancel("Smart probe fallback validation") {
+                        self.abort_started_connect(error.to_string());
+                        return Err(error);
+                    }
                     self.mihomo
-                        .validate(&mihomo_bin, &fallback_draft, self.config_store.home_dir())
+                        .validate_with_cancel(
+                            &mihomo_bin,
+                            &fallback_draft,
+                            self.config_store.home_dir(),
+                            cancel,
+                        )
                         .context("Mihomo rejected VPN-only probe fallback config")?;
+                    if let Err(error) = check_cancel("Smart probe fallback validation") {
+                        self.abort_started_connect(error.to_string());
+                        return Err(error);
+                    }
                     let fallback_run = self.config_store.promote_draft_to_run(&fallback_draft)?;
                     if let Err(reload_error) = self
                         .mihomo
@@ -435,14 +613,16 @@ impl RuntimeManager {
                             return Ok(self.snapshot.clone());
                         }
                         if let Err(ready_error) = self
-                            .mihomo
-                            .wait_ready(
+                            .wait_for_initial_mihomo_ready(
                                 request.settings.mihomo.controller_port,
-                                MIHOMO_READY_TIMEOUT,
                                 &fallback.secret,
+                                cancel,
                             )
                             .await
                         {
+                            if cancelled() {
+                                return Err(ready_error);
+                            }
                             let _ = self.mihomo.stop();
                             let _ = self.config_store.rollback_run();
                             let _ = self.zapret.stop();
@@ -451,6 +631,10 @@ impl RuntimeManager {
                             ));
                             return Ok(self.snapshot.clone());
                         }
+                    }
+                    if let Err(error) = check_cancel("Smart probe fallback apply") {
+                        self.abort_started_connect(error.to_string());
+                        return Err(error);
                     }
                     if let Err(close_error) = self
                         .mihomo
@@ -482,6 +666,11 @@ impl RuntimeManager {
         }
         timeline.mark("diagnostics_ms");
 
+        if let Err(error) = check_cancel("diagnostics") {
+            self.abort_started_connect(error.to_string());
+            return Err(error);
+        }
+
         self.config_store.commit_last_working()?;
         self.snapshot.effective_mode = effective_mode;
         self.snapshot.mihomo = RuntimeComponentSnapshot::new(
@@ -510,12 +699,68 @@ impl RuntimeManager {
         }
         self.snapshot.last_error = None;
         self.snapshot.diagnostics.push(timeline.summary());
+        if let Err(error) = (DesiredRuntimeState {
+            connected: true,
+            desired_mode: request.route_mode,
+            effective_mode,
+            controller_port: request.settings.mihomo.controller_port,
+            mixed_port: request.settings.mihomo.mixed_port,
+            updated_at_unix: now_unix(),
+            safe_mode: false,
+            message: None,
+        })
+        .write()
+        {
+            tracing::warn!(%error, "failed to persist desired runtime state");
+        }
         tracing::info!(
             phase = ?self.snapshot.phase,
             effective_mode = ?self.snapshot.effective_mode,
             "runtime connect finished"
         );
         Ok(self.snapshot.clone())
+    }
+
+    async fn wait_for_initial_mihomo_ready(
+        &mut self,
+        controller_port: u16,
+        secret: &str,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
+        let outcome = {
+            let ready = self
+                .mihomo
+                .wait_ready(controller_port, MIHOMO_READY_TIMEOUT, secret);
+            tokio::select! {
+                result = ready => Some(result),
+                () = wait_for_connect_cancel(cancel), if cancel.is_some() => None,
+            }
+        };
+        if let Some(result) = outcome {
+            return result;
+        }
+
+        // Stop and reap the owned process before releasing the runtime mutex.
+        // The background command can then finish and Stop will not wait behind
+        // the full controller readiness timeout.
+        let mut cleanup_errors = Vec::new();
+        if let Err(error) = self.mihomo.stop() {
+            cleanup_errors.push(format!("Mihomo stop failed: {error}"));
+        }
+        if let Err(error) = self.config_store.rollback_run() {
+            cleanup_errors.push(format!("config rollback failed: {error}"));
+        }
+        if let Err(error) = self.zapret.stop() {
+            cleanup_errors.push(format!("winws stop failed: {error}"));
+        }
+        let cleanup = if cleanup_errors.is_empty() {
+            String::new()
+        } else {
+            format!(" Cleanup warnings: {}", cleanup_errors.join("; "))
+        };
+        Err(anyhow!(
+            "connect cancelled during Mihomo controller readiness.{cleanup}"
+        ))
     }
 
     pub async fn restart(&mut self) -> Result<AgentRuntimeSnapshot> {
@@ -540,14 +785,20 @@ impl RuntimeManager {
         }
         self.mihomo.stop()?;
         self.zapret.stop()?;
+        self.active_policy = None;
+        self.last_metrics = badvpn_common::TrafficMetrics::default();
         self.snapshot.phase = RuntimePhase::Idle;
         self.snapshot.effective_mode = self.snapshot.desired_mode;
         self.snapshot.mihomo = RuntimeComponentSnapshot::default();
         self.snapshot.zapret = RuntimeComponentSnapshot::default();
         self.snapshot.windivert = RuntimeComponentSnapshot::default();
+        self.snapshot.active_config_id = None;
         self.snapshot
             .diagnostics
             .push("Stopped BadVpn-owned Mihomo and winws processes.".to_string());
+        if let Err(error) = DesiredRuntimeState::clear_connected() {
+            tracing::warn!(%error, "failed to clear desired runtime state");
+        }
         tracing::info!("runtime stop finished");
         Ok(self.snapshot.clone())
     }
@@ -585,6 +836,31 @@ impl RuntimeManager {
                 "winws.exe is missing from managed assets.",
                 "Repair zapret components; BadVpn can still start in VPN-only mode.",
             ));
+        }
+        if request.route_mode == RuntimeMode::Smart
+            && request.settings.zapret.enabled
+            && self.component_store.winws_bin().is_ok()
+        {
+            let missing = self.component_store.missing_zapret_runtime_assets();
+            if !missing.is_empty() {
+                self.snapshot.zapret = RuntimeComponentSnapshot::new(
+                    RuntimeComponentState::Missing,
+                    Some(format!(
+                        "WinDivert/Flowseal support assets missing: {}",
+                        missing.join(", ")
+                    )),
+                );
+                checks.push(preflight_failed(
+                    "windivert_assets",
+                    PreflightSeverity::DegradeToVpnOnly,
+                    "zapret",
+                    format!(
+                        "WinDivert/Flowseal support assets are missing: {}.",
+                        missing.join(", ")
+                    ),
+                    "Repair zapret components; BadVpn can still start in VPN-only mode.",
+                ));
+            }
         }
 
         let managed_mihomo = self.component_store.mihomo_bin().ok();
@@ -752,7 +1028,11 @@ impl RuntimeManager {
         request: &ConnectRequest,
         mode: RuntimeMode,
     ) -> Result<RuntimeConfig> {
-        self.build_runtime_config_with_secret(request, mode, generate_controller_secret()?)
+        self.build_runtime_config_with_secret(
+            request,
+            mode,
+            badvpn_common::generate_controller_secret().map_err(|error| anyhow!(error))?,
+        )
     }
 
     fn build_runtime_config_with_secret(
@@ -930,7 +1210,28 @@ impl RuntimeManager {
         self.snapshot
             .diagnostics
             .push(format!("Runtime error: {message}"));
+        self.active_policy = None;
+        self.snapshot.active_config_id = None;
         self.refresh_process_state();
+    }
+
+    fn abort_started_connect(&mut self, message: String) {
+        if let Err(error) = self.mihomo.stop() {
+            self.snapshot.diagnostics.push(format!(
+                "Failed to stop Mihomo after startup failure: {error}"
+            ));
+        }
+        if let Err(error) = self.config_store.rollback_run() {
+            self.snapshot.diagnostics.push(format!(
+                "Failed to roll back Mihomo config after startup failure: {error}"
+            ));
+        }
+        if let Err(error) = self.zapret.stop() {
+            self.snapshot.diagnostics.push(format!(
+                "Failed to stop winws after startup failure: {error}"
+            ));
+        }
+        self.set_error(message);
     }
 
     fn handle_late_mihomo_death(&mut self) {
@@ -1023,13 +1324,63 @@ impl RuntimeManager {
         };
     }
 
-    fn late_zapret_death_requires_fallback(&self) -> bool {
+    pub(crate) fn refresh_process_state_for_watchdog(&mut self) {
+        self.refresh_process_state();
+    }
+
+    pub(crate) fn handle_late_mihomo_death_for_watchdog(&mut self) {
+        self.handle_late_mihomo_death();
+    }
+
+    pub(crate) fn fail_closed_after_late_zapret_fallback(&mut self, error: &dyn std::fmt::Display) {
+        self.fail_closed_after_late_zapret_fallback_inner(error, true);
+    }
+
+    fn fail_closed_after_late_zapret_fallback_inner(
+        &mut self,
+        error: &dyn std::fmt::Display,
+        clear_desired_state: bool,
+    ) {
+        let mut cleanup_errors = Vec::new();
+        if let Err(stop_error) = self.mihomo.stop() {
+            cleanup_errors.push(format!("Mihomo stop failed: {stop_error}"));
+        }
+        if let Err(stop_error) = self.zapret.stop() {
+            cleanup_errors.push(format!("winws stop failed: {stop_error}"));
+        }
+        if let Err(rollback_error) = self.config_store.rollback_run() {
+            cleanup_errors.push(format!("config rollback failed: {rollback_error}"));
+        }
+        if clear_desired_state {
+            if let Err(state_error) = DesiredRuntimeState::clear_connected() {
+                cleanup_errors.push(format!("desired-state cleanup failed: {state_error}"));
+            }
+        }
+        self.last_metrics = badvpn_common::TrafficMetrics::default();
+        self.snapshot.windivert = RuntimeComponentSnapshot::default();
+        let mut cleanup =
+            "Stopped BadVpn-owned Mihomo and winws to prevent unprotected DIRECT routing."
+                .to_string();
+        if !cleanup_errors.is_empty() {
+            cleanup.push_str(&format!(" Cleanup warnings: {}", cleanup_errors.join("; ")));
+        }
+        self.set_error(format!(
+            "Late zapret death VPN-only fallback failed: {error}. {cleanup}"
+        ));
+    }
+
+    pub(crate) fn late_zapret_death_requires_fallback(&self) -> bool {
         self.snapshot.effective_mode == RuntimeMode::Smart
             && self.snapshot.mihomo.state == RuntimeComponentState::Running
             && self.snapshot.zapret.state != RuntimeComponentState::Running
     }
 
-    async fn fallback_to_vpn_only_after_late_zapret_death(&mut self) -> Result<()> {
+    pub(crate) async fn fallback_to_vpn_only_after_late_zapret_death(
+        &mut self,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
+        let check_cancel = |phase: &str| check_connect_cancel(cancel, phase);
+        check_cancel("late zapret fallback planning")?;
         let request = self
             .last_request
             .clone()
@@ -1049,19 +1400,30 @@ impl RuntimeManager {
         self.write_zapret_lists_best_effort(&fallback.policy, "late zapret VPN-only fallback");
         self.record_policy_diagnostics(&fallback.policy);
         let fallback_draft = self.config_store.write_draft(&fallback.yaml)?;
+        check_cancel("late zapret fallback validation")?;
         self.mihomo
-            .validate(&mihomo_bin, &fallback_draft, self.config_store.home_dir())
-            .context("Mihomo rejected late zapret VPN-only fallback config")?;
-        let fallback_run = self.config_store.promote_draft_to_run(&fallback_draft)?;
-        if let Err(reload_error) = self
-            .mihomo
-            .reload(
-                fallback_run.as_path(),
-                request.settings.mihomo.controller_port,
-                &secret,
+            .validate_with_cancel(
+                &mihomo_bin,
+                &fallback_draft,
+                self.config_store.home_dir(),
+                cancel,
             )
-            .await
-        {
+            .context("Mihomo rejected late zapret VPN-only fallback config")?;
+        check_cancel("late zapret fallback promotion")?;
+        let fallback_run = self.config_store.promote_draft_to_run(&fallback_draft)?;
+        let reload = self.mihomo.reload(
+            fallback_run.as_path(),
+            request.settings.mihomo.controller_port,
+            &secret,
+        );
+        let reload_result = tokio::select! {
+            result = reload => result,
+            () = wait_for_connect_cancel(cancel), if cancel.is_some() => {
+                let _ = self.config_store.rollback_run();
+                return Err(anyhow!("connect cancelled during late zapret fallback reload"));
+            }
+        };
+        if let Err(reload_error) = reload_result {
             self.snapshot.diagnostics.push(format!(
                 "Mihomo reload failed during late zapret fallback; restarting: {reload_error}"
             ));
@@ -1078,15 +1440,21 @@ impl RuntimeManager {
                     "Mihomo restart failed during late zapret fallback: {start_error}"
                 ));
             }
-            if let Err(ready_error) = self
-                .mihomo
-                .wait_ready(
-                    request.settings.mihomo.controller_port,
-                    MIHOMO_READY_TIMEOUT,
-                    &secret,
-                )
-                .await
-            {
+            check_cancel("late zapret fallback restart")?;
+            let ready = self.mihomo.wait_ready(
+                request.settings.mihomo.controller_port,
+                MIHOMO_READY_TIMEOUT,
+                &secret,
+            );
+            let ready_result = tokio::select! {
+                result = ready => result,
+                () = wait_for_connect_cancel(cancel), if cancel.is_some() => {
+                    let _ = self.mihomo.stop();
+                    let _ = self.config_store.rollback_run();
+                    return Err(anyhow!("connect cancelled during late zapret fallback readiness"));
+                }
+            };
+            if let Err(ready_error) = ready_result {
                 let _ = self.mihomo.stop();
                 let _ = self.config_store.rollback_run();
                 let _ = self.zapret.stop();
@@ -1098,14 +1466,18 @@ impl RuntimeManager {
 
         let _ = self.zapret.stop();
         self.mark_unverified_late_vpn_only_fallback(&fallback, &fallback_run);
-        if let Err(error) = self.config_store.write_policy_summary(&fallback.policy) {
-            tracing::warn!(%error, "failed to write unverified late fallback policy summary JSON");
-        }
-        if let Err(close_error) = self
+        check_cancel("late zapret fallback connection cleanup")?;
+        let close_connections = self
             .mihomo
-            .close_connections(request.settings.mihomo.controller_port, &secret)
-            .await
-        {
+            .close_connections(request.settings.mihomo.controller_port, &secret);
+        let close_result = tokio::select! {
+            result = close_connections => result,
+            () = wait_for_connect_cancel(cancel), if cancel.is_some() => {
+                let _ = self.config_store.rollback_run();
+                return Err(anyhow!("connect cancelled during late zapret fallback cleanup"));
+            }
+        };
+        if let Err(close_error) = close_result {
             self.snapshot.diagnostics.push(format!(
                 "Mihomo connection cleanup warning after late zapret fallback: {close_error}"
             ));
@@ -1124,9 +1496,13 @@ impl RuntimeManager {
                 &fallback.policy.main_proxy_group,
                 request.settings.mihomo.controller_port,
                 &secret,
+                cancel,
             )
             .await
         {
+            if connect_is_cancelled(cancel) {
+                return Err(error);
+            }
             match tested_active_proxy {
                 Ok(active_proxy) => {
                     self.record_invalid_active_proxy_for_policy(&fallback.policy, &active_proxy)
@@ -1140,11 +1516,13 @@ impl RuntimeManager {
                     self.record_invalid_proxy_selections_for_policy(&fallback.policy);
                 }
             }
-            return Err(anyhow!(
+            self.set_error(format!(
                 "VPN-only fallback is active without DIRECT routes, but its selected VPN path failed egress verification: {error}. Choose another server to recover."
             ));
+            return Ok(());
         }
 
+        check_cancel("late zapret fallback commit")?;
         self.config_store.commit_last_working()?;
         self.snapshot.phase = RuntimePhase::DegradedVpnOnly;
         self.snapshot.mihomo.detail = Some(format!(
@@ -1276,7 +1654,7 @@ impl RuntimeManager {
             .to_string();
         if let Err(error) = self
             .mihomo
-            .verify_proxy_egress(&verify_group, controller_port, &secret)
+            .verify_proxy_egress(&verify_group, controller_port, &secret, None)
             .await
         {
             let rollback_errors =
@@ -1295,7 +1673,7 @@ impl RuntimeManager {
             ProxyRecoveryGate::VerifyMain(main_group) => {
                 match self
                     .mihomo
-                    .verify_proxy_egress(&main_group, controller_port, &secret)
+                    .verify_proxy_egress(&main_group, controller_port, &secret, None)
                     .await
                 {
                     Ok(()) => true,
@@ -2483,6 +2861,11 @@ impl RuntimeConfigStore {
         let last_working = self.last_working_path();
         if last_working.exists() {
             fs::copy(last_working, self.run_path())?;
+        } else {
+            let run_path = self.run_path();
+            if run_path.exists() {
+                fs::remove_file(run_path)?;
+            }
         }
         Ok(())
     }
@@ -2507,7 +2890,6 @@ impl Default for RuntimeConfigStore {
 #[derive(Debug, Clone)]
 struct ComponentStore {
     root: PathBuf,
-    appdata_fallback: Option<PathBuf>,
 }
 
 impl ComponentStore {
@@ -2525,6 +2907,27 @@ impl ComponentStore {
         }
         self.first_existing_file(&["zapret", "bin", "winws.exe"])
             .ok_or_else(|| anyhow!("zapret/winws binary was not found."))
+    }
+
+    fn missing_zapret_runtime_assets(&self) -> Vec<String> {
+        let bin = self.zapret_bin_dir();
+        [
+            "WinDivert.dll",
+            "WinDivert64.sys",
+            "cygwin1.dll",
+            "quic_initial_www_google_com.bin",
+            "tls_clienthello_www_google_com.bin",
+        ]
+        .into_iter()
+        .filter_map(|name| {
+            let path = bin.join(name);
+            if path.exists() {
+                None
+            } else {
+                Some(path.display().to_string())
+            }
+        })
+        .collect()
     }
 
     fn zapret_root(&self) -> PathBuf {
@@ -2556,24 +2959,16 @@ impl ComponentStore {
         let candidate = parts
             .iter()
             .fold(self.root.clone(), |path, part| path.join(part));
-        if candidate.exists() {
-            return Some(candidate);
-        }
-        let fallback = self.appdata_fallback.as_ref()?;
-        let candidate = parts
-            .iter()
-            .fold(fallback.clone(), |path, part| path.join(part));
         candidate.exists().then_some(candidate)
     }
 }
 
 impl Default for ComponentStore {
     fn default() -> Self {
-        let root = runtime_root_dir().join("components");
-        let appdata_fallback = appdata_root_dir().map(|path| path.join("components"));
         Self {
-            root,
-            appdata_fallback,
+            // Service-owned ProgramData (or BADVPN_AGENT_DATA_DIR). Do not fall back to
+            // %APPDATA%: under LocalSystem that resolves to the wrong profile.
+            root: runtime_root_dir().join("components"),
         }
     }
 }
@@ -2581,6 +2976,7 @@ impl Default for ComponentStore {
 #[derive(Debug, Default)]
 struct MihomoManager {
     child: Option<Child>,
+    job: Option<crate::process_job::ProcessJob>,
     last_exit_detail: Option<String>,
 }
 
@@ -2592,12 +2988,15 @@ impl MihomoManager {
                     self.last_exit_detail =
                         Some(format!("Mihomo exited unexpectedly with {status}"));
                     self.child = None;
+                    self.job = None;
                     false
                 }
                 Ok(None) => true,
                 Err(error) => {
                     self.last_exit_detail = Some(format!("Mihomo state check failed: {error}"));
-                    false
+                    // Keep reporting running until stop/kill clears the child; a transient
+                    // try_wait error must not orphan the handle while claiming stopped.
+                    true
                 }
             }
         } else {
@@ -2610,6 +3009,16 @@ impl MihomoManager {
     }
 
     fn validate(&self, mihomo_bin: &Path, config_path: &Path, home_dir: &Path) -> Result<()> {
+        self.validate_with_cancel(mihomo_bin, config_path, home_dir, None)
+    }
+
+    fn validate_with_cancel(
+        &self,
+        mihomo_bin: &Path,
+        config_path: &Path,
+        home_dir: &Path,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
         tracing::debug!(
             mihomo = %mihomo_bin.display(),
             config = %config_path.display(),
@@ -2629,20 +3038,7 @@ impl MihomoManager {
             .with_context(|| format!("failed to run {}", mihomo_bin.display()))?;
         let stdout_reader = child.stdout.take().map(read_output_pipe);
         let stderr_reader = child.stderr.take().map(read_output_pipe);
-        let started = Instant::now();
-        let timed_out;
-        let status = loop {
-            if let Some(status) = child.try_wait()? {
-                timed_out = false;
-                break status;
-            }
-            if started.elapsed() >= MIHOMO_VALIDATE_TIMEOUT {
-                let _ = child.kill();
-                timed_out = true;
-                break child.wait()?;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
+        let (status, timed_out) = wait_for_mihomo_validation(&mut child, cancel)?;
         let stdout = join_output_reader(stdout_reader)?;
         let stderr = join_output_reader(stderr_reader)?;
         if timed_out {
@@ -2687,7 +3083,7 @@ impl MihomoManager {
             controller_port,
             "starting Mihomo child"
         );
-        let mut child = Command::new(mihomo_bin)
+        let child = Command::new(mihomo_bin)
             .arg("-d")
             .arg(home_dir)
             .arg("-f")
@@ -2697,6 +3093,11 @@ impl MihomoManager {
             .stderr(log_stdio("mihomo.log")?)
             .spawn()
             .with_context(|| format!("failed to start {}", mihomo_bin.display()))?;
+        let (mut child, job) = bind_owned_child_to_job(child, "Mihomo")?;
+        tracing::debug!(
+            pid = child.id(),
+            "Mihomo child bound to kill-on-close Job Object"
+        );
         std::thread::sleep(Duration::from_millis(350));
         if let Some(status) = child.try_wait()? {
             self.last_exit_detail = Some(format!("Mihomo exited immediately with {status}"));
@@ -2708,6 +3109,7 @@ impl MihomoManager {
         tracing::info!(pid = child.id(), "Mihomo child started");
         self.last_exit_detail = None;
         self.child = Some(child);
+        self.job = Some(job);
         Ok(())
     }
 
@@ -2801,23 +3203,33 @@ impl MihomoManager {
         proxy_group: &str,
         controller_port: u16,
         secret: &str,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<()> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()?;
         let mut failures = Vec::new();
         for attempt in 1..=2 {
+            check_egress_cancel(cancel)?;
             failures.clear();
             for test_url in [
                 "https://www.gstatic.com/generate_204",
                 "https://cp.cloudflare.com/generate_204",
             ] {
+                check_egress_cancel(cancel)?;
                 let url = mihomo_proxy_delay_url(controller_port, proxy_group, test_url, 3_500)?;
                 let mut request = client.get(url);
                 if !secret.is_empty() {
                     request = request.bearer_auth(secret);
                 }
-                match request.send().await {
+                let response = tokio::select! {
+                    response = request.send() => response,
+                    () = wait_for_connect_cancel(cancel), if cancel.is_some() => {
+                        return Err(anyhow!("connect cancelled during proxy_egress"));
+                    }
+                };
+                check_egress_cancel(cancel)?;
+                match response {
                     Ok(response) if response.status().is_success() => {
                         tracing::info!(
                             proxy_group,
@@ -2841,7 +3253,12 @@ impl MihomoManager {
                 }
             }
             if attempt < 2 {
-                sleep(Duration::from_millis(500)).await;
+                tokio::select! {
+                    () = sleep(Duration::from_millis(500)) => {}
+                    () = wait_for_connect_cancel(cancel), if cancel.is_some() => {
+                        return Err(anyhow!("connect cancelled during proxy_egress"));
+                    }
+                }
             }
         }
         Err(anyhow!(failures.join("; ")))
@@ -2886,6 +3303,34 @@ impl MihomoManager {
         Ok(())
     }
 
+    async fn fetch_traffic_metrics(
+        &self,
+        controller_port: u16,
+        secret: &str,
+    ) -> Result<badvpn_common::TrafficMetrics> {
+        let client = reqwest::Client::builder()
+            .timeout(MIHOMO_CONTROLLER_REQUEST_TIMEOUT)
+            .build()?;
+        let mut request = client.get(format!("http://{LOCALHOST}:{controller_port}/connections"));
+        if !secret.is_empty() {
+            request = request.bearer_auth(secret);
+        }
+        let response = request.send().await?;
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "Mihomo connections returned HTTP {}",
+                response.status()
+            ));
+        }
+        let value = response.json::<serde_json::Value>().await?;
+        let upload_bytes = json_u64(&value, "uploadTotal").unwrap_or(0);
+        let download_bytes = json_u64(&value, "downloadTotal").unwrap_or(0);
+        Ok(badvpn_common::TrafficMetrics {
+            upload_bytes,
+            download_bytes,
+        })
+    }
+
     fn stop(&mut self) -> Result<()> {
         if let Some(mut child) = self.child.take() {
             tracing::info!(pid = child.id(), "stopping Mihomo child");
@@ -2896,6 +3341,52 @@ impl MihomoManager {
         } else {
             tracing::debug!("Mihomo stop skipped; no owned child");
         }
+        self.job = None;
+        Ok(())
+    }
+}
+
+fn wait_for_mihomo_validation(
+    child: &mut Child,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<(std::process::ExitStatus, bool)> {
+    let started = Instant::now();
+    loop {
+        if connect_is_cancelled(cancel) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow!("connect cancelled during Mihomo validation"));
+        }
+        if let Some(status) = child.try_wait()? {
+            return Ok((status, false));
+        }
+        if started.elapsed() >= MIHOMO_VALIDATE_TIMEOUT {
+            let _ = child.kill();
+            return Ok((child.wait()?, true));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+async fn wait_for_connect_cancel(cancel: Option<&std::sync::atomic::AtomicBool>) {
+    loop {
+        if cancel
+            .map(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn check_egress_cancel(cancel: Option<&std::sync::atomic::AtomicBool>) -> Result<()> {
+    if cancel
+        .map(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+        .unwrap_or(false)
+    {
+        Err(anyhow!("connect cancelled during proxy_egress"))
+    } else {
         Ok(())
     }
 }
@@ -2944,6 +3435,7 @@ fn join_output_reader(
 #[derive(Debug, Default)]
 struct ZapretManager {
     child: Option<Child>,
+    job: Option<crate::process_job::ProcessJob>,
     last_exit_detail: Option<String>,
 }
 
@@ -2955,12 +3447,15 @@ impl ZapretManager {
                     self.last_exit_detail =
                         Some(format!("winws exited unexpectedly with {status}"));
                     self.child = None;
+                    self.job = None;
                     false
                 }
                 Ok(None) => true,
                 Err(error) => {
                     self.last_exit_detail = Some(format!("winws state check failed: {error}"));
-                    false
+                    // Keep reporting running until stop/kill clears the child; a transient
+                    // try_wait error must not orphan the handle while claiming stopped.
+                    true
                 }
             }
         } else {
@@ -2976,9 +3471,48 @@ impl ZapretManager {
         &mut self,
         component_store: &ComponentStore,
         settings: &badvpn_common::RuntimeZapretSettings,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<String> {
         self.stop()?;
         let winws = component_store.winws_bin()?;
+        let attempts = zapret_strategy_attempt_order(settings);
+        let mut errors = Vec::new();
+        for strategy in attempts {
+            check_connect_cancel(cancel, "zapret profile selection")?;
+            let mut attempt_settings = settings.clone();
+            attempt_settings.strategy = strategy.to_string();
+            match self.spawn_with_strategy(component_store, &winws, &attempt_settings, cancel) {
+                Ok(message) => {
+                    if strategy != settings.strategy.as_str() {
+                        return Ok(format!(
+                            "{message}; auto-selected strategy={strategy} after selected profile failed"
+                        ));
+                    }
+                    return Ok(message);
+                }
+                Err(error) => {
+                    if connect_is_cancelled(cancel) {
+                        return Err(error);
+                    }
+                    tracing::warn!(strategy, %error, "winws strategy attempt failed");
+                    errors.push(format!("{strategy}: {error}"));
+                }
+            }
+        }
+        Err(anyhow!(
+            "all zapret Flowseal profiles failed: {}",
+            errors.join("; ")
+        ))
+    }
+
+    fn spawn_with_strategy(
+        &mut self,
+        component_store: &ComponentStore,
+        winws: &Path,
+        settings: &badvpn_common::RuntimeZapretSettings,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<String> {
+        check_connect_cancel(cancel, "zapret profile spawn")?;
         let args = build_winws_args(component_store, settings)?;
         tracing::info!(
             winws = %winws.display(),
@@ -2990,7 +3524,7 @@ impl ZapretManager {
             "starting winws child"
         );
         tracing::debug!(args = ?args, "winws arguments");
-        let mut child = Command::new(&winws)
+        let child = Command::new(winws)
             .current_dir(component_store.zapret_bin_dir())
             .args(&args)
             .stdin(Stdio::null())
@@ -2998,17 +3532,24 @@ impl ZapretManager {
             .stderr(log_stdio("winws.log")?)
             .spawn()
             .with_context(|| format!("failed to start {}", winws.display()))?;
-        std::thread::sleep(Duration::from_millis(900));
-        if let Some(status) = child.try_wait()? {
+        let (mut child, job) = bind_owned_child_to_job(child, "winws")?;
+        tracing::debug!(
+            pid = child.id(),
+            "winws child bound to kill-on-close Job Object"
+        );
+        if let Some(status) =
+            wait_for_zapret_stabilization(&mut child, cancel, Duration::from_millis(900))?
+        {
             self.last_exit_detail = Some(format!("winws exited immediately with {status}"));
-            tracing::error!(%status, "winws exited immediately");
+            tracing::error!(%status, strategy = %settings.strategy, "winws exited immediately");
             return Err(anyhow!(
                 "winws exited immediately with {status}; WinDivert may need service elevation or another DPI tool owns the driver"
             ));
         }
-        tracing::info!(pid = child.id(), "winws child started");
+        tracing::info!(pid = child.id(), strategy = %settings.strategy, "winws child started");
         self.last_exit_detail = None;
         self.child = Some(child);
+        self.job = Some(job);
         Ok(format!(
             "winws started with profile={} ipset={} game={}",
             settings.strategy, settings.ipset_filter, settings.game_filter
@@ -3025,7 +3566,91 @@ impl ZapretManager {
         } else {
             tracing::debug!("winws stop skipped; no owned child");
         }
+        self.job = None;
         Ok(())
+    }
+}
+
+fn connect_is_cancelled(cancel: Option<&std::sync::atomic::AtomicBool>) -> bool {
+    cancel
+        .map(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+        .unwrap_or(false)
+}
+
+fn check_connect_cancel(cancel: Option<&std::sync::atomic::AtomicBool>, phase: &str) -> Result<()> {
+    if connect_is_cancelled(cancel) {
+        Err(anyhow!("connect cancelled during {phase}"))
+    } else {
+        Ok(())
+    }
+}
+
+fn wait_for_zapret_stabilization(
+    child: &mut Child,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    duration: Duration,
+) -> Result<Option<std::process::ExitStatus>> {
+    let started = Instant::now();
+    loop {
+        if connect_is_cancelled(cancel) {
+            let kill_error = child.kill().err();
+            let wait_error = child.wait().err();
+            if kill_error.is_some() || wait_error.is_some() {
+                return Err(anyhow!(
+                    "connect cancelled during zapret stabilization; cleanup errors: kill={kill_error:?}, wait={wait_error:?}"
+                ));
+            }
+            return Err(anyhow!("connect cancelled during zapret stabilization"));
+        }
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if started.elapsed() >= duration {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn bind_owned_child_to_job(
+    child: Child,
+    component: &str,
+) -> Result<(Child, crate::process_job::ProcessJob)> {
+    bind_owned_child_to_job_with(child, component, |child| {
+        crate::process_job::bind_child_to_kill_on_close_job(child)
+    })
+}
+
+fn bind_owned_child_to_job_with<F>(
+    mut child: Child,
+    component: &str,
+    bind: F,
+) -> Result<(Child, crate::process_job::ProcessJob)>
+where
+    F: FnOnce(&Child) -> Result<crate::process_job::ProcessJob>,
+{
+    match bind(&child) {
+        Ok(job) => Ok((child, job)),
+        Err(bind_error) => {
+            let pid = child.id();
+            let kill_error = child.kill().err();
+            let wait_error = child.wait().err();
+            tracing::error!(
+                %bind_error,
+                ?kill_error,
+                ?wait_error,
+                pid,
+                component,
+                "failed to bind owned child to kill-on-close Job Object"
+            );
+            let cleanup = match (kill_error, wait_error) {
+                (None, None) => "child was killed and reaped".to_string(),
+                (kill, wait) => format!("cleanup errors: kill={kill:?}, wait={wait:?}"),
+            };
+            Err(anyhow!(
+                "{component} startup aborted because Job Object binding failed: {bind_error}; {cleanup}"
+            ))
+        }
     }
 }
 
@@ -3195,6 +3820,55 @@ fn flowseal_profile_bat_file_name(strategy: &str) -> &'static str {
         "simple_fake_alt2" => "general (SIMPLE FAKE ALT2).bat",
         _ => "general.bat",
     }
+}
+
+fn zapret_strategy_ids() -> &'static [&'static str] {
+    &[
+        "general",
+        "alt",
+        "alt2",
+        "alt3",
+        "alt4",
+        "alt5",
+        "alt6",
+        "alt7",
+        "alt8",
+        "alt9",
+        "alt10",
+        "alt11",
+        "fake_tls_auto",
+        "fake_tls_auto_alt",
+        "fake_tls_auto_alt2",
+        "fake_tls_auto_alt3",
+        "simple_fake",
+        "simple_fake_alt",
+        "simple_fake_alt2",
+    ]
+}
+
+fn normalize_zapret_strategy(strategy: &str) -> &'static str {
+    let trimmed = strategy.trim().to_ascii_lowercase();
+    zapret_strategy_ids()
+        .iter()
+        .copied()
+        .find(|id| *id == trimmed)
+        .unwrap_or("general")
+}
+
+fn zapret_strategy_attempt_order(
+    settings: &badvpn_common::RuntimeZapretSettings,
+) -> Vec<&'static str> {
+    let preferred = normalize_zapret_strategy(&settings.strategy);
+    if !settings.auto_profile_fallback {
+        return vec![preferred];
+    }
+    let mut order = vec![preferred];
+    for strategy in zapret_strategy_ids() {
+        if !order.contains(strategy) {
+            order.push(*strategy);
+        }
+    }
+    order
 }
 
 fn extract_winws_command_from_bat(content: &str) -> Option<String> {
@@ -3827,6 +4501,14 @@ fn append_google_quic_hostlist_args(
     ipset_exclude: &Path,
     bin: &Path,
 ) {
+    // A fake-QUIC option in a general/ipset branch does not cover Google hosts.
+    // Skip injection only when one branch combines all three required semantics.
+    let already_has_google_quic = args
+        .split(|arg| arg.eq_ignore_ascii_case("--new"))
+        .any(|branch| google_quic_branch_is_complete(branch, list_google));
+    if already_has_google_quic {
+        return;
+    }
     args.extend([
         "--new".to_string(),
         "--filter-udp=443".to_string(),
@@ -3840,6 +4522,45 @@ fn append_google_quic_hostlist_args(
     if fake_quic.exists() {
         args.push(format!("--dpi-desync-fake-quic={}", fake_quic.display()));
     }
+}
+
+fn google_quic_branch_is_complete(branch: &[String], list_google: &Path) -> bool {
+    let expected_hostlist = list_google
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let has_google_hostlist = branch.iter().any(|arg| {
+        let normalized = arg.replace('\\', "/").to_ascii_lowercase();
+        normalized.strip_prefix("--hostlist=").is_some_and(|path| {
+            path.trim_matches('"') == expected_hostlist
+                || path.trim_matches('"').ends_with("/list-google.txt")
+                || path.trim_matches('"') == "list-google.txt"
+        })
+    });
+    let has_udp_443 = branch.iter().any(|arg| {
+        arg.to_ascii_lowercase()
+            .strip_prefix("--filter-udp=")
+            .is_some_and(|ports| port_filter_contains(ports, 443))
+    });
+    let has_fake_quic = branch.iter().any(|arg| {
+        let normalized = arg.replace('\\', "/").to_ascii_lowercase();
+        normalized.starts_with("--dpi-desync-fake-quic=")
+    });
+    has_google_hostlist && has_udp_443 && has_fake_quic
+}
+
+fn port_filter_contains(filter: &str, expected: u16) -> bool {
+    filter.split(',').any(|part| {
+        let part = part.trim();
+        if let Some((start, end)) = part.split_once('-') {
+            return start
+                .parse::<u16>()
+                .ok()
+                .is_some_and(|start| start <= expected)
+                && end.parse::<u16>().ok().is_some_and(|end| expected <= end);
+        }
+        part.parse::<u16>().ok() == Some(expected)
+    })
 }
 
 fn write_compiled_zapret_lists(
@@ -3940,26 +4661,91 @@ fn ensure_vpn_only_fallback_policy(policy: &CompiledPolicy) -> Result<()> {
         .validate_invariants()
         .map_err(|error| anyhow!("invalid VPN-only fallback policy: {error}"))?;
 
-    for forbidden_rule in [
-        "MATCH,DIRECT",
-        "GEOSITE,youtube,DIRECT",
-        "DOMAIN-SUFFIX,googlevideo.com,DIRECT",
-        "DOMAIN-SUFFIX,youtu.be,DIRECT",
-        "GEOSITE,discord,DIRECT",
-    ] {
-        if policy
-            .mihomo_rules
-            .iter()
-            .any(|rule| rule == forbidden_rule)
+    for rule in &policy.mihomo_rules {
+        if mihomo_rule_has_direct_action(rule)
+            && !is_safety_direct_mihomo_rule(rule)
+            && !is_explicit_local_force_direct_rule(policy, rule)
         {
             return Err(anyhow!(
-                "VPN-only fallback policy contains Smart direct rule {forbidden_rule}."
+                "VPN-only fallback policy contains non-safety DIRECT rule {rule}."
             ));
         }
     }
 
     debug_assert_vpn_only_policy(policy);
     Ok(())
+}
+
+fn is_explicit_local_force_direct_rule(policy: &CompiledPolicy, mihomo_rule: &str) -> bool {
+    let fields = mihomo_rule.split(',').map(str::trim).collect::<Vec<_>>();
+    if fields.len() < 3 || !mihomo_rule_has_direct_action(mihomo_rule) {
+        return false;
+    }
+    policy.policy_rules.iter().any(|rule| {
+        if rule.source != PolicySource::LocalUserOverride || rule.path != PolicyPath::DirectSafe {
+            return false;
+        }
+        let expected_kind = match rule.target.kind {
+            PolicyTargetKind::DomainSuffix => "DOMAIN-SUFFIX",
+            PolicyTargetKind::Cidr => "IP-CIDR",
+            PolicyTargetKind::Cidr6 => "IP-CIDR6",
+            PolicyTargetKind::ProcessName => "PROCESS-NAME",
+            _ => return false,
+        };
+        fields[0].eq_ignore_ascii_case(expected_kind)
+            && fields[1].eq_ignore_ascii_case(rule.target.value.trim())
+    })
+}
+
+fn mihomo_rule_has_direct_action(rule: &str) -> bool {
+    mihomo_rule_action(rule).is_some_and(|action| action.eq_ignore_ascii_case("DIRECT"))
+}
+
+fn mihomo_rule_action(rule: &str) -> Option<&str> {
+    let parts = rule
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() < 3 {
+        return None;
+    }
+    let last = *parts.last()?;
+    if last.eq_ignore_ascii_case("no-resolve") {
+        if parts.len() < 4 {
+            return None;
+        }
+        Some(parts[parts.len() - 2])
+    } else {
+        Some(last)
+    }
+}
+
+fn is_safety_direct_mihomo_rule(rule: &str) -> bool {
+    let normalized = rule.trim().to_ascii_lowercase();
+    if normalized.starts_with("geoip,private") || normalized.starts_with("geosite,private") {
+        return true;
+    }
+    if normalized.contains("localhost")
+        || normalized.contains(",local,")
+        || normalized.contains(".local,")
+    {
+        return true;
+    }
+    const SAFETY_CIDRS: &[&str] = &[
+        "0.0.0.0/8",
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "224.0.0.0/4",
+        "::1/128",
+        "fc00::/7",
+        "fe80::/10",
+    ];
+    SAFETY_CIDRS.iter().any(|cidr| normalized.contains(cidr))
 }
 
 fn debug_assert_vpn_only_policy(policy: &CompiledPolicy) {
@@ -4036,13 +4822,107 @@ fn write_file_atomically(path: &Path, content: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension(format!("{}.tmp", now_unix()));
-    fs::write(&tmp, content)?;
-    if path.exists() {
-        fs::remove_file(path)?;
+    let mut nonce = [0_u8; 8];
+    let _ = getrandom::fill(&mut nonce);
+    let mut suffix = String::with_capacity(16);
+    for byte in nonce {
+        suffix.push(char::from_digit((byte >> 4) as u32, 16).unwrap_or('0'));
+        suffix.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap_or('0'));
     }
-    fs::rename(&tmp, path)?;
+    let tmp = path.with_extension(format!("tmp-{suffix}"));
+    fs::write(&tmp, content)?;
+    // Prefer rename-over on platforms that support it; Windows still needs replace.
+    #[cfg(windows)]
+    {
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        fs::rename(&tmp, path)?;
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(&tmp, path)?;
+    }
     Ok(())
+}
+
+pub fn windivert_and_bfe_diagnostic_notes() -> Vec<String> {
+    let mut notes = Vec::new();
+    for (label, names) in [
+        ("WinDivert", &["WinDivert", "WinDivert14"][..]),
+        ("Base Filtering Engine", &["BFE"][..]),
+    ] {
+        match windows_service_states(names) {
+            Some(states)
+                if states
+                    .iter()
+                    .any(|(_, state)| state.eq_ignore_ascii_case("RUNNING")) =>
+            {
+                let detail = states
+                    .iter()
+                    .map(|(name, state)| format!("{name}={state}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                notes.push(format!("{label} service probe: {detail}"));
+            }
+            Some(states) => {
+                let detail = states
+                    .iter()
+                    .map(|(name, state)| format!("{name}={state}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                notes.push(format!(
+                    "{label} service probe: not running ({detail}). WinDivert-based bypass may fail until the driver/service is available."
+                ));
+            }
+            None => notes.push(format!(
+                "{label} service probe unavailable on this platform/runtime."
+            )),
+        }
+    }
+    notes
+}
+
+fn windows_service_states(names: &[&str]) -> Option<Vec<(String, String)>> {
+    #[cfg(windows)]
+    {
+        let mut out = Vec::new();
+        for name in names {
+            let output = Command::new("sc")
+                .args(["query", name])
+                .stdin(Stdio::null())
+                .output()
+                .ok()?;
+            let body = String::from_utf8_lossy(&output.stdout);
+            let state = body
+                .lines()
+                .find_map(|line| {
+                    let line = line.trim();
+                    let lower = line.to_ascii_lowercase();
+                    if lower.starts_with("state") {
+                        line.split_whitespace()
+                            .last()
+                            .map(|value| value.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| {
+                    if output.status.success() {
+                        "UNKNOWN".to_string()
+                    } else {
+                        "MISSING".to_string()
+                    }
+                });
+            out.push(((*name).to_string(), state));
+        }
+        Some(out)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = names;
+        None
+    }
 }
 
 fn preflight_failed(
@@ -4231,24 +5111,6 @@ fn tcp_port_is_busy(port: u16) -> bool {
 
 fn udp_port_is_busy(port: u16) -> bool {
     UdpSocket::bind((LOCALHOST, port)).is_err()
-}
-
-fn generate_controller_secret() -> Result<String> {
-    let mut bytes = [0_u8; 32];
-    getrandom::fill(&mut bytes)
-        .map_err(|error| anyhow!("failed to read OS random bytes for Mihomo secret: {error}"))?;
-    Ok(format!("badvpn-{}", to_hex(&bytes)))
-}
-
-fn to_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let byte = *byte;
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
 }
 
 #[derive(Debug, Clone)]
@@ -4560,6 +5422,15 @@ fn appdata_root_dir() -> Option<PathBuf> {
         .map(|path| PathBuf::from(path).join("BadVpn"))
 }
 
+fn json_u64(value: &serde_json::Value, key: &str) -> Option<u64> {
+    let field = value.get(key)?;
+    field
+        .as_u64()
+        .or_else(|| field.as_i64().map(|v| v.max(0) as u64))
+        .or_else(|| field.as_f64().map(|v| v.max(0.0) as u64))
+        .or_else(|| field.as_str()?.parse::<u64>().ok())
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4570,6 +5441,8 @@ fn now_unix() -> u64 {
 pub fn snapshot_to_agent_state(
     snapshot: &AgentRuntimeSnapshot,
     subscription: SubscriptionState,
+    selected_proxy: Option<String>,
+    metrics: badvpn_common::TrafficMetrics,
 ) -> badvpn_common::AgentState {
     let running = matches!(
         snapshot.phase,
@@ -4606,10 +5479,10 @@ pub fn snapshot_to_agent_state(
                 RuntimePhase::Error => badvpn_common::ConnectionStatus::Error,
             },
             selected_profile: snapshot.active_config_id.clone(),
-            selected_proxy: None,
+            selected_proxy,
             route_mode: snapshot.effective_mode.as_route_mode(),
         },
-        metrics: badvpn_common::TrafficMetrics::default(),
+        metrics,
         diagnostics: badvpn_common::DiagnosticSummary {
             mihomo_healthy: snapshot.mihomo.state == RuntimeComponentState::Running,
             zapret_healthy: snapshot.zapret.state == RuntimeComponentState::Running,
@@ -4622,6 +5495,92 @@ pub fn snapshot_to_agent_state(
 pub fn cleanup_legacy_zapret_service() -> Result<String> {
     stop_legacy_zapret_service()?;
     Ok("Legacy BadVpnZapret service stop was requested; badvpn-agent owns winws now.".to_string())
+}
+
+/// After agent/service restart, clean up orphaned owned processes and enter Safe Mode
+/// instead of auto-reconnecting. Product default: manual Connect from the UI.
+pub fn safe_mode_message() -> Option<String> {
+    safe_mode_message_from(DesiredRuntimeState::read()?)
+}
+
+fn safe_mode_message_from(desired: DesiredRuntimeState) -> Option<String> {
+    if desired.safe_mode {
+        desired.message.or_else(|| {
+            Some(
+                "Safe Mode: reconnect from the UI after the agent restarted during a session."
+                    .to_string(),
+            )
+        })
+    } else {
+        None
+    }
+}
+
+pub fn recover_after_agent_restart() -> Result<String> {
+    let mut messages = Vec::new();
+    let desired = DesiredRuntimeState::read();
+    let component_store = ComponentStore::default();
+    let managed_mihomo = component_store.mihomo_bin().ok();
+    let managed_winws = component_store.winws_bin().ok();
+
+    let mihomo_processes = running_process_details(&["mihomo.exe"]);
+    for message in
+        cleanup_stale_managed_mihomo_processes(&mihomo_processes, managed_mihomo.as_deref())
+    {
+        messages.push(message);
+    }
+    let zapret_processes = running_process_details(&["winws.exe"]);
+    let (external, stale) =
+        classify_zapret_preflight_processes(&zapret_processes, managed_winws.as_deref());
+    messages.extend(stale);
+    if !external.is_empty() {
+        messages.push(format!(
+            "External DPI processes still present after recovery: {}",
+            external.join(", ")
+        ));
+    }
+
+    let was_connected = desired.as_ref().is_some_and(|state| state.connected);
+    if was_connected || !messages.is_empty() {
+        let message = if was_connected {
+            "Safe Mode: badvpn-agent restarted while a session was marked connected. Orphaned owned processes were cleaned up when possible. Reconnect from the UI to restore VPN.".to_string()
+        } else {
+            "Agent startup recovery cleaned stale owned processes.".to_string()
+        };
+        let state = DesiredRuntimeState {
+            connected: false,
+            desired_mode: desired
+                .as_ref()
+                .map(|state| state.desired_mode)
+                .unwrap_or(RuntimeMode::Smart),
+            effective_mode: desired
+                .as_ref()
+                .map(|state| state.effective_mode)
+                .unwrap_or(RuntimeMode::Smart),
+            controller_port: desired
+                .as_ref()
+                .map(|state| state.controller_port)
+                .unwrap_or(9090),
+            mixed_port: desired
+                .as_ref()
+                .map(|state| state.mixed_port)
+                .unwrap_or(7890),
+            updated_at_unix: now_unix(),
+            safe_mode: was_connected,
+            message: Some(message.clone()),
+        };
+        let _ = state.write();
+        messages.insert(0, message);
+    }
+
+    if messages.is_empty() {
+        Ok(
+            "Agent recovery: no orphaned owned processes and no prior connected session."
+                .to_string(),
+        )
+    } else {
+        Ok(messages.join(" "))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4753,8 +5712,8 @@ mod architecture_fix_tests {
 
     #[test]
     fn controller_secret_is_random_shape() {
-        let first = generate_controller_secret().unwrap();
-        let second = generate_controller_secret().unwrap();
+        let first = badvpn_common::generate_controller_secret().unwrap();
+        let second = badvpn_common::generate_controller_secret().unwrap();
 
         assert!(first.starts_with("badvpn-"));
         assert_eq!(first.len(), "badvpn-".len() + 64);
@@ -4765,8 +5724,182 @@ mod architecture_fix_tests {
     }
 
     #[test]
-    fn hex_encoding_is_lowercase_and_stable() {
-        assert_eq!(to_hex(&[0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
+    fn desired_runtime_state_round_trips_safe_mode_flag() {
+        let root = std::env::temp_dir().join(format!("badvpn-desired-{}", now_unix()));
+        let path = root.join("runtime").join("desired-state.json");
+        let state = DesiredRuntimeState {
+            connected: false,
+            desired_mode: RuntimeMode::Smart,
+            effective_mode: RuntimeMode::VpnOnly,
+            controller_port: 9090,
+            mixed_port: 7890,
+            updated_at_unix: now_unix(),
+            safe_mode: true,
+            message: Some("Safe Mode test".to_string()),
+        };
+        state.write_to(&path).unwrap();
+        let loaded = DesiredRuntimeState::read_from(&path).expect("desired state should load");
+        assert!(loaded.safe_mode);
+        assert_eq!(loaded.message.as_deref(), Some("Safe Mode test"));
+        assert_eq!(
+            safe_mode_message_from(loaded).as_deref(),
+            Some("Safe Mode test")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn vpn_only_guard_rejects_non_safety_direct_rules() {
+        let mut policy = badvpn_common::compile_policy(badvpn_common::PolicyCompileInput {
+            mode: AppRouteMode::VpnOnly,
+            provider_rules: vec![
+                "DOMAIN-SUFFIX,example.com,PROXY".to_string(),
+                "MATCH,PROXY".to_string(),
+            ],
+            proxy_groups: vec![badvpn_common::ProxyGroupInfo {
+                name: "PROXY".to_string(),
+                group_type: Some("select".to_string()),
+                proxies: vec!["n1".to_string()],
+            }],
+            proxy_count: 1,
+            routing: badvpn_common::RoutingPolicySettings::default(),
+            runtime_facts: badvpn_common::RuntimeFacts::default(),
+        })
+        .unwrap();
+        ensure_vpn_only_fallback_policy(&policy).unwrap();
+
+        policy
+            .mihomo_rules
+            .insert(0, "DOMAIN-SUFFIX,youtube.com,DIRECT".to_string());
+        let err = ensure_vpn_only_fallback_policy(&policy).unwrap_err();
+        assert!(err.to_string().contains("youtube.com"));
+
+        assert!(is_safety_direct_mihomo_rule(
+            "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve"
+        ));
+        assert!(!is_safety_direct_mihomo_rule(
+            "DOMAIN-SUFFIX,discord.com,DIRECT"
+        ));
+
+        let mut routing = badvpn_common::RoutingPolicySettings::default();
+        routing.force_direct_domains = vec!["custom.example".to_string()];
+        routing.force_direct_cidrs = vec!["203.0.113.0/24".to_string()];
+        routing.force_direct_processes = vec!["custom-game.exe".to_string()];
+        let explicit_overrides = badvpn_common::compile_policy(badvpn_common::PolicyCompileInput {
+            mode: AppRouteMode::VpnOnly,
+            provider_rules: vec!["MATCH,PROXY".to_string()],
+            proxy_groups: vec![badvpn_common::ProxyGroupInfo {
+                name: "PROXY".to_string(),
+                group_type: Some("select".to_string()),
+                proxies: vec!["n1".to_string()],
+            }],
+            proxy_count: 1,
+            routing,
+            runtime_facts: badvpn_common::RuntimeFacts::default(),
+        })
+        .unwrap();
+        ensure_vpn_only_fallback_policy(&explicit_overrides).unwrap();
+        assert!(explicit_overrides
+            .mihomo_rules
+            .iter()
+            .any(|rule| rule == "DOMAIN-SUFFIX,custom.example,DIRECT"));
+        assert!(explicit_overrides
+            .mihomo_rules
+            .iter()
+            .any(|rule| rule == "IP-CIDR,203.0.113.0/24,DIRECT,no-resolve"));
+        assert!(explicit_overrides
+            .mihomo_rules
+            .iter()
+            .any(|rule| rule == "PROCESS-NAME,custom-game.exe,DIRECT"));
+    }
+
+    #[test]
+    fn zapret_strategy_fallback_order_prefers_selected_then_all() {
+        let mut settings = badvpn_common::RuntimeZapretSettings::default();
+        settings.strategy = "alt5".to_string();
+        settings.auto_profile_fallback = true;
+        let order = zapret_strategy_attempt_order(&settings);
+        assert_eq!(order.first().copied(), Some("alt5"));
+        assert_eq!(order.len(), zapret_strategy_ids().len());
+        assert!(order.contains(&"general"));
+        assert!(order.contains(&"simple_fake_alt2"));
+
+        settings.auto_profile_fallback = false;
+        assert_eq!(zapret_strategy_attempt_order(&settings), vec!["alt5"]);
+    }
+
+    #[test]
+    fn append_google_quic_injects_when_fake_quic_is_only_in_unrelated_branch() {
+        let mut args = vec![
+            "--filter-udp=443".to_string(),
+            "--dpi-desync-fake-quic=C:\\bin\\quic_initial_www_google_com.bin".to_string(),
+        ];
+        let google = PathBuf::from("C:\\lists\\list-google.txt");
+        let exclude = PathBuf::from("C:\\lists\\list-exclude.txt");
+        let ipset = PathBuf::from("C:\\lists\\ipset-exclude.txt");
+        let bin = PathBuf::from("C:\\bin");
+        append_google_quic_hostlist_args(&mut args, &google, &exclude, &ipset, &bin);
+        assert!(args.len() > 2);
+        assert!(args
+            .iter()
+            .any(|arg| arg.replace('\\', "/").ends_with("/list-google.txt")));
+    }
+
+    #[test]
+    fn append_google_quic_skips_complete_dedicated_google_branch() {
+        let google = PathBuf::from("C:\\lists\\list-google.txt");
+        let exclude = PathBuf::from("C:\\lists\\list-exclude.txt");
+        let ipset = PathBuf::from("C:\\lists\\ipset-exclude.txt");
+        let bin = PathBuf::from("C:\\bin");
+        let mut args = vec![
+            "--new".to_string(),
+            "--filter-udp=443".to_string(),
+            format!("--hostlist={}", google.display()),
+            "--dpi-desync-fake-quic=C:\\bin\\quic_initial_www_google_com.bin".to_string(),
+        ];
+        let original = args.clone();
+
+        append_google_quic_hostlist_args(&mut args, &google, &exclude, &ipset, &bin);
+
+        assert_eq!(args, original);
+    }
+
+    #[test]
+    fn watchdog_fallback_failure_stops_runtime_before_entering_error() {
+        let mut manager = RuntimeManager::new();
+        manager.snapshot.phase = RuntimePhase::Running;
+        manager.snapshot.effective_mode = RuntimeMode::Smart;
+        manager.snapshot.mihomo =
+            RuntimeComponentSnapshot::new(RuntimeComponentState::Running, None);
+        manager.snapshot.zapret =
+            RuntimeComponentSnapshot::new(RuntimeComponentState::Stopped, None);
+        manager.snapshot.windivert =
+            RuntimeComponentSnapshot::new(RuntimeComponentState::Running, None);
+
+        manager.fail_closed_after_late_zapret_fallback_inner(
+            &anyhow!("forced fallback failure"),
+            false,
+        );
+
+        assert_eq!(manager.snapshot.phase, RuntimePhase::Error);
+        assert_eq!(
+            manager.snapshot.mihomo.state,
+            RuntimeComponentState::Stopped
+        );
+        assert_eq!(
+            manager.snapshot.zapret.state,
+            RuntimeComponentState::Stopped
+        );
+        assert_eq!(
+            manager.snapshot.windivert.state,
+            RuntimeComponentState::Stopped
+        );
+        assert!(manager
+            .snapshot
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("prevent unprotected DIRECT routing"));
     }
 
     #[test]
@@ -4810,15 +5943,18 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn duplicate_connect_returns_transition_snapshot() {
+    async fn duplicate_connect_returns_busy_error() {
         let mut manager = RuntimeManager::new();
         manager.snapshot.phase = RuntimePhase::StartingMihomo;
-        let snapshot = manager.connect(test_request()).await.unwrap();
-        assert_eq!(snapshot.phase, RuntimePhase::StartingMihomo);
-        assert!(snapshot
-            .diagnostics
-            .iter()
-            .any(|message| message.contains("already in progress")));
+        let error = manager
+            .connect(test_request())
+            .await
+            .expect_err("duplicate connect must fail while a transition is active");
+        assert!(
+            error.to_string().contains("already in progress"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(manager.snapshot.phase, RuntimePhase::StartingMihomo);
     }
 
     #[test]
@@ -4904,7 +6040,12 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("VPN routing is no longer active"));
-        let state = snapshot_to_agent_state(&manager.snapshot, SubscriptionState::default());
+        let state = snapshot_to_agent_state(
+            &manager.snapshot,
+            SubscriptionState::default(),
+            None,
+            Default::default(),
+        );
         assert!(!state.running);
         assert!(!state.connection.connected);
         assert_eq!(state.phase, badvpn_common::AppPhase::Error);
@@ -5121,6 +6262,219 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn proxy_egress_verification_observes_cancellation_during_http_request() {
+        let listener = TcpListener::bind((LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            if let Ok((_stream, _address)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        });
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_task = std::sync::Arc::clone(&cancel);
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(75)).await;
+            cancel_task.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let started = Instant::now();
+        let error = MihomoManager::default()
+            .verify_proxy_egress("PROXY", port, "", Some(cancel.as_ref()))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("cancelled during proxy_egress"));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "cancellation took {:?}",
+            started.elapsed()
+        );
+        server.join().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn job_binding_failure_kills_and_reaps_spawned_child() {
+        let child = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+
+        let error = bind_owned_child_to_job_with(child, "test-child", |_child| {
+            Err(anyhow!("forced Job Object bind failure"))
+        })
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("Job Object binding failed"));
+        assert!(message.contains("child was killed and reaped"));
+        let query = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!("if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 1 }}"),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(query.success(), "child process {pid} survived bind failure");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn zapret_stabilization_cancellation_kills_child_promptly() {
+        let mut child = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_thread = std::sync::Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(75));
+            cancel_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let started = Instant::now();
+        let error = wait_for_zapret_stabilization(
+            &mut child,
+            Some(cancel.as_ref()),
+            Duration::from_secs(10),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("cancelled during zapret stabilization"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mihomo_validation_cancellation_kills_and_reaps_child_promptly() {
+        let mut child = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_thread = std::sync::Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(75));
+            cancel_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let started = Instant::now();
+        let error = wait_for_mihomo_validation(&mut child, Some(cancel.as_ref())).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("cancelled during Mihomo validation"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn mihomo_readiness_cancellation_stops_process_and_rolls_back_promptly() {
+        let root = std::env::temp_dir().join(format!(
+            "badvpn-ready-cancel-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = RuntimeConfigStore { root: root.clone() };
+        fs::create_dir_all(&root).unwrap();
+        fs::write(store.run_path(), "new: unready\n").unwrap();
+        fs::write(store.last_working_path(), "old: verified\n").unwrap();
+
+        let child = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let unavailable_port = TcpListener::bind((LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut manager = RuntimeManager::new();
+        manager.config_store = store.clone();
+        manager.mihomo.child = Some(child);
+        manager.snapshot.phase = RuntimePhase::StartingMihomo;
+        manager.snapshot.mihomo =
+            RuntimeComponentSnapshot::new(RuntimeComponentState::Starting, None);
+
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_thread = std::sync::Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(75));
+            cancel_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let started = Instant::now();
+        let error = manager
+            .wait_for_initial_mihomo_ready(unavailable_port, "", Some(cancel.as_ref()))
+            .await
+            .unwrap_err();
+        manager.persist_background_connect_failure(error.to_string());
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!manager.mihomo.is_running());
+        assert_eq!(manager.snapshot.phase, RuntimePhase::Error);
+        assert_ne!(manager.snapshot.phase, RuntimePhase::Running);
+        assert_eq!(
+            fs::read_to_string(store.run_path()).unwrap(),
+            "old: verified\n"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn corrupt_draft_does_not_replace_last_working() {
         let root = std::env::temp_dir().join(format!("badvpn-config-test-{}", now_unix()));
@@ -5136,6 +6490,125 @@ mod tests {
             "good: true\n"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_startup_egress_probe_stops_runtime_and_rolls_back_config() {
+        let root = std::env::temp_dir().join(format!(
+            "badvpn-egress-failure-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = RuntimeConfigStore { root: root.clone() };
+        fs::create_dir_all(&root).unwrap();
+        fs::write(store.run_path(), "new: unverified\n").unwrap();
+        fs::write(store.last_working_path(), "old: verified\n").unwrap();
+        fs::write(
+            store.policy_summary_path(),
+            r#"{"source":"previous-verified-policy"}"#,
+        )
+        .unwrap();
+
+        let mut manager = RuntimeManager::new();
+        manager.config_store = store.clone();
+        manager.snapshot.phase = RuntimePhase::Verifying;
+        manager.snapshot.active_config_id = Some("unverified".to_string());
+        manager.snapshot.mihomo =
+            RuntimeComponentSnapshot::new(RuntimeComponentState::Running, None);
+        manager.snapshot.zapret =
+            RuntimeComponentSnapshot::new(RuntimeComponentState::Running, None);
+
+        manager.abort_started_connect(
+            "Mihomo proxy egress verification failed; connection was not started".to_string(),
+        );
+
+        assert_eq!(manager.snapshot.phase, RuntimePhase::Error);
+        assert_eq!(
+            manager.snapshot.mihomo.state,
+            RuntimeComponentState::Stopped
+        );
+        assert_eq!(
+            manager.snapshot.zapret.state,
+            RuntimeComponentState::Stopped
+        );
+        assert!(manager.snapshot.active_config_id.is_none());
+        assert!(manager
+            .snapshot
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("proxy egress verification failed"));
+        assert_eq!(
+            fs::read_to_string(store.run_path()).unwrap(),
+            "old: verified\n"
+        );
+        assert_eq!(
+            fs::read_to_string(store.policy_summary_path()).unwrap(),
+            r#"{"source":"previous-verified-policy"}"#
+        );
+
+        let _ = fs::remove_dir_all(root);
+
+        let first_connect_root = std::env::temp_dir().join(format!(
+            "badvpn-first-egress-failure-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let first_connect_store = RuntimeConfigStore {
+            root: first_connect_root.clone(),
+        };
+        fs::create_dir_all(&first_connect_root).unwrap();
+        fs::write(first_connect_store.run_path(), "new: unverified\n").unwrap();
+
+        let mut first_connect_manager = RuntimeManager::new();
+        first_connect_manager.config_store = first_connect_store.clone();
+        first_connect_manager.abort_started_connect(
+            "Mihomo proxy egress verification failed; connection was not started".to_string(),
+        );
+
+        assert!(!first_connect_store.run_path().exists());
+        assert!(!first_connect_store.policy_summary_path().exists());
+        let _ = fs::remove_dir_all(first_connect_root);
+    }
+
+    #[test]
+    fn background_connect_failure_replaces_transitional_or_connected_snapshot_with_error() {
+        for phase in [RuntimePhase::Preparing, RuntimePhase::DegradedVpnOnly] {
+            let mut manager = RuntimeManager::new();
+            manager.snapshot.phase = phase;
+            manager.snapshot.mihomo =
+                RuntimeComponentSnapshot::new(RuntimeComponentState::Running, None);
+            manager.snapshot.zapret =
+                RuntimeComponentSnapshot::new(RuntimeComponentState::Running, None);
+            manager.snapshot.active_config_id = Some("stale-config".to_string());
+
+            manager.persist_background_connect_failure(format!("failure from {phase:?}"));
+
+            assert_eq!(manager.snapshot.phase, RuntimePhase::Error);
+            assert_eq!(
+                manager.snapshot.mihomo.state,
+                RuntimeComponentState::Stopped
+            );
+            assert_eq!(
+                manager.snapshot.zapret.state,
+                RuntimeComponentState::Stopped
+            );
+            assert!(manager.snapshot.active_config_id.is_none());
+            assert!(manager.snapshot.last_error.is_some());
+            let state = manager.to_agent_state(SubscriptionState::default());
+            assert_eq!(state.phase, badvpn_common::AppPhase::Error);
+            assert_eq!(
+                state.connection.status,
+                badvpn_common::ConnectionStatus::Error
+            );
+            assert!(!state.connection.connected);
+        }
     }
 
     #[test]
@@ -5190,10 +6663,7 @@ start "zapret: general (ALT9)" /min "%BIN%winws.exe" --wf-tcp=80,443,%GameFilter
 "#,
         )
         .unwrap();
-        let store = ComponentStore {
-            root: components,
-            appdata_fallback: None,
-        };
+        let store = ComponentStore { root: components };
         let settings = RuntimeZapretSettings {
             strategy: "alt9".to_string(),
             game_filter: "tcp_udp".to_string(),
@@ -5351,7 +6821,6 @@ start "zapret: general (ALT9)" /min "%BIN%winws.exe" --wf-tcp=80,443,%GameFilter
         let components = root.join("components");
         let store = ComponentStore {
             root: components.clone(),
-            appdata_fallback: None,
         };
         let mut routing = RoutingPolicySettings::default();
         routing.force_zapret_cidrs = vec!["203.0.113.0/24".to_string()];
@@ -6416,7 +7885,6 @@ rules:
         let components = root.join("components");
         let store = ComponentStore {
             root: components.clone(),
-            appdata_fallback: None,
         };
         let policy = compile_policy(PolicyCompileInput {
             mode: AppRouteMode::VpnOnly,

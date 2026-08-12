@@ -14,7 +14,8 @@ pub use ipc::{
 };
 pub use mihomo_config::{
     flowseal_exclude_hostlist, flowseal_general_hostlist, flowseal_google_hostlist,
-    flowseal_ipset_exclude, flowseal_target_hostlist, generate_mihomo_config_from_subscription,
+    flowseal_ipset_exclude, flowseal_target_hostlist, generate_controller_secret,
+    generate_mihomo_config_from_subscription,
     generate_mihomo_config_from_subscription_with_options, geodata_asset_exists,
     overlay_mihomo_config_yaml, smart_hybrid_direct_rules, strip_missing_geodata_rules,
     zapret_default_hostlist, zapret_default_ipset, zapret_user_placeholder_hostlist,

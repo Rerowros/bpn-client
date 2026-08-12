@@ -26,7 +26,7 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::sleep;
 use zip::ZipArchive;
@@ -36,8 +36,9 @@ use std::os::windows::process::CommandExt;
 
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_BUSY,
-    GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+    CloseHandle, GetLastError, LocalFree, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA,
+    ERROR_PIPE_BUSY, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 #[cfg(windows)]
 use windows_sys::Win32::Security::Cryptography::{
@@ -45,10 +46,14 @@ use windows_sys::Win32::Security::Cryptography::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING,
+    CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+#[cfg(windows)]
+use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -675,7 +680,16 @@ fn apply_agent_unreachable_state(error: String) -> Result<AgentState, String> {
 }
 
 fn should_use_agent_runtime() -> bool {
-    std::env::var("BADVPN_LEGACY_RUNTIME").ok().as_deref() != Some("1")
+    // Release builds are service-first only. Legacy GUI-owned Mihomo/winws spawn
+    // remains available in debug builds behind BADVPN_LEGACY_RUNTIME=1.
+    #[cfg(not(debug_assertions))]
+    {
+        true
+    }
+    #[cfg(debug_assertions)]
+    {
+        std::env::var("BADVPN_LEGACY_RUNTIME").ok().as_deref() != Some("1")
+    }
 }
 
 fn send_agent_command(command: AgentCommand, spawn_if_missing: bool) -> Result<AgentState, String> {
@@ -817,7 +831,7 @@ fn open_agent_pipe(timeout: Duration) -> Result<windows_sys::Win32::Foundation::
                 0,
                 std::ptr::null(),
                 OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
                 std::ptr::null_mut(),
             )
         };
@@ -846,21 +860,22 @@ fn write_pipe_all(
     mut data: &[u8],
 ) -> Result<(), String> {
     while !data.is_empty() {
-        let mut written = 0_u32;
-        let ok = unsafe {
-            WriteFile(
-                handle,
-                data.as_ptr().cast(),
-                data.len().min(u32::MAX as usize) as u32,
-                &mut written,
-                std::ptr::null_mut(),
-            )
-        } != 0;
-        if !ok {
-            return Err(format!(
-                "Failed to write agent named pipe request: {}",
-                std::io::Error::last_os_error()
-            ));
+        let written = overlapped_pipe_io(
+            handle,
+            Duration::from_secs(30),
+            "Timed out writing BadVpn agent named pipe request.",
+            |overlapped, transferred| unsafe {
+                WriteFile(
+                    handle,
+                    data.as_ptr(),
+                    data.len().min(u32::MAX as usize) as u32,
+                    transferred,
+                    overlapped,
+                )
+            },
+        )?;
+        if written == 0 {
+            return Err("BadVpn agent named pipe accepted zero request bytes.".to_string());
         }
         data = &data[written as usize..];
     }
@@ -871,31 +886,30 @@ fn write_pipe_all(
 fn read_pipe_line(handle: windows_sys::Win32::Foundation::HANDLE) -> Result<String, String> {
     let mut data = Vec::new();
     let mut buffer = [0_u8; 4096];
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let mut read = 0_u32;
-        let ok = unsafe {
-            ReadFile(
-                handle,
-                buffer.as_mut_ptr().cast(),
-                buffer.len() as u32,
-                &mut read,
-                std::ptr::null_mut(),
-            )
-        } != 0;
-        if !ok {
-            let error = unsafe { GetLastError() };
-            if error == ERROR_NO_DATA {
-                std::thread::sleep(Duration::from_millis(20));
-                continue;
-            }
-            if error == ERROR_BROKEN_PIPE && !data.is_empty() {
-                break;
-            }
-            return Err(format!(
-                "Failed to read agent named pipe response: {}",
-                std::io::Error::last_os_error()
-            ));
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("Timed out waiting for BadVpn agent named pipe response.".to_string());
         }
+        let read = match overlapped_pipe_io(
+            handle,
+            remaining,
+            "Timed out waiting for BadVpn agent named pipe response.",
+            |overlapped, transferred| unsafe {
+                ReadFile(
+                    handle,
+                    buffer.as_mut_ptr(),
+                    buffer.len() as u32,
+                    transferred,
+                    overlapped,
+                )
+            },
+        ) {
+            Ok(read) => read,
+            Err(error) if error.contains("broken pipe") && !data.is_empty() => break,
+            Err(error) => return Err(error),
+        };
         if read == 0 {
             break;
         }
@@ -910,6 +924,80 @@ fn read_pipe_line(handle: windows_sys::Win32::Foundation::HANDLE) -> Result<Stri
     String::from_utf8(data)
         .map(|line| line.trim_end_matches(['\r', '\n']).to_string())
         .map_err(|error| format!("Agent response was not valid UTF-8: {error}"))
+}
+
+#[cfg(windows)]
+fn overlapped_pipe_io(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    timeout: Duration,
+    timeout_message: &str,
+    issue: impl FnOnce(*mut OVERLAPPED, *mut u32) -> i32,
+) -> Result<u32, String> {
+    let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+    if event.is_null() {
+        return Err(format!(
+            "Failed to create named pipe I/O event: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let result = (|| {
+        let mut overlapped = OVERLAPPED {
+            hEvent: event,
+            ..Default::default()
+        };
+        let mut transferred = 0_u32;
+        if issue(&mut overlapped, &mut transferred) != 0 {
+            return Ok(transferred);
+        }
+        let error = unsafe { GetLastError() };
+        if error != ERROR_IO_PENDING {
+            if error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA {
+                return Err("BadVpn agent named pipe was closed (broken pipe).".to_string());
+            }
+            return Err(format!(
+                "Failed to perform BadVpn agent named pipe I/O: {}",
+                std::io::Error::from_raw_os_error(error as i32)
+            ));
+        }
+
+        let timeout_ms = timeout.as_millis().clamp(1, u32::MAX as u128) as u32;
+        match unsafe { WaitForSingleObject(event, timeout_ms) } {
+            WAIT_OBJECT_0 => {
+                if unsafe { GetOverlappedResult(handle, &overlapped, &mut transferred, 0) } == 0 {
+                    let error = unsafe { GetLastError() };
+                    if error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA {
+                        return Err("BadVpn agent named pipe was closed (broken pipe).".to_string());
+                    }
+                    return Err(format!(
+                        "Failed to complete BadVpn agent named pipe I/O: {}",
+                        std::io::Error::from_raw_os_error(error as i32)
+                    ));
+                }
+                Ok(transferred)
+            }
+            WAIT_TIMEOUT => {
+                // Wait for cancellation completion before the OVERLAPPED/event/buffer leave scope.
+                unsafe {
+                    let _ = CancelIoEx(handle, &overlapped);
+                    let _ = GetOverlappedResult(handle, &overlapped, &mut transferred, 1);
+                }
+                Err(timeout_message.to_string())
+            }
+            wait_error => {
+                unsafe {
+                    let _ = CancelIoEx(handle, &overlapped);
+                    let _ = GetOverlappedResult(handle, &overlapped, &mut transferred, 1);
+                }
+                Err(format!(
+                    "Named pipe I/O wait failed with status {wait_error}."
+                ))
+            }
+        }
+    })();
+    unsafe {
+        CloseHandle(event);
+    }
+    result
 }
 
 #[cfg(windows)]
@@ -5784,32 +5872,13 @@ fn install_badvpn_agent_service() -> Result<AgentServiceStatus, String> {
         } else {
             "badvpn-agent"
         });
+        let invoking_user_sid = current_process_user_sid()?;
         let staging_script = stage_runtime_assets_powershell()?;
-        let script = format!(
-            r#"$ErrorActionPreference = 'Stop'
-$sourceAgent = '{agent}'
-$serviceAgent = '{service_agent}'
-$serviceAgentDir = Split-Path -Parent $serviceAgent
-{staging_script}
-New-Item -ItemType Directory -Path $serviceAgentDir -Force | Out-Null
-$service = Get-Service -Name '{service_name}' -ErrorAction SilentlyContinue
-if ($service -and $service.Status -ne 'Stopped') {{
-  sc.exe stop '{service_name}' | Out-Null
-  $deadline = (Get-Date).AddSeconds(20)
-  do {{
-    Start-Sleep -Milliseconds 250
-    $service = Get-Service -Name '{service_name}' -ErrorAction SilentlyContinue
-  }} while ($service -and $service.Status -ne 'Stopped' -and (Get-Date) -lt $deadline)
-  if ($service -and $service.Status -ne 'Stopped') {{ throw "{service_name} did not stop before agent repair" }}
-}}
-Copy-Item -LiteralPath $sourceAgent -Destination $serviceAgent -Force
-& $serviceAgent install-service | Out-Null
-if ($LASTEXITCODE -ne 0) {{ throw "badvpn-agent install-service failed with exit code $LASTEXITCODE" }}
-"#,
-            agent = powershell_single_quote(&agent_bin.to_string_lossy()),
-            service_agent = powershell_single_quote(&service_agent_bin.to_string_lossy()),
-            service_name = BADVPN_AGENT_SERVICE,
-            staging_script = staging_script,
+        let script = render_agent_install_powershell(
+            &agent_bin,
+            &service_agent_bin,
+            &invoking_user_sid,
+            &staging_script,
         );
         run_elevated_powershell_script(&script)?;
         let status = read_badvpn_agent_service_status();
@@ -5821,36 +5890,335 @@ if ($LASTEXITCODE -ne 0) {{ throw "badvpn-agent install-service failed with exit
     }
 }
 
+#[cfg(windows)]
+fn render_agent_install_powershell(
+    agent_bin: &Path,
+    service_agent_bin: &Path,
+    invoking_user_sid: &str,
+    staging_script: &str,
+) -> String {
+    format!(
+        r#"$ErrorActionPreference = 'Stop'
+$sourceAgent = '{agent}'
+$serviceAgent = '{service_agent}'
+$serviceAgentDir = Split-Path -Parent $serviceAgent
+New-Item -ItemType Directory -Path $serviceAgentDir -Force | Out-Null
+$invokingUserSid = '{invoking_user_sid}'
+$allowedUserSidPath = Join-Path $serviceAgentDir 'allowed-user.sid'
+$allowedUserSidExisted = Test-Path -LiteralPath $allowedUserSidPath -PathType Leaf
+$previousAllowedUserSid = if ($allowedUserSidExisted) {{ Get-Content -LiteralPath $allowedUserSidPath -Raw }} else {{ $null }}
+$service = Get-Service -Name '{service_name}' -ErrorAction SilentlyContinue
+$serviceExisted = [bool]$service
+$wasRunning = [bool]($service -and $service.Status -eq 'Running')
+$serviceAgentExisted = Test-Path -LiteralPath $serviceAgent -PathType Leaf
+$serviceAgentBackup = $null
+try {{
+  if ($service -and $service.Status -ne 'Stopped') {{
+    sc.exe stop '{service_name}' | Out-Null
+    $deadline = (Get-Date).AddSeconds(20)
+    do {{
+      Start-Sleep -Milliseconds 250
+      $service = Get-Service -Name '{service_name}' -ErrorAction SilentlyContinue
+    }} while ($service -and $service.Status -ne 'Stopped' -and (Get-Date) -lt $deadline)
+    if ($service -and $service.Status -ne 'Stopped') {{ throw "{service_name} did not stop before agent repair" }}
+  }}
+{staging_script}
+  if (Test-Path -LiteralPath $serviceAgent -PathType Leaf) {{
+    $serviceAgentBackup = "$serviceAgent.backup-$([Guid]::NewGuid().ToString('N'))"
+    Copy-Item -LiteralPath $serviceAgent -Destination $serviceAgentBackup -Force
+  }}
+  Set-Content -LiteralPath $allowedUserSidPath -Value $invokingUserSid -Encoding ascii -NoNewline
+  Copy-Item -LiteralPath $sourceAgent -Destination $serviceAgent -Force
+  & $serviceAgent install-service | Out-Null
+  if ($LASTEXITCODE -ne 0) {{ throw "badvpn-agent install-service failed with exit code $LASTEXITCODE" }}
+  if ($serviceExisted -and -not $wasRunning) {{
+    $service = Get-Service -Name '{service_name}' -ErrorAction SilentlyContinue
+    if ($service -and $service.Status -ne 'Stopped') {{
+      Stop-Service -Name '{service_name}' -ErrorAction Stop
+      $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(20))
+    }}
+  }}
+  if ($runtimeAssetsBackup -and (Test-Path -LiteralPath $runtimeAssetsBackup)) {{
+    Remove-Item -LiteralPath $runtimeAssetsBackup -Recurse -Force -ErrorAction SilentlyContinue
+  }}
+  if ($serviceAgentBackup -and (Test-Path -LiteralPath $serviceAgentBackup)) {{
+    Remove-Item -LiteralPath $serviceAgentBackup -Force -ErrorAction SilentlyContinue
+  }}
+}} catch {{
+  $installFailure = $_.Exception.Message
+  $rollbackFailures = [System.Collections.Generic.List[string]]::new()
+
+  # Stop and remove any partially installed service before replacing its executable.
+  try {{
+    $partialService = Get-Service -Name '{service_name}' -ErrorAction SilentlyContinue
+    if ($partialService) {{
+      if ($partialService.Status -ne 'Stopped') {{
+        Stop-Service -Name '{service_name}' -ErrorAction Stop
+        $partialService.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(20))
+      }}
+      & $serviceAgent uninstall-service | Out-Null
+      if ($LASTEXITCODE -ne 0) {{ throw "partial badvpn-agent uninstall-service failed with exit code $LASTEXITCODE" }}
+    }}
+  }} catch {{
+    $rollbackFailures.Add("partial service removal: $($_.Exception.Message)")
+  }}
+
+  try {{
+    if ($runtimeAssetsBackup -and (Test-Path -LiteralPath $runtimeAssetsBackup)) {{
+      if (Test-Path -LiteralPath $runtimeAssetsTarget) {{
+        Remove-Item -LiteralPath $runtimeAssetsTarget -Recurse -Force
+      }}
+      Move-Item -LiteralPath $runtimeAssetsBackup -Destination $runtimeAssetsTarget
+    }}
+  }} catch {{
+    $rollbackFailures.Add("runtime asset restore: $($_.Exception.Message)")
+  }}
+
+  $binaryRestored = -not $serviceExisted
+  try {{
+    if ($serviceAgentBackup -and (Test-Path -LiteralPath $serviceAgentBackup)) {{
+      Copy-Item -LiteralPath $serviceAgentBackup -Destination $serviceAgent -Force
+      $binaryRestored = $true
+    }} elseif ($serviceExisted) {{
+      throw "previous badvpn-agent executable backup is unavailable"
+    }}
+  }} catch {{
+    $rollbackFailures.Add("agent executable restore: $($_.Exception.Message)")
+  }}
+
+  try {{
+    if ($allowedUserSidExisted) {{
+      Set-Content -LiteralPath $allowedUserSidPath -Value $previousAllowedUserSid -Encoding ascii -NoNewline
+    }} elseif (Test-Path -LiteralPath $allowedUserSidPath) {{
+      Remove-Item -LiteralPath $allowedUserSidPath -Force
+    }}
+  }} catch {{
+    $rollbackFailures.Add("allowed-user SID restore: $($_.Exception.Message)")
+  }}
+
+  if ($serviceExisted -and $binaryRestored) {{
+    try {{
+      & $serviceAgent install-service | Out-Null
+      if ($LASTEXITCODE -ne 0) {{ throw "restored badvpn-agent install-service failed with exit code $LASTEXITCODE" }}
+      $service = Get-Service -Name '{service_name}' -ErrorAction Stop
+      if ($wasRunning) {{
+        if ($service.Status -ne 'Running') {{ Start-Service -Name '{service_name}' -ErrorAction Stop }}
+        $service.WaitForStatus('Running', [TimeSpan]::FromSeconds(20))
+      }} elseif ($service.Status -ne 'Stopped') {{
+        Stop-Service -Name '{service_name}' -ErrorAction Stop
+        $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(20))
+      }}
+    }} catch {{
+      $rollbackFailures.Add("previous service recreation: $($_.Exception.Message)")
+    }}
+  }} elseif (-not $serviceExisted -and -not $serviceAgentExisted) {{
+    try {{
+      if (Test-Path -LiteralPath $serviceAgent) {{
+        Remove-Item -LiteralPath $serviceAgent -Force
+      }}
+    }} catch {{
+      $rollbackFailures.Add("new agent executable cleanup: $($_.Exception.Message)")
+    }}
+  }}
+  if ($rollbackFailures.Count -gt 0) {{
+    throw "$installFailure Rollback warnings: $($rollbackFailures -join '; ')"
+  }}
+  throw $installFailure
+}}
+"#,
+        agent = powershell_single_quote(&agent_bin.to_string_lossy()),
+        service_agent = powershell_single_quote(&service_agent_bin.to_string_lossy()),
+        invoking_user_sid = powershell_single_quote(invoking_user_sid),
+        service_name = BADVPN_AGENT_SERVICE,
+        staging_script = staging_script,
+    )
+}
+
+#[cfg(windows)]
+fn current_process_user_sid() -> Result<String, String> {
+    let mut command = Command::new("whoami.exe");
+    command
+        .args(["/user", "/fo", "csv", "/nh"])
+        .stdin(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW);
+    let output = command
+        .output()
+        .map_err(|error| format!("Failed to query invoking user SID: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Failed to query invoking user SID: whoami exited with {}",
+            output.status
+        ));
+    }
+    parse_user_sid(&String::from_utf8_lossy(&output.stdout))
+        .ok_or_else(|| "Failed to parse invoking user SID from whoami output".to_string())
+}
+
+#[cfg(windows)]
+fn parse_user_sid(output: &str) -> Option<String> {
+    output
+        .split([',', '\r', '\n'])
+        .map(|field| field.trim().trim_matches('"'))
+        .find(|field| is_valid_windows_sid(field))
+        .map(ToOwned::to_owned)
+}
+
+#[cfg(windows)]
+fn is_valid_windows_sid(value: &str) -> bool {
+    let mut parts = value.split('-');
+    if parts.next() != Some("S") {
+        return false;
+    }
+    let revision = parts.next();
+    let authority = parts.next();
+    let sub_authorities = parts.collect::<Vec<_>>();
+    revision.is_some_and(is_decimal_field)
+        && authority.is_some_and(is_decimal_field)
+        && !sub_authorities.is_empty()
+        && sub_authorities.into_iter().all(is_decimal_field)
+}
+
+#[cfg(windows)]
+fn is_decimal_field(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(|character| character.is_ascii_digit())
+}
+
 fn stage_runtime_assets_powershell() -> Result<String, String> {
     let source_components = data_dir()?.join("components");
     let target_components = programdata_dir()?.join("components");
     let source_lists = data_dir()?.join("zapret").join("lists");
-    let target_lists = programdata_dir()?
-        .join("components")
-        .join("zapret")
-        .join("lists");
+    let required_profiles = ZapretProfile::all()
+        .iter()
+        .map(|profile| format!("'{}'", powershell_single_quote(profile.bat_file_name())))
+        .collect::<Vec<_>>()
+        .join(", ");
     Ok(format!(
-        r#"$sourceComponents = '{source_components}'
+        r#"$runtimeAssetsBackup = $null
+$runtimeAssetsTarget = $null
+$sourceComponents = '{source_components}'
 $targetComponents = '{target_components}'
+$runtimeAssetsTarget = $targetComponents
 if (Test-Path -LiteralPath $sourceComponents) {{
-  New-Item -ItemType Directory -Path $targetComponents -Force | Out-Null
-  robocopy $sourceComponents $targetComponents /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
-  if ($LASTEXITCODE -gt 7) {{ throw "component staging failed with robocopy exit code $LASTEXITCODE" }}
-  $global:LASTEXITCODE = 0
-}}
-$sourceLists = '{source_lists}'
-$targetLists = '{target_lists}'
-if (Test-Path -LiteralPath $sourceLists) {{
-  New-Item -ItemType Directory -Path $targetLists -Force | Out-Null
-  robocopy $sourceLists $targetLists /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
-  if ($LASTEXITCODE -gt 7) {{ throw "Flowseal list staging failed with robocopy exit code $LASTEXITCODE" }}
-  $global:LASTEXITCODE = 0
+  $mihomoCandidates = @(
+    (Join-Path $sourceComponents 'mihomo.exe'),
+    (Join-Path $sourceComponents 'mihomo\mihomo.exe')
+  )
+  $hasMihomo = $false
+  foreach ($candidate in $mihomoCandidates) {{
+    if (Test-Path -LiteralPath $candidate) {{ $hasMihomo = $true; break }}
+  }}
+  if (-not $hasMihomo) {{
+    throw "Refusing ProgramData staging because source components are incomplete (mihomo.exe missing)."
+  }}
+  $sourceZapret = Join-Path $sourceComponents 'zapret'
+  $targetZapret = Join-Path $targetComponents 'zapret'
+  if ((Test-Path -LiteralPath $sourceZapret) -or (Test-Path -LiteralPath $targetZapret)) {{
+    $requiredZapretAssets = @(
+      'zapret\bin\winws.exe',
+      'zapret\bin\WinDivert.dll',
+      'zapret\bin\WinDivert64.sys',
+      'zapret\bin\cygwin1.dll',
+      'zapret\bin\quic_initial_www_google_com.bin',
+      'zapret\bin\tls_clienthello_www_google_com.bin'
+    )
+    $missingZapretAssets = @($requiredZapretAssets | Where-Object {{
+      -not (Test-Path -LiteralPath (Join-Path $sourceComponents $_) -PathType Leaf)
+    }})
+    $requiredZapretProfiles = @({required_profiles})
+    foreach ($profile in $requiredZapretProfiles) {{
+      $rootProfile = Join-Path $sourceZapret $profile
+      $nestedProfile = Join-Path (Join-Path $sourceZapret 'profiles') $profile
+      if (-not (Test-Path -LiteralPath $rootProfile -PathType Leaf) -and -not (Test-Path -LiteralPath $nestedProfile -PathType Leaf)) {{
+        $missingZapretAssets += "zapret profile: $profile"
+      }}
+    }}
+    if ($missingZapretAssets.Count -gt 0) {{
+      throw "Refusing ProgramData staging because source zapret components are incomplete: $($missingZapretAssets -join ', ')"
+    }}
+  }}
+  $targetParent = Split-Path -Parent $targetComponents
+  New-Item -ItemType Directory -Path $targetParent -Force | Out-Null
+  $nonce = [Guid]::NewGuid().ToString('N')
+  $stagingComponents = Join-Path $targetParent ("components.stage-" + $nonce)
+  $backupComponents = Join-Path $targetParent ("components.backup-" + $nonce)
+  $targetWasMoved = $false
+
+  function Assert-StagedTreeContent([string]$source, [string]$destination) {{
+    $sourceRoot = [IO.Path]::GetFullPath($source).TrimEnd('\') + '\'
+    foreach ($sourceFile in Get-ChildItem -LiteralPath $source -File -Recurse) {{
+      $relative = $sourceFile.FullName.Substring($sourceRoot.Length)
+      $destinationFile = Join-Path $destination $relative
+      if (-not (Test-Path -LiteralPath $destinationFile -PathType Leaf)) {{
+        throw "Staged runtime asset is missing: $relative"
+      }}
+      $sourceHash = (Get-FileHash -LiteralPath $sourceFile.FullName -Algorithm SHA256).Hash
+      $destinationHash = (Get-FileHash -LiteralPath $destinationFile -Algorithm SHA256).Hash
+      if ($sourceHash -ne $destinationHash) {{
+        throw "Staged runtime asset hash mismatch: $relative"
+      }}
+    }}
+  }}
+
+  try {{
+    New-Item -ItemType Directory -Path $stagingComponents -Force | Out-Null
+    robocopy $sourceComponents $stagingComponents /E /COPY:DAT /DCOPY:DAT /R:2 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -gt 7) {{ throw "component staging failed with robocopy exit code $LASTEXITCODE" }}
+    $global:LASTEXITCODE = 0
+    Assert-StagedTreeContent $sourceComponents $stagingComponents
+
+    $sourceLists = '{source_lists}'
+    if (Test-Path -LiteralPath $sourceLists) {{
+      $stagingLists = Join-Path $stagingComponents 'zapret\lists'
+      New-Item -ItemType Directory -Path $stagingLists -Force | Out-Null
+      # /MIR is safe only inside the disposable staging tree and makes the list set exact.
+      robocopy $sourceLists $stagingLists /MIR /COPY:DAT /DCOPY:DAT /R:2 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+      if ($LASTEXITCODE -gt 7) {{ throw "Flowseal list staging failed with robocopy exit code $LASTEXITCODE" }}
+      $global:LASTEXITCODE = 0
+      Assert-StagedTreeContent $sourceLists $stagingLists
+    }}
+
+    $stagedMihomoCandidates = @(
+      (Join-Path $stagingComponents 'mihomo.exe'),
+      (Join-Path $stagingComponents 'mihomo\mihomo.exe')
+    )
+    if (-not ($stagedMihomoCandidates | Where-Object {{ Test-Path -LiteralPath $_ -PathType Leaf }})) {{
+      throw "Refusing ProgramData swap because staged components are incomplete (mihomo.exe missing)."
+    }}
+
+    if (Test-Path -LiteralPath $targetComponents) {{
+      Move-Item -LiteralPath $targetComponents -Destination $backupComponents
+      $targetWasMoved = $true
+      $runtimeAssetsBackup = $backupComponents
+    }}
+    try {{
+      Move-Item -LiteralPath $stagingComponents -Destination $targetComponents
+    }} catch {{
+      if (Test-Path -LiteralPath $targetComponents) {{
+        Remove-Item -LiteralPath $targetComponents -Recurse -Force
+      }}
+      if ($targetWasMoved -and (Test-Path -LiteralPath $backupComponents)) {{
+        Move-Item -LiteralPath $backupComponents -Destination $targetComponents
+        $targetWasMoved = $false
+        $runtimeAssetsBackup = $null
+      }}
+      throw
+    }}
+  }} catch {{
+    if (Test-Path -LiteralPath $stagingComponents) {{
+      Remove-Item -LiteralPath $stagingComponents -Recurse -Force -ErrorAction SilentlyContinue
+    }}
+    if ($targetWasMoved -and (Test-Path -LiteralPath $backupComponents) -and -not (Test-Path -LiteralPath $targetComponents)) {{
+      Move-Item -LiteralPath $backupComponents -Destination $targetComponents
+      $runtimeAssetsBackup = $null
+    }}
+    throw
+  }}
 }}
 "#,
         source_components = powershell_single_quote(&source_components.to_string_lossy()),
         target_components = powershell_single_quote(&target_components.to_string_lossy()),
         source_lists = powershell_single_quote(&source_lists.to_string_lossy()),
-        target_lists = powershell_single_quote(&target_lists.to_string_lossy()),
+        required_profiles = required_profiles,
     ))
 }
 
@@ -5867,6 +6235,9 @@ fn stage_runtime_assets_to_programdata() -> Result<(), String> {
 {}
 "#,
             stage_runtime_assets_powershell()?
+        );
+        let script = format!(
+            "{script}\nif ($runtimeAssetsBackup -and (Test-Path -LiteralPath $runtimeAssetsBackup)) {{ Remove-Item -LiteralPath $runtimeAssetsBackup -Recurse -Force }}\n"
         );
         run_elevated_powershell_script(&script)
     }
@@ -7189,7 +7560,7 @@ fn format_subscription_fetch_error(action: &str, url: &str, error: reqwest::Erro
 }
 
 fn write_mihomo_config(subscription_body: &str) -> Result<(), String> {
-    let secret = format!("badvpn-{}", current_unix_timestamp());
+    let secret = badvpn_common::generate_controller_secret()?;
     let settings = load_app_settings();
     write_zapret_lists()?;
     let options = mihomo_options_for_runtime_route(&settings, settings.effective_route_mode());
@@ -7257,14 +7628,16 @@ fn ensure_mihomo_config_routing(
 ) -> Result<(), String> {
     let content = fs::read_to_string(config_path)
         .map_err(|error| format!("Failed to read Mihomo config for route migration: {error}"))?;
-    let secret = serde_yaml::from_str::<YamlValue>(&content)
+    let secret = match serde_yaml::from_str::<YamlValue>(&content)
         .ok()
         .and_then(|yaml| {
             yaml.get("secret")
                 .and_then(YamlValue::as_str)
                 .map(ToOwned::to_owned)
-        })
-        .unwrap_or_else(|| format!("badvpn-{}", current_unix_timestamp()));
+        }) {
+        Some(existing) => existing,
+        None => badvpn_common::generate_controller_secret()?,
+    };
     let rendered = overlay_mihomo_config_yaml(
         &content,
         &secret,
@@ -10245,6 +10618,232 @@ fn normalize_subscription_profile_description(
 mod redaction_tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn programdata_staging_uses_verified_tree_swap_with_rollback() {
+        let script = stage_runtime_assets_powershell().unwrap();
+        let robocopy_lines = script
+            .lines()
+            .filter(|line| line.trim_start().starts_with("robocopy "))
+            .collect::<Vec<_>>();
+
+        assert_eq!(robocopy_lines.len(), 2);
+        for line in robocopy_lines {
+            assert!(
+                line.contains("$staging"),
+                "copy must target staging: {line}"
+            );
+            assert!(!line.contains("$targetComponents"));
+            assert!(!line.contains("/XO"));
+            assert!(
+                line.contains(" /R:2 /W:1 "),
+                "retries must be bounded: {line}"
+            );
+        }
+        assert!(script.contains("Get-FileHash"));
+        assert!(script.contains("robocopy $sourceLists $stagingLists /MIR"));
+        let backup = script
+            .find("Move-Item -LiteralPath $targetComponents -Destination $backupComponents")
+            .unwrap();
+        let promote = script
+            .find("Move-Item -LiteralPath $stagingComponents -Destination $targetComponents")
+            .unwrap();
+        let rollback = script
+            .rfind("Move-Item -LiteralPath $backupComponents -Destination $targetComponents")
+            .unwrap();
+        assert!(backup < promote);
+        assert!(promote < rollback);
+        assert!(!script.contains("robocopy $sourceComponents $targetComponents"));
+
+        let syntax = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$tokens=$null; $errors=$null; [void][System.Management.Automation.Language.Parser]::ParseInput($env:BADVPN_TEST_SCRIPT,[ref]$tokens,[ref]$errors); if ($errors.Count) { $errors | ForEach-Object { Write-Error $_ }; exit 1 }",
+            ])
+            .env("BADVPN_TEST_SCRIPT", &script)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            syntax.status.success(),
+            "PowerShell staging script syntax failed: {}",
+            String::from_utf8_lossy(&syntax.stderr)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn agent_install_stops_service_before_staging_and_binary_replacement() {
+        let staging_marker = "# runtime-staging-marker";
+        let script = render_agent_install_powershell(
+            Path::new(r"C:\Users\alice\badvpn-agent.exe"),
+            Path::new(r"C:\ProgramData\BadVpn\agent\badvpn-agent.exe"),
+            "S-1-5-21-1-2-3-1001",
+            staging_marker,
+        );
+
+        let stop = script.find("sc.exe stop").unwrap();
+        let staging = script.find(staging_marker).unwrap();
+        let replace = script.find("Copy-Item -LiteralPath").unwrap();
+        assert!(stop < staging, "service must stop before runtime staging");
+        assert!(
+            staging < replace,
+            "staging must finish before agent replacement"
+        );
+        assert!(script.contains("$invokingUserSid = 'S-1-5-21-1-2-3-1001'"));
+        assert!(!script.contains("Win32_ComputerSystem"));
+        assert!(script.contains("$allowedUserSidExisted = Test-Path"));
+        assert!(script.contains("$previousAllowedUserSid = if ($allowedUserSidExisted)"));
+        assert!(script.contains(
+            "Set-Content -LiteralPath $allowedUserSidPath -Value $previousAllowedUserSid"
+        ));
+        assert!(script.contains("elseif (Test-Path -LiteralPath $allowedUserSidPath)"));
+        assert!(script.contains("Remove-Item -LiteralPath $allowedUserSidPath -Force"));
+        assert!(script.contains("$serviceExisted = [bool]$service"));
+        assert!(
+            script.contains("$wasRunning = [bool]($service -and $service.Status -eq 'Running')")
+        );
+        assert!(script.contains("if ($wasRunning) {"));
+        assert!(script.contains("Start-Service -Name 'badvpn-agent' -ErrorAction Stop"));
+        assert!(script.contains("if ($serviceExisted -and -not $wasRunning) {"));
+        assert!(script.contains("Stop-Service -Name 'badvpn-agent' -ErrorAction Stop"));
+        let catch = script.find("} catch {").unwrap();
+        let restore_assets = script
+            .find("Move-Item -LiteralPath $runtimeAssetsBackup -Destination $runtimeAssetsTarget")
+            .unwrap();
+        let restart = script.find("Start-Service -Name 'badvpn-agent'").unwrap();
+        let write_new_sid = script
+            .find("Set-Content -LiteralPath $allowedUserSidPath -Value $invokingUserSid")
+            .unwrap();
+        let install = script.find("& $serviceAgent install-service").unwrap();
+        let restore_sid = script
+            .find("Set-Content -LiteralPath $allowedUserSidPath -Value $previousAllowedUserSid")
+            .unwrap();
+        let delete_new_sid = script
+            .find("Remove-Item -LiteralPath $allowedUserSidPath -Force")
+            .unwrap();
+        assert!(
+            write_new_sid < install,
+            "service must start with the new SID ACL"
+        );
+        assert!(
+            install < restore_sid,
+            "SID restore belongs to failure handling"
+        );
+        assert!(restore_sid < restart);
+        assert!(delete_new_sid < restart);
+        assert!(catch < restore_assets);
+        assert!(restore_assets < restart);
+
+        let install_calls = script
+            .match_indices("& $serviceAgent install-service")
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(install_calls.len(), 2);
+        let restore_binary = script
+            .find("Copy-Item -LiteralPath $serviceAgentBackup -Destination $serviceAgent -Force")
+            .unwrap();
+        assert!(restore_binary < install_calls[1]);
+        assert!(restore_sid < install_calls[1]);
+        assert!(install_calls[1] < restart);
+        assert!(script.contains("if ($serviceExisted -and $binaryRestored) {"));
+        assert!(script.contains("if ($wasRunning) {"));
+        assert!(script.contains("elseif ($service.Status -ne 'Stopped')"));
+        assert!(script.contains("Rollback warnings:"));
+        assert!(script.contains("$rollbackFailures.Add(\"runtime asset restore:"));
+        assert!(script.contains("$rollbackFailures.Add(\"agent executable restore:"));
+        assert!(script.contains("$rollbackFailures.Add(\"allowed-user SID restore:"));
+        let remove_partial = script.find("& $serviceAgent uninstall-service").unwrap();
+        assert!(remove_partial < restore_assets);
+        assert!(remove_partial < restore_binary);
+        assert!(remove_partial < restore_sid);
+
+        let syntax = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$tokens=$null; $errors=$null; [void][System.Management.Automation.Language.Parser]::ParseInput($env:BADVPN_TEST_SCRIPT,[ref]$tokens,[ref]$errors); if ($errors.Count) { $errors | ForEach-Object { Write-Error $_ }; exit 1 }",
+            ])
+            .env("BADVPN_TEST_SCRIPT", &script)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            syntax.status.success(),
+            "PowerShell install script syntax failed: {}",
+            String::from_utf8_lossy(&syntax.stderr)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn agent_install_preserves_absent_running_and_stopped_service_states() {
+        let script = render_agent_install_powershell(
+            Path::new(r"C:\Users\alice\badvpn-agent.exe"),
+            Path::new(r"C:\ProgramData\BadVpn\agent\badvpn-agent.exe"),
+            "S-1-5-21-1-2-3-1001",
+            "# runtime-staging-marker",
+        );
+
+        // Fresh installs are not stopped: only an existing, previously stopped
+        // service enters the success-path Stop-Service branch.
+        assert!(script.contains("if ($serviceExisted -and -not $wasRunning) {"));
+        assert!(!script.contains("if (-not $wasRunning) {\n    $service = Get-Service"));
+        // Rollback recreates an existing service from the restored old binary,
+        // then explicitly restores running vs stopped state.
+        let rollback = script
+            .find("if ($serviceExisted -and $binaryRestored) {")
+            .unwrap();
+        let recreate = script[rollback..]
+            .find("& $serviceAgent install-service")
+            .map(|offset| rollback + offset)
+            .unwrap();
+        let running = script[recreate..]
+            .find("if ($wasRunning) {")
+            .map(|offset| recreate + offset)
+            .unwrap();
+        let stopped = script[running..]
+            .find("elseif ($service.Status -ne 'Stopped')")
+            .map(|offset| running + offset)
+            .unwrap();
+        assert!(rollback < recreate && recreate < running && running < stopped);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn named_pipe_client_uses_overlapped_io_with_bounded_cancellation() {
+        let source = include_str!("commands.rs");
+        let open_pipe = source
+            .find("FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED")
+            .unwrap();
+        let read = source.find("fn read_pipe_line").unwrap();
+        let wait = source
+            .find("WaitForSingleObject(event, timeout_ms)")
+            .unwrap();
+        let cancel = source.find("CancelIoEx(handle, &overlapped)").unwrap();
+        let complete = source
+            .find("GetOverlappedResult(handle, &overlapped, &mut transferred, 1)")
+            .unwrap();
+        assert!(open_pipe < read);
+        assert!(read < wait && wait < cancel && cancel < complete);
+        assert!(source.contains("Instant::now() + Duration::from_secs(30)"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn invoking_user_sid_parser_accepts_only_strict_sid_fields() {
+        assert_eq!(
+            parse_user_sid("\"DESKTOP\\alice\",\"S-1-5-21-1-2-3-1001\"\r\n").as_deref(),
+            Some("S-1-5-21-1-2-3-1001")
+        );
+        assert!(parse_user_sid("DESKTOP\\alice,S-1-5-21-1-2-3-1001;evil").is_none());
+        assert!(parse_user_sid("DESKTOP\\alice,not-a-sid").is_none());
+        assert!(parse_user_sid("DESKTOP\\alice,S-1-").is_none());
+    }
+
     #[test]
     fn nested_provider_catalog_exposes_flattened_managed_recovery_group() {
         let yaml = serde_yaml::from_str::<YamlValue>(
@@ -11074,14 +11673,16 @@ fn patch_mihomo_config_with_settings(settings: &AppSettings) -> Result<(), Strin
     }
     let content = fs::read_to_string(&config_path)
         .map_err(|error| format!("Failed to read Mihomo config for settings apply: {error}"))?;
-    let secret = serde_yaml::from_str::<YamlValue>(&content)
+    let secret = match serde_yaml::from_str::<YamlValue>(&content)
         .ok()
         .and_then(|yaml| {
             yaml.get("secret")
                 .and_then(YamlValue::as_str)
                 .map(ToOwned::to_owned)
-        })
-        .unwrap_or_else(|| format!("badvpn-{}", current_unix_timestamp()));
+        }) {
+        Some(existing) => existing,
+        None => badvpn_common::generate_controller_secret()?,
+    };
     let rendered = overlay_mihomo_config_yaml(
         &content,
         &secret,

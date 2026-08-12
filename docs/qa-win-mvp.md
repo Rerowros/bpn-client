@@ -34,9 +34,28 @@ This document owns manual Windows validation. Keep architecture in `docs/BADVPN_
 [ ] Windows reboot restores intended state or enters safe mode with an actionable message.
 [ ] Occupied TCP/UDP `1053` blocks before winws starts and shows a DNS conflict.
 [ ] External Mihomo/Clash/sing-box/v2rayN TUN client blocks before runtime mutation.
-[ ] `Connected` is not reported when the local Mihomo controller is reachable but the selected main proxy group cannot pass either bounded egress probe.
+[ ] `Connected` requires both a reachable local Mihomo controller and a successful bounded proxy egress probe; probe failure reports Error, does not commit `last-working.yaml`, and keeps the local Mihomo controller available so the user can select and verify another VPN server.
 [ ] Killing the owned Mihomo process changes the state from Connected to Error and stops owned winws.
+[ ] Killing the agent process also tears down owned Mihomo/winws via Job Object kill-on-close.
 [ ] Selecting a Unicode-named proxy group uses the active service runtime catalog, survives reconnect, and survives Smart-to-VPN-only fallback.
+```
+
+## Audit Remediation Scenarios
+
+These cover the runtime review fixes in service-first mode.
+
+```text
+[ ] During a slow Smart connect, Status/RuntimeStatus remains responsive (background Connect).
+[ ] Stop during connect cancels startup and leaves no orphaned BadVpn-owned mihomo/winws.
+[ ] Status polls during connect do not overwrite UI with a stale Idle state.
+[ ] Install/Repair writes `%PROGRAMDATA%\BadVpn\agent\allowed-user.sid`; standard user can open the agent pipe without elevating the GUI.
+[ ] Incomplete AppData components (missing mihomo.exe) cannot wipe existing ProgramData assets (no `/MIR` staging).
+[ ] Agent restart while a session was marked connected enters Safe Mode, cleans owned orphans when possible, and requires manual Connect.
+[ ] Late winws death with GUI closed still falls back to VPN Only via agent watchdog.
+[ ] `auto_profile_fallback` tries alternate Flowseal BAT strategies before Smart degrades to VPN Only.
+[ ] Missing WinDivert/cygwin/fake packet assets degrade Smart to VPN Only before winws spawn.
+[ ] VerifyInstalledAgent / diagnostics redact ProgramData absolute paths (`%PROGRAMDATA%`).
+[ ] Traffic metrics update from Mihomo `/connections` while connected through the agent status path.
 ```
 
 ## Smart Mode
