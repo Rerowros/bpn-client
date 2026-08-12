@@ -34,7 +34,7 @@ This document owns manual Windows validation. Keep architecture in `docs/BADVPN_
 [ ] Windows reboot restores intended state or enters safe mode with an actionable message.
 [ ] Occupied TCP/UDP `1053` blocks before winws starts and shows a DNS conflict.
 [ ] External Mihomo/Clash/sing-box/v2rayN TUN client blocks before runtime mutation.
-[ ] `Connected` requires both a reachable local Mihomo controller and a successful bounded proxy egress probe; probe failure stops owned Mihomo/winws, rolls back the runtime config, and reports Error.
+[ ] `Connected` requires both a reachable local Mihomo controller and a successful bounded proxy egress probe; probe failure reports Error, does not commit `last-working.yaml`, and keeps the local Mihomo controller available so the user can select and verify another VPN server.
 [ ] Killing the owned Mihomo process changes the state from Connected to Error and stops owned winws.
 [ ] Killing the agent process also tears down owned Mihomo/winws via Job Object kill-on-close.
 [ ] Selecting a Unicode-named proxy group uses the active service runtime catalog, survives reconnect, and survives Smart-to-VPN-only fallback.
