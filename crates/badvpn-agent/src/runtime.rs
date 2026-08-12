@@ -839,15 +839,29 @@ impl RuntimeManager {
     }
 
     fn refresh_process_state(&mut self) {
-        self.snapshot.mihomo.state = if self.mihomo.is_running() {
-            RuntimeComponentState::Running
+        let mihomo_running = self.mihomo.is_running();
+        self.snapshot.mihomo = if mihomo_running {
+            RuntimeComponentSnapshot::new(
+                RuntimeComponentState::Running,
+                self.snapshot.mihomo.detail.clone(),
+            )
         } else {
-            RuntimeComponentState::Stopped
+            RuntimeComponentSnapshot::new(
+                RuntimeComponentState::Stopped,
+                stopped_component_detail(&self.snapshot.mihomo, self.mihomo.last_exit_detail()),
+            )
         };
-        self.snapshot.zapret.state = if self.zapret.is_running() {
-            RuntimeComponentState::Running
+        let zapret_running = self.zapret.is_running();
+        self.snapshot.zapret = if zapret_running {
+            RuntimeComponentSnapshot::new(
+                RuntimeComponentState::Running,
+                self.snapshot.zapret.detail.clone(),
+            )
         } else {
-            RuntimeComponentState::Stopped
+            RuntimeComponentSnapshot::new(
+                RuntimeComponentState::Stopped,
+                stopped_component_detail(&self.snapshot.zapret, self.zapret.last_exit_detail()),
+            )
         };
     }
 
@@ -976,7 +990,10 @@ impl RuntimeManager {
         }
         self.snapshot.zapret = RuntimeComponentSnapshot::new(
             RuntimeComponentState::Stopped,
-            Some(MESSAGE.to_string()),
+            Some(match self.zapret.last_exit_detail() {
+                Some(detail) => format!("{MESSAGE} {detail}"),
+                None => MESSAGE.to_string(),
+            }),
         );
     }
 
@@ -986,6 +1003,22 @@ impl RuntimeManager {
             .map(|request| request.settings.mihomo.controller_port)
             .unwrap_or(9090)
     }
+}
+
+fn stopped_component_detail(
+    current: &RuntimeComponentSnapshot,
+    last_exit_detail: Option<&str>,
+) -> Option<String> {
+    last_exit_detail.map(ToOwned::to_owned).or_else(|| {
+        matches!(
+            current.state,
+            RuntimeComponentState::Stopped
+                | RuntimeComponentState::Unhealthy
+                | RuntimeComponentState::Missing
+        )
+        .then(|| current.detail.clone())
+        .flatten()
+    })
 }
 
 fn diagnostic_rule_kind(rule: &str) -> String {
@@ -1234,22 +1267,32 @@ impl Default for ComponentStore {
 #[derive(Debug, Default)]
 struct MihomoManager {
     child: Option<Child>,
+    last_exit_detail: Option<String>,
 }
 
 impl MihomoManager {
     fn is_running(&mut self) -> bool {
         if let Some(child) = &mut self.child {
             match child.try_wait() {
-                Ok(Some(_)) => {
+                Ok(Some(status)) => {
+                    self.last_exit_detail =
+                        Some(format!("Mihomo exited unexpectedly with {status}"));
                     self.child = None;
                     false
                 }
                 Ok(None) => true,
-                Err(_) => false,
+                Err(error) => {
+                    self.last_exit_detail = Some(format!("Mihomo state check failed: {error}"));
+                    false
+                }
             }
         } else {
             false
         }
+    }
+
+    fn last_exit_detail(&self) -> Option<&str> {
+        self.last_exit_detail.as_deref()
     }
 
     fn validate(&self, mihomo_bin: &Path, config_path: &Path, home_dir: &Path) -> Result<()> {
@@ -1342,12 +1385,14 @@ impl MihomoManager {
             .with_context(|| format!("failed to start {}", mihomo_bin.display()))?;
         std::thread::sleep(Duration::from_millis(350));
         if let Some(status) = child.try_wait()? {
+            self.last_exit_detail = Some(format!("Mihomo exited immediately with {status}"));
             tracing::error!(%status, controller_port, "Mihomo exited immediately");
             return Err(anyhow!(
                 "Mihomo exited immediately with {status}; controller port {controller_port}"
             ));
         }
         tracing::info!(pid = child.id(), "Mihomo child started");
+        self.last_exit_detail = None;
         self.child = Some(child);
         Ok(())
     }
@@ -1457,6 +1502,7 @@ impl MihomoManager {
             let _ = child.kill();
             let _ = child.wait();
             tracing::info!("Mihomo child stopped");
+            self.last_exit_detail = None;
         } else {
             tracing::debug!("Mihomo stop skipped; no owned child");
         }
@@ -1490,22 +1536,32 @@ fn join_output_reader(
 #[derive(Debug, Default)]
 struct ZapretManager {
     child: Option<Child>,
+    last_exit_detail: Option<String>,
 }
 
 impl ZapretManager {
     fn is_running(&mut self) -> bool {
         if let Some(child) = &mut self.child {
             match child.try_wait() {
-                Ok(Some(_)) => {
+                Ok(Some(status)) => {
+                    self.last_exit_detail =
+                        Some(format!("winws exited unexpectedly with {status}"));
                     self.child = None;
                     false
                 }
                 Ok(None) => true,
-                Err(_) => false,
+                Err(error) => {
+                    self.last_exit_detail = Some(format!("winws state check failed: {error}"));
+                    false
+                }
             }
         } else {
             false
         }
+    }
+
+    fn last_exit_detail(&self) -> Option<&str> {
+        self.last_exit_detail.as_deref()
     }
 
     fn start(
@@ -1536,12 +1592,14 @@ impl ZapretManager {
             .with_context(|| format!("failed to start {}", winws.display()))?;
         std::thread::sleep(Duration::from_millis(900));
         if let Some(status) = child.try_wait()? {
+            self.last_exit_detail = Some(format!("winws exited immediately with {status}"));
             tracing::error!(%status, "winws exited immediately");
             return Err(anyhow!(
                 "winws exited immediately with {status}; WinDivert may need service elevation or another DPI tool owns the driver"
             ));
         }
         tracing::info!(pid = child.id(), "winws child started");
+        self.last_exit_detail = None;
         self.child = Some(child);
         Ok(format!(
             "winws started with profile={} ipset={} game={}",
@@ -1555,6 +1613,7 @@ impl ZapretManager {
             let _ = child.kill();
             let _ = child.wait();
             tracing::info!("winws child stopped");
+            self.last_exit_detail = None;
         } else {
             tracing::debug!("winws stop skipped; no owned child");
         }
@@ -3278,6 +3337,50 @@ mod tests {
 
         manager.snapshot.effective_mode = RuntimeMode::VpnOnly;
         assert!(!manager.late_zapret_death_requires_fallback());
+    }
+
+    #[test]
+    fn late_zapret_death_keeps_exit_detail_for_ui() {
+        let mut manager = RuntimeManager::new();
+        manager.snapshot.effective_mode = RuntimeMode::Smart;
+        manager.snapshot.mihomo =
+            RuntimeComponentSnapshot::new(RuntimeComponentState::Running, None);
+        manager.zapret.last_exit_detail =
+            Some("winws exited unexpectedly with exit code: 1".to_string());
+
+        manager.record_late_zapret_death_if_needed();
+
+        assert_eq!(
+            manager.snapshot.zapret.state,
+            RuntimeComponentState::Stopped
+        );
+        assert!(manager
+            .snapshot
+            .zapret
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("exit code: 1"));
+    }
+
+    #[test]
+    fn refresh_process_state_preserves_stopped_zapret_detail() {
+        let mut manager = RuntimeManager::new();
+        manager.snapshot.zapret = RuntimeComponentSnapshot::new(
+            RuntimeComponentState::Stopped,
+            Some("zapret is disabled for VPN Only.".to_string()),
+        );
+
+        manager.refresh_process_state();
+
+        assert_eq!(
+            manager.snapshot.zapret.state,
+            RuntimeComponentState::Stopped
+        );
+        assert_eq!(
+            manager.snapshot.zapret.detail.as_deref(),
+            Some("zapret is disabled for VPN Only.")
+        );
     }
 
     #[test]

@@ -924,3 +924,164 @@
     grid-column: auto;
   }
 }
+
+/* Responsive hardening for the fixed Tauri webview: content may scroll inside
+   the active pane, but no page should force the window wider or taller. */
+.workspace.setupMode {
+  background: var(--desktop-bg);
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 320px);
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  padding: 12px;
+}
+
+.setupPane {
+  align-content: start;
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+}
+
+.setupHeader,
+.setupForm,
+.setupReadiness,
+.setupStep,
+.settingsBanner,
+.connectionNotice,
+.policyQuickStats,
+.processPathCounts,
+.nodeMeta {
+  min-width: 0;
+}
+
+.setupStep,
+.connectionNotice {
+  grid-template-columns: auto minmax(0, 1fr) max-content;
+}
+
+.connectionNotice span,
+.diagnosticText,
+.policyWarning span,
+.policyManagedGroup span,
+.detailItem strong,
+.detailItem span {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.pathFilter,
+.policyPathFilter,
+.policySourceFilter,
+.policyQuickStats,
+.nodeMeta,
+.processPathCounts {
+  flex-wrap: wrap;
+  overflow: visible;
+}
+
+.policyTable td,
+.policyTable th,
+.runtimeArtifact pre,
+.logViewer,
+.mono {
+  overflow-wrap: anywhere;
+}
+
+.policyTable {
+  min-width: min(860px, calc(100vw - 120px));
+}
+
+.connectionDetailsGrid,
+.operatorPanels,
+.settingsPanels,
+.policyArtifactGrid,
+.providerGrid,
+.runtimeConfigGrid,
+.advancedOverrideGrid,
+.overrideGrid {
+  min-width: 0;
+}
+
+@media (max-width: 1180px) {
+  .workspace.setupMode {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .workspace.setupMode .dashboardInspector {
+    display: none;
+  }
+}
+
+@media (max-width: 900px) {
+  .setupInputRow,
+  .setupStep,
+  .connectionNotice,
+  .policyRuleLine,
+  .serverGroupHead {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .setupStepAction,
+  .connectionNotice button,
+  .slothSegmentBlock.alignEnd {
+    justify-items: stretch;
+  }
+
+  .subtleButton,
+  .primarySmall,
+  .slothGhostButton,
+  .slothSupportButton,
+  .slothTextButton,
+  .textAction {
+    min-height: 34px;
+    white-space: normal;
+  }
+
+  .statusBar .textAction {
+    min-height: 28px;
+    white-space: nowrap;
+  }
+}
+
+@media (max-height: 720px) {
+  .workspace.dashboardWorkspace,
+  .workspace.pageWorkspace,
+  .workspace.setupMode {
+    padding: 8px;
+  }
+
+  .connectionPane.dashboardPane,
+  .pagePanel,
+  .settingsContent,
+  .setupPane {
+    gap: 8px;
+    padding: 10px;
+  }
+
+  .slothProfileHeader {
+    padding-bottom: 7px;
+  }
+
+  .slothCenterControl {
+    padding: 10px;
+  }
+
+  .slothCenterControl .connectButton {
+    height: 96px;
+    width: 96px;
+  }
+
+  .slothNoticeGrid,
+  .slothStatusGrid,
+  .slothControlRow {
+    gap: 8px;
+  }
+
+  .slothGroupList,
+  .slothNodeList {
+    max-height: 150px;
+  }
+}

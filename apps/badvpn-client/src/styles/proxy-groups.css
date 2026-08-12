@@ -370,3 +370,34 @@
     padding: 8px;
   }
 }
+
+@media (max-width: 900px) {
+  .serverGroupTitle > span {
+    flex-wrap: wrap;
+  }
+
+  .serverGroupHead {
+    grid-template-columns: 36px minmax(0, 1fr) 24px;
+  }
+
+  .nodeRow,
+  .homeNodeButton {
+    min-width: 0;
+  }
+}
+
+@media (max-height: 720px) {
+  .serverDeckList {
+    gap: 8px;
+  }
+
+  .serverGroupHead {
+    min-height: 52px;
+    padding-block: 8px;
+  }
+
+  .serverNodeGrid {
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    padding-block: 8px;
+  }
+}
