@@ -109,5 +109,5 @@ Potential bugs to check separately:
 - [x] `cargo check --workspace`
 - [x] direct TypeScript check: `apps/badvpn-client/node_modules/.bin/tsc.cmd --noEmit`
 - [x] `git diff --check`
-- [ ] `pnpm --dir apps/badvpn-client check` without package-manager lock contention
-- [ ] Manual Windows QA: AppData-only components, ProgramData staging, missing winws, missing Mihomo, external winws, external Mihomo, Smart fallback, VPN Only, stopped agent, agent repair, reboot recovery.
+- [x] `pnpm --dir apps/badvpn-client check` without package-manager lock contention
+- [ ] Manual Windows QA: AppData-only components, ProgramData staging, missing winws, missing Mihomo, external winws, external Mihomo, Smart fallback, VPN Only, stopped agent, agent repair, reboot recovery (see `docs/qa-win-mvp.md` Audit Remediation Scenarios; requires Windows host).
