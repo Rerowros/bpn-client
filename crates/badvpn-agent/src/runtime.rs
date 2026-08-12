@@ -1657,9 +1657,9 @@ impl RuntimeConfigStore {
     fn promote_draft_to_run(&self, draft_path: &Path) -> Result<PathBuf> {
         fs::create_dir_all(&self.root)?;
         let run_path = self.run_path();
-        if run_path.exists() {
-            fs::copy(&run_path, self.last_working_path())?;
-        }
+        // config.yaml is only a candidate until startup and egress verification succeed.
+        // last-working.yaml is updated exclusively by commit_last_working(), so reconnecting
+        // from an egress error cannot rotate the unverified current run into the rollback slot.
         fs::copy(draft_path, &run_path)?;
         Ok(run_path)
     }
@@ -4206,6 +4206,40 @@ mod tests {
         assert_eq!(
             fs::read_to_string(store.run_path()).unwrap(),
             "good: true\n"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reconnect_promotion_does_not_replace_verified_rollback_with_unverified_run() {
+        let root = std::env::temp_dir().join(format!("badvpn-unverified-run-test-{}", now_unix()));
+        let store = RuntimeConfigStore { root: root.clone() };
+
+        let verified_draft = store.write_draft("version: verified\n").unwrap();
+        store.promote_draft_to_run(&verified_draft).unwrap();
+        store.commit_last_working().unwrap();
+
+        // The first replacement starts but fails egress, so it is never committed.
+        let unverified_draft = store.write_draft("version: failed-egress\n").unwrap();
+        store.promote_draft_to_run(&unverified_draft).unwrap();
+        assert_eq!(
+            fs::read_to_string(store.last_working_path()).unwrap(),
+            "version: verified\n"
+        );
+
+        // A reconnect promotes another candidate. If it fails before egress, rollback must
+        // still restore the original verified config, not the failed-egress current run.
+        let reconnect_draft = store.write_draft("version: reconnect-candidate\n").unwrap();
+        store.promote_draft_to_run(&reconnect_draft).unwrap();
+        store.rollback_run().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(store.run_path()).unwrap(),
+            "version: verified\n"
+        );
+        assert_eq!(
+            fs::read_to_string(store.last_working_path()).unwrap(),
+            "version: verified\n"
         );
         let _ = fs::remove_dir_all(root);
     }
