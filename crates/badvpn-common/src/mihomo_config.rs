@@ -1298,6 +1298,89 @@ fn is_safe_provider_fake_ip_filter(value: &str) -> bool {
         || bare == "badvpn.pro"
 }
 
+/// Remove GEOSITE/GEOIP rules when local geodata assets are missing.
+/// Prevents Mihomo `mihomo -t` / startup from downloading GeoSite.dat / GeoIP.dat
+/// via unreachable mirrors (which fails DNS and blocks connect).
+pub fn strip_missing_geodata_rules(
+    yaml: &mut String,
+    geosite_available: bool,
+    geoip_available: bool,
+) -> Result<Vec<String>, String> {
+    if geosite_available && geoip_available {
+        return Ok(Vec::new());
+    }
+
+    let mut value: serde_yaml::Value = serde_yaml::from_str(yaml)
+        .map_err(|error| format!("failed to parse generated Mihomo YAML: {error}"))?;
+    let mut removed_geosite = 0usize;
+    let mut removed_geoip = 0usize;
+
+    if let Some(map) = value.as_mapping_mut() {
+        if let Some(rules) = map
+            .get_mut(serde_yaml::Value::String("rules".to_string()))
+            .and_then(serde_yaml::Value::as_sequence_mut)
+        {
+            rules.retain(|rule| {
+                let Some(text) = rule.as_str() else {
+                    return true;
+                };
+                let normalized = text.trim_start().to_ascii_uppercase();
+                if !geosite_available && normalized.starts_with("GEOSITE,") {
+                    removed_geosite += 1;
+                    return false;
+                }
+                if !geoip_available && normalized.starts_with("GEOIP,") {
+                    removed_geoip += 1;
+                    return false;
+                }
+                true
+            });
+        }
+    }
+
+    let mut messages = Vec::new();
+    if removed_geosite > 0 {
+        messages.push(format!(
+            "Disabled {removed_geosite} GEOSITE provider rules because no local GeoSite.dat asset is installed; this prevents Mihomo startup-time downloads."
+        ));
+    }
+    if removed_geoip > 0 {
+        messages.push(format!(
+            "Disabled {removed_geoip} GEOIP provider rules because no local GeoIP.dat asset is installed; this prevents Mihomo startup-time downloads."
+        ));
+    }
+    if !messages.is_empty() {
+        *yaml = serde_yaml::to_string(&value)
+            .map_err(|error| format!("failed to render Mihomo YAML: {error}"))?;
+    }
+    Ok(messages)
+}
+
+pub fn geodata_asset_exists(home: &std::path::Path, names: &[&str]) -> bool {
+    names.iter().any(|name| {
+        let path = home.join(name);
+        path.is_file()
+            && std::fs::metadata(&path)
+                .map(|metadata| metadata.len() > 0)
+                .unwrap_or(false)
+    }) || std::fs::read_dir(home)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .any(|entry| {
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            names
+                .iter()
+                .any(|name| file_name.eq_ignore_ascii_case(name))
+                && entry
+                    .metadata()
+                    .map(|metadata| metadata.len() > 0)
+                    .unwrap_or(false)
+        })
+}
+
 fn base_config_yaml(secret: &str, options: &MihomoConfigOptions) -> String {
     let mut map = serde_yaml::Mapping::new();
     insert_yaml(
@@ -2022,5 +2105,20 @@ vless://00000000-0000-0000-0000-000000000001@turkey.example.com:443?encryption=n
             .unwrap();
 
         assert_eq!(proxies[0].as_str(), Some("Turkey"));
+    }
+
+    #[test]
+    fn strip_missing_geodata_rules_removes_geosite_when_asset_absent() {
+        let mut yaml = r#"
+rules:
+  - GEOSITE,private,DIRECT
+  - DOMAIN-SUFFIX,example.com,PROXY
+  - MATCH,PROXY
+"#
+        .to_string();
+        let messages = strip_missing_geodata_rules(&mut yaml, false, true).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(!yaml.to_ascii_uppercase().contains("GEOSITE,"));
+        assert!(yaml.contains("DOMAIN-SUFFIX,example.com,PROXY"));
     }
 }

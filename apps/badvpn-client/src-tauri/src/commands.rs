@@ -5,11 +5,12 @@ use crate::settings::{
 use badvpn_common::{
     classify_subscription_failure, decode_header_value, flowseal_exclude_hostlist,
     flowseal_general_hostlist, flowseal_google_hostlist, flowseal_ipset_exclude,
-    generate_mihomo_config_from_subscription_with_options, overlay_mihomo_config_yaml,
-    parse_subscription_userinfo, summarize_subscription_body, zapret_default_hostlist,
-    zapret_default_ipset, zapret_user_placeholder_hostlist, AgentCommand, AgentState, AppPhase,
-    CompiledPolicy, ConnectRequest, ConnectionStatus, DiagnosticSummary, MihomoConfigOptions,
-    RouteMode, RuntimeDiagnosticsSettings, RuntimeGameProfile, RuntimeMode, RuntimeSettings,
+    generate_mihomo_config_from_subscription_with_options, geodata_asset_exists,
+    overlay_mihomo_config_yaml, parse_subscription_userinfo, strip_missing_geodata_rules,
+    summarize_subscription_body, zapret_default_hostlist, zapret_default_ipset,
+    zapret_user_placeholder_hostlist, AgentCommand, AgentState, AppPhase, CompiledPolicy,
+    ConnectRequest, ConnectionStatus, DiagnosticSummary, MihomoConfigOptions, RouteMode,
+    RuntimeDiagnosticsSettings, RuntimeGameProfile, RuntimeMode, RuntimeSettings,
     RuntimeZapretSettings, SubscriptionFormat, SubscriptionState, AGENT_LOCAL_ADDR,
     AGENT_PIPE_NAME,
 };
@@ -1043,6 +1044,17 @@ fn resolve_agent_bin() -> Result<PathBuf, String> {
         if let Some(dir) = current_exe.parent() {
             candidates.extend(exe_names.iter().map(|name| dir.join(name)));
             candidates.extend(agent_resource_bin_candidates(dir, &exe_names));
+            // tauri:dev keeps resources under src-tauri/resources, not next to the debug exe.
+            if let Some(src_tauri) = dir
+                .ancestors()
+                .find(|path| path.file_name().and_then(|name| name.to_str()) == Some("src-tauri"))
+            {
+                candidates.extend(
+                    exe_names
+                        .iter()
+                        .map(|name| src_tauri.join("resources").join("agent").join(name)),
+                );
+            }
         }
     }
     if let Ok(current_dir) = std::env::current_dir() {
@@ -1060,6 +1072,13 @@ fn resolve_agent_bin() -> Result<PathBuf, String> {
             );
             candidates.push(
                 current_dir
+                    .join("src-tauri")
+                    .join("resources")
+                    .join("agent")
+                    .join(exe_name),
+            );
+            candidates.push(
+                current_dir
                     .join("apps")
                     .join("badvpn-client")
                     .join("src-tauri")
@@ -1067,6 +1086,27 @@ fn resolve_agent_bin() -> Result<PathBuf, String> {
                     .join("release")
                     .join(exe_name),
             );
+        }
+        // Walk up to workspace root when cwd is apps/badvpn-client.
+        for ancestor in current_dir.ancestors().take(5) {
+            for exe_name in &exe_names {
+                candidates.push(ancestor.join("target").join("debug").join(exe_name));
+                candidates.push(ancestor.join("target").join("release").join(exe_name));
+                candidates.push(
+                    ancestor
+                        .join("apps")
+                        .join("badvpn-client")
+                        .join("src-tauri")
+                        .join("resources")
+                        .join("agent")
+                        .join(exe_name),
+                );
+            }
+        }
+    }
+    if let Ok(data) = data_dir() {
+        for exe_name in &exe_names {
+            candidates.push(data.join("components").join("agent").join(exe_name));
         }
     }
     if let Some(path) = data_dir()
@@ -7201,10 +7241,17 @@ fn write_mihomo_config_atomically(
     let next_path = config_path.with_file_name("config.yaml.next");
     let backup_path = config_path.with_file_name("config.yaml.last-good");
 
-    fs::write(&next_path, rendered_yaml)
+    let mut yaml = rendered_yaml.to_string();
+    let geosite_available = geodata_asset_exists(parent, &["GeoSite.dat", "geosite.dat"]);
+    let geoip_available = geodata_asset_exists(parent, &["GeoIP.dat", "geoip.dat"]);
+    for message in strip_missing_geodata_rules(&mut yaml, geosite_available, geoip_available)? {
+        log_event("mihomo-config", message);
+    }
+
+    fs::write(&next_path, &yaml)
         .map_err(|error| format!("Failed to write staged Mihomo config: {error}"))?;
 
-    if let Err(error) = validate_mihomo_config_yaml_structure(rendered_yaml) {
+    if let Err(error) = validate_mihomo_config_yaml_structure(&yaml) {
         let _ = fs::remove_file(&next_path);
         log_event(
             "mihomo-config",

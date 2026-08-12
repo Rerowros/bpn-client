@@ -718,10 +718,16 @@ impl RuntimeManager {
         config: &mut RuntimeConfig,
     ) -> Result<()> {
         let home = self.config_store.home_dir();
-        let geosite_available = geodata_asset_exists(home, &["GeoSite.dat", "geosite.dat"]);
-        let geoip_available = geodata_asset_exists(home, &["GeoIP.dat", "geoip.dat"]);
-        let messages =
-            strip_missing_geodata_rules(&mut config.yaml, geosite_available, geoip_available)?;
+        let geosite_available =
+            badvpn_common::geodata_asset_exists(home, &["GeoSite.dat", "geosite.dat"]);
+        let geoip_available =
+            badvpn_common::geodata_asset_exists(home, &["GeoIP.dat", "geoip.dat"]);
+        let messages = badvpn_common::strip_missing_geodata_rules(
+            &mut config.yaml,
+            geosite_available,
+            geoip_available,
+        )
+        .map_err(|error| anyhow!(error))?;
         if !messages.is_empty() {
             sync_policy_after_missing_geodata_strip(
                 &mut config.policy,
@@ -2654,56 +2660,6 @@ fn preflight_failed(
     )
 }
 
-fn strip_missing_geodata_rules(
-    yaml: &mut String,
-    geosite_available: bool,
-    geoip_available: bool,
-) -> Result<Vec<String>> {
-    let mut value: YamlValue =
-        serde_yaml::from_str(yaml).context("failed to parse generated Mihomo YAML")?;
-    let mut removed_geosite = 0usize;
-    let mut removed_geoip = 0usize;
-
-    if let Some(map) = value.as_mapping_mut() {
-        if let Some(rules) = map
-            .get_mut(YamlValue::String("rules".to_string()))
-            .and_then(YamlValue::as_sequence_mut)
-        {
-            rules.retain(|rule| {
-                let Some(text) = rule.as_str() else {
-                    return true;
-                };
-                let normalized = text.trim_start().to_ascii_uppercase();
-                if !geosite_available && normalized.starts_with("GEOSITE,") {
-                    removed_geosite += 1;
-                    return false;
-                }
-                if !geoip_available && normalized.starts_with("GEOIP,") {
-                    removed_geoip += 1;
-                    return false;
-                }
-                true
-            });
-        }
-    }
-
-    let mut messages = Vec::new();
-    if removed_geosite > 0 {
-        messages.push(format!(
-            "Disabled {removed_geosite} GEOSITE provider rules because no local GeoSite.dat asset is installed; this prevents Mihomo startup-time downloads."
-        ));
-    }
-    if removed_geoip > 0 {
-        messages.push(format!(
-            "Disabled {removed_geoip} GEOIP provider rules because no local GeoIP.dat asset is installed; this prevents Mihomo startup-time downloads."
-        ));
-    }
-    if !messages.is_empty() {
-        *yaml = serde_yaml::to_string(&value).context("failed to render Mihomo YAML")?;
-    }
-    Ok(messages)
-}
-
 fn sync_policy_after_missing_geodata_strip(
     policy: &mut CompiledPolicy,
     geosite_available: bool,
@@ -2741,22 +2697,6 @@ fn missing_geodata_target_kind(
 ) -> bool {
     (!geosite_available && kind == PolicyTargetKind::GeoSite)
         || (!geoip_available && kind == PolicyTargetKind::GeoIp)
-}
-
-fn geodata_asset_exists(home: &Path, names: &[&str]) -> bool {
-    names.iter().any(|name| home.join(name).is_file())
-        || fs::read_dir(home)
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| entry.ok())
-            .any(|entry| {
-                let file_name = entry.file_name();
-                let file_name = file_name.to_string_lossy();
-                names
-                    .iter()
-                    .any(|name| file_name.eq_ignore_ascii_case(name))
-            })
 }
 
 fn tcp_port_is_busy(port: u16) -> bool {
