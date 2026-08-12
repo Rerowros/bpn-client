@@ -1784,6 +1784,7 @@ pub struct ProxyCatalog {
 #[derive(Debug, Clone, Serialize)]
 pub struct ProxyGroupView {
     pub name: String,
+    pub api_name: String,
     pub group_type: String,
     pub selected: Option<String>,
     pub nodes: Vec<ProxyNodeView>,
@@ -6236,6 +6237,10 @@ fn local_proxy_catalog() -> Result<Vec<ProxyGroupView>, String> {
     let yaml = serde_yaml::from_str::<YamlValue>(&content)
         .map_err(|error| format!("Failed to parse Mihomo config: {error}"))?;
 
+    proxy_groups_from_yaml(&yaml)
+}
+
+fn proxy_groups_from_yaml(yaml: &YamlValue) -> Result<Vec<ProxyGroupView>, String> {
     let proxy_meta = yaml
         .get("proxies")
         .and_then(YamlValue::as_sequence)
@@ -6266,6 +6271,25 @@ fn local_proxy_catalog() -> Result<Vec<ProxyGroupView>, String> {
                 .collect::<std::collections::BTreeSet<_>>()
         })
         .unwrap_or_default();
+    let group_members = yaml
+        .get("proxy-groups")
+        .and_then(YamlValue::as_sequence)
+        .into_iter()
+        .flatten()
+        .filter_map(|group| {
+            Some((
+                yaml_field(group, "name")?.to_string(),
+                group
+                    .get("proxies")
+                    .and_then(YamlValue::as_sequence)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(YamlValue::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
 
     let groups = yaml
         .get("proxy-groups")
@@ -6274,10 +6298,28 @@ fn local_proxy_catalog() -> Result<Vec<ProxyGroupView>, String> {
             groups
                 .iter()
                 .filter_map(|group| {
-                    let name = yaml_field(group, "name")?.to_string();
-                    if name.starts_with("__BADVPN_") {
-                        return None;
-                    }
+                    let api_name = yaml_field(group, "name")?.to_string();
+                    let name = if api_name.starts_with("__BADVPN_") {
+                        let managed_leaves = group_members.get(&api_name)?;
+                        let recovery_source =
+                            group_members.iter().find_map(|(candidate, members)| {
+                                (!candidate.starts_with("__BADVPN_")
+                                    && !members
+                                        .iter()
+                                        .any(|member| proxy_meta.contains_key(member))
+                                    && nested_group_reaches_any_leaf(
+                                        candidate,
+                                        managed_leaves,
+                                        &group_members,
+                                        &proxy_meta,
+                                        &mut BTreeSet::new(),
+                                    ))
+                                .then_some(candidate)
+                            })?;
+                        format!("{recovery_source} — VPN servers")
+                    } else {
+                        api_name.clone()
+                    };
                     let group_type = yaml_field(group, "type").unwrap_or("select").to_string();
                     let nodes = group
                         .get("proxies")
@@ -6312,6 +6354,7 @@ fn local_proxy_catalog() -> Result<Vec<ProxyGroupView>, String> {
 
                     Some(ProxyGroupView {
                         name,
+                        api_name,
                         group_type,
                         selected: None,
                         nodes,
@@ -6326,6 +6369,33 @@ fn local_proxy_catalog() -> Result<Vec<ProxyGroupView>, String> {
     } else {
         Ok(groups)
     }
+}
+
+fn nested_group_reaches_any_leaf(
+    group: &str,
+    target_leaves: &[String],
+    groups: &BTreeMap<String, Vec<String>>,
+    proxy_meta: &BTreeMap<String, (Option<String>, Option<String>)>,
+    visiting: &mut BTreeSet<String>,
+) -> bool {
+    if !visiting.insert(group.to_string()) {
+        return false;
+    }
+    let reaches = groups.get(group).is_some_and(|members| {
+        members.iter().any(|member| {
+            (proxy_meta.contains_key(member) && target_leaves.contains(member))
+                || (groups.contains_key(member)
+                    && nested_group_reaches_any_leaf(
+                        member,
+                        target_leaves,
+                        groups,
+                        proxy_meta,
+                        visiting,
+                    ))
+        })
+    });
+    visiting.remove(group);
+    reaches
 }
 
 fn validate_proxy_selection(
@@ -6372,7 +6442,7 @@ fn proxy_selection_http_error(status: reqwest::StatusCode, detail: &str) -> Stri
 
 fn merge_proxy_runtime_state(groups: &mut [ProxyGroupView], api: &MihomoProxiesResponse) {
     for group in groups {
-        if let Some(state) = api.proxies.get(&group.name) {
+        if let Some(state) = api.proxies.get(&group.api_name) {
             group.selected = state.now.clone();
         }
 
@@ -10168,6 +10238,58 @@ fn normalize_subscription_profile_description(
 #[cfg(test)]
 mod redaction_tests {
     use super::*;
+
+    #[test]
+    fn nested_provider_catalog_exposes_flattened_managed_recovery_group() {
+        let yaml = serde_yaml::from_str::<YamlValue>(
+            r#"
+proxies:
+  - { name: A, type: vless, server: a.example }
+  - { name: B, type: vless, server: b.example }
+proxy-groups:
+  - { name: AUTO, type: url-test, proxies: [A, B] }
+  - { name: PROXY, type: select, proxies: [AUTO] }
+  - { name: __BADVPN_VPN_ONLY__, type: select, proxies: [A, B] }
+"#,
+        )
+        .unwrap();
+
+        let groups = proxy_groups_from_yaml(&yaml).unwrap();
+        let recovery = groups
+            .iter()
+            .find(|group| group.api_name == "__BADVPN_VPN_ONLY__")
+            .expect("managed recovery group must be exposed");
+        assert_eq!(recovery.name, "PROXY — VPN servers");
+        assert!(!recovery.name.contains("__BADVPN_"));
+        assert_eq!(
+            recovery
+                .nodes
+                .iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>(),
+            ["A", "B"]
+        );
+    }
+
+    #[test]
+    fn simple_provider_catalog_hides_duplicate_managed_group() {
+        let yaml = serde_yaml::from_str::<YamlValue>(
+            r#"
+proxies:
+  - { name: A, type: vless, server: a.example }
+  - { name: B, type: vless, server: b.example }
+proxy-groups:
+  - { name: PROXY, type: select, proxies: [A, B] }
+  - { name: __BADVPN_VPN_ONLY__, type: select, proxies: [A, B] }
+"#,
+        )
+        .unwrap();
+
+        let groups = proxy_groups_from_yaml(&yaml).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "PROXY");
+        assert_eq!(groups[0].api_name, "PROXY");
+    }
 
     #[test]
     fn managed_proxy_persistence_uses_source_group() {

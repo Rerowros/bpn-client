@@ -1646,10 +1646,11 @@ export function App() {
   async function handleSelectProxy(group: string, proxy: string) {
     setCatalogBusy(true);
     try {
+      const displayGroup = catalog?.groups.find((entry) => (entry.api_name ?? entry.name) === group)?.name ?? group;
       const nextCatalog = await selectProxy(group, proxy);
       setCatalog(nextCatalog);
       await runAction(() => getStatus(), false);
-      pushNotification({ tone: "success", title: "Server selected", message: `${proxy} selected for ${group}.` });
+      pushNotification({ tone: "success", title: "Server selected", message: `${proxy} selected for ${displayGroup}.` });
     } catch (error) {
       notifyFromError("Server selection failed", error);
     } finally {
@@ -2125,7 +2126,7 @@ export function App() {
                 {homeNodes.slice(0, 6).map((node) => (
                   <HomeNodeButton
                     key={`${activeHomeGroup?.name}-${node.name}`}
-                    group={activeHomeGroup?.name ?? ""}
+                    group={activeHomeGroup?.api_name ?? activeHomeGroup?.name ?? ""}
                     node={node}
                     selected={node.selected || node.name === activeHomeGroup?.selected || node.name === currentNode}
                     busy={catalogBusy}

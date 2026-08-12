@@ -489,6 +489,7 @@ export interface ProxyCatalog {
 
 export interface ProxyGroupView {
   name: string;
+  api_name?: string;
   group_type: string;
   selected: string | null;
   nodes: ProxyNodeView[];
