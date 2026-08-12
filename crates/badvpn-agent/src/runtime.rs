@@ -10,9 +10,9 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use badvpn_common::{
     generate_mihomo_config_from_subscription_with_options, AgentRuntimeSnapshot, AppRouteMode,
-    CompiledPolicy, ConnectRequest, PolicyTargetKind, PreflightCheck, PreflightSeverity,
-    PreflightStatus, RuntimeComponentSnapshot, RuntimeComponentState, RuntimeGameProfile,
-    RuntimeMode, RuntimePhase, SubscriptionState,
+    CompiledPolicy, ConnectRequest, PolicyPath, PolicySource, PolicyTargetKind, PreflightCheck,
+    PreflightSeverity, PreflightStatus, RuntimeComponentSnapshot, RuntimeComponentState,
+    RuntimeGameProfile, RuntimeMode, RuntimePhase, SubscriptionState,
 };
 use serde_yaml::Value as YamlValue;
 use tokio::time::sleep;
@@ -113,9 +113,7 @@ impl RuntimeManager {
         if self.late_zapret_death_requires_fallback() {
             if let Err(error) = self.fallback_to_vpn_only_after_late_zapret_death().await {
                 tracing::error!(%error, "failed to apply VPN-only fallback after late zapret death");
-                self.set_error(format!(
-                    "Late zapret death fallback failed; Smart DIRECT rules may still be active: {error}"
-                ));
+                self.fail_closed_after_late_zapret_fallback(&error);
             }
         }
         self.record_late_zapret_death_if_needed();
@@ -1165,8 +1163,41 @@ impl RuntimeManager {
         self.handle_late_mihomo_death();
     }
 
-    pub(crate) fn set_error_for_watchdog(&mut self, message: String) {
-        self.set_error(message);
+    pub(crate) fn fail_closed_after_late_zapret_fallback(&mut self, error: &dyn std::fmt::Display) {
+        self.fail_closed_after_late_zapret_fallback_inner(error, true);
+    }
+
+    fn fail_closed_after_late_zapret_fallback_inner(
+        &mut self,
+        error: &dyn std::fmt::Display,
+        clear_desired_state: bool,
+    ) {
+        let mut cleanup_errors = Vec::new();
+        if let Err(stop_error) = self.mihomo.stop() {
+            cleanup_errors.push(format!("Mihomo stop failed: {stop_error}"));
+        }
+        if let Err(stop_error) = self.zapret.stop() {
+            cleanup_errors.push(format!("winws stop failed: {stop_error}"));
+        }
+        if let Err(rollback_error) = self.config_store.rollback_run() {
+            cleanup_errors.push(format!("config rollback failed: {rollback_error}"));
+        }
+        if clear_desired_state {
+            if let Err(state_error) = DesiredRuntimeState::clear_connected() {
+                cleanup_errors.push(format!("desired-state cleanup failed: {state_error}"));
+            }
+        }
+        self.last_metrics = badvpn_common::TrafficMetrics::default();
+        self.snapshot.windivert = RuntimeComponentSnapshot::default();
+        let mut cleanup =
+            "Stopped BadVpn-owned Mihomo and winws to prevent unprotected DIRECT routing."
+                .to_string();
+        if !cleanup_errors.is_empty() {
+            cleanup.push_str(&format!(" Cleanup warnings: {}", cleanup_errors.join("; ")));
+        }
+        self.set_error(format!(
+            "Late zapret death VPN-only fallback failed: {error}. {cleanup}"
+        ));
     }
 
     pub(crate) fn late_zapret_death_requires_fallback(&self) -> bool {
@@ -3131,12 +3162,11 @@ fn append_google_quic_hostlist_args(
     ipset_exclude: &Path,
     bin: &Path,
 ) {
-    // Skip only when a UDP/443 Google branch with fake-quic is already present.
-    let already_has_google_quic = args.iter().any(|arg| {
-        let normalized = arg.replace('\\', "/").to_ascii_lowercase();
-        normalized.contains("dpi-desync-fake-quic=")
-            || normalized.contains("quic_initial_www_google_com.bin")
-    });
+    // A fake-QUIC option in a general/ipset branch does not cover Google hosts.
+    // Skip injection only when one branch combines all three required semantics.
+    let already_has_google_quic = args
+        .split(|arg| arg.eq_ignore_ascii_case("--new"))
+        .any(|branch| google_quic_branch_is_complete(branch, list_google));
     if already_has_google_quic {
         return;
     }
@@ -3153,6 +3183,45 @@ fn append_google_quic_hostlist_args(
     if fake_quic.exists() {
         args.push(format!("--dpi-desync-fake-quic={}", fake_quic.display()));
     }
+}
+
+fn google_quic_branch_is_complete(branch: &[String], list_google: &Path) -> bool {
+    let expected_hostlist = list_google
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let has_google_hostlist = branch.iter().any(|arg| {
+        let normalized = arg.replace('\\', "/").to_ascii_lowercase();
+        normalized.strip_prefix("--hostlist=").is_some_and(|path| {
+            path.trim_matches('"') == expected_hostlist
+                || path.trim_matches('"').ends_with("/list-google.txt")
+                || path.trim_matches('"') == "list-google.txt"
+        })
+    });
+    let has_udp_443 = branch.iter().any(|arg| {
+        arg.to_ascii_lowercase()
+            .strip_prefix("--filter-udp=")
+            .is_some_and(|ports| port_filter_contains(ports, 443))
+    });
+    let has_fake_quic = branch.iter().any(|arg| {
+        let normalized = arg.replace('\\', "/").to_ascii_lowercase();
+        normalized.starts_with("--dpi-desync-fake-quic=")
+    });
+    has_google_hostlist && has_udp_443 && has_fake_quic
+}
+
+fn port_filter_contains(filter: &str, expected: u16) -> bool {
+    filter.split(',').any(|part| {
+        let part = part.trim();
+        if let Some((start, end)) = part.split_once('-') {
+            return start
+                .parse::<u16>()
+                .ok()
+                .is_some_and(|start| start <= expected)
+                && end.parse::<u16>().ok().is_some_and(|end| expected <= end);
+        }
+        part.parse::<u16>().ok() == Some(expected)
+    })
 }
 
 fn write_compiled_zapret_lists(
@@ -3254,7 +3323,10 @@ fn ensure_vpn_only_fallback_policy(policy: &CompiledPolicy) -> Result<()> {
         .map_err(|error| anyhow!("invalid VPN-only fallback policy: {error}"))?;
 
     for rule in &policy.mihomo_rules {
-        if mihomo_rule_has_direct_action(rule) && !is_safety_direct_mihomo_rule(rule) {
+        if mihomo_rule_has_direct_action(rule)
+            && !is_safety_direct_mihomo_rule(rule)
+            && !is_explicit_local_force_direct_rule(policy, rule)
+        {
             return Err(anyhow!(
                 "VPN-only fallback policy contains non-safety DIRECT rule {rule}."
             ));
@@ -3263,6 +3335,27 @@ fn ensure_vpn_only_fallback_policy(policy: &CompiledPolicy) -> Result<()> {
 
     debug_assert_vpn_only_policy(policy);
     Ok(())
+}
+
+fn is_explicit_local_force_direct_rule(policy: &CompiledPolicy, mihomo_rule: &str) -> bool {
+    let fields = mihomo_rule.split(',').map(str::trim).collect::<Vec<_>>();
+    if fields.len() < 3 || !mihomo_rule_has_direct_action(mihomo_rule) {
+        return false;
+    }
+    policy.policy_rules.iter().any(|rule| {
+        if rule.source != PolicySource::LocalUserOverride || rule.path != PolicyPath::DirectSafe {
+            return false;
+        }
+        let expected_kind = match rule.target.kind {
+            PolicyTargetKind::DomainSuffix => "DOMAIN-SUFFIX",
+            PolicyTargetKind::Cidr => "IP-CIDR",
+            PolicyTargetKind::Cidr6 => "IP-CIDR6",
+            PolicyTargetKind::ProcessName => "PROCESS-NAME",
+            _ => return false,
+        };
+        fields[0].eq_ignore_ascii_case(expected_kind)
+            && fields[1].eq_ignore_ascii_case(rule.target.value.trim())
+    })
 }
 
 fn mihomo_rule_has_direct_action(rule: &str) -> bool {
@@ -4343,6 +4436,37 @@ mod architecture_fix_tests {
         assert!(!is_safety_direct_mihomo_rule(
             "DOMAIN-SUFFIX,discord.com,DIRECT"
         ));
+
+        let mut routing = badvpn_common::RoutingPolicySettings::default();
+        routing.force_direct_domains = vec!["custom.example".to_string()];
+        routing.force_direct_cidrs = vec!["203.0.113.0/24".to_string()];
+        routing.force_direct_processes = vec!["custom-game.exe".to_string()];
+        let explicit_overrides = badvpn_common::compile_policy(badvpn_common::PolicyCompileInput {
+            mode: AppRouteMode::VpnOnly,
+            provider_rules: vec!["MATCH,PROXY".to_string()],
+            proxy_groups: vec![badvpn_common::ProxyGroupInfo {
+                name: "PROXY".to_string(),
+                group_type: Some("select".to_string()),
+                proxies: vec!["n1".to_string()],
+            }],
+            proxy_count: 1,
+            routing,
+            runtime_facts: badvpn_common::RuntimeFacts::default(),
+        })
+        .unwrap();
+        ensure_vpn_only_fallback_policy(&explicit_overrides).unwrap();
+        assert!(explicit_overrides
+            .mihomo_rules
+            .iter()
+            .any(|rule| rule == "DOMAIN-SUFFIX,custom.example,DIRECT"));
+        assert!(explicit_overrides
+            .mihomo_rules
+            .iter()
+            .any(|rule| rule == "IP-CIDR,203.0.113.0/24,DIRECT,no-resolve"));
+        assert!(explicit_overrides
+            .mihomo_rules
+            .iter()
+            .any(|rule| rule == "PROCESS-NAME,custom-game.exe,DIRECT"));
     }
 
     #[test]
@@ -4361,7 +4485,7 @@ mod architecture_fix_tests {
     }
 
     #[test]
-    fn append_google_quic_skips_when_fake_quic_already_present() {
+    fn append_google_quic_injects_when_fake_quic_is_only_in_unrelated_branch() {
         let mut args = vec![
             "--filter-udp=443".to_string(),
             "--dpi-desync-fake-quic=C:\\bin\\quic_initial_www_google_com.bin".to_string(),
@@ -4371,7 +4495,67 @@ mod architecture_fix_tests {
         let ipset = PathBuf::from("C:\\lists\\ipset-exclude.txt");
         let bin = PathBuf::from("C:\\bin");
         append_google_quic_hostlist_args(&mut args, &google, &exclude, &ipset, &bin);
-        assert_eq!(args.len(), 2);
+        assert!(args.len() > 2);
+        assert!(args
+            .iter()
+            .any(|arg| arg.replace('\\', "/").ends_with("/list-google.txt")));
+    }
+
+    #[test]
+    fn append_google_quic_skips_complete_dedicated_google_branch() {
+        let google = PathBuf::from("C:\\lists\\list-google.txt");
+        let exclude = PathBuf::from("C:\\lists\\list-exclude.txt");
+        let ipset = PathBuf::from("C:\\lists\\ipset-exclude.txt");
+        let bin = PathBuf::from("C:\\bin");
+        let mut args = vec![
+            "--new".to_string(),
+            "--filter-udp=443".to_string(),
+            format!("--hostlist={}", google.display()),
+            "--dpi-desync-fake-quic=C:\\bin\\quic_initial_www_google_com.bin".to_string(),
+        ];
+        let original = args.clone();
+
+        append_google_quic_hostlist_args(&mut args, &google, &exclude, &ipset, &bin);
+
+        assert_eq!(args, original);
+    }
+
+    #[test]
+    fn watchdog_fallback_failure_stops_runtime_before_entering_error() {
+        let mut manager = RuntimeManager::new();
+        manager.snapshot.phase = RuntimePhase::Running;
+        manager.snapshot.effective_mode = RuntimeMode::Smart;
+        manager.snapshot.mihomo =
+            RuntimeComponentSnapshot::new(RuntimeComponentState::Running, None);
+        manager.snapshot.zapret =
+            RuntimeComponentSnapshot::new(RuntimeComponentState::Stopped, None);
+        manager.snapshot.windivert =
+            RuntimeComponentSnapshot::new(RuntimeComponentState::Running, None);
+
+        manager.fail_closed_after_late_zapret_fallback_inner(
+            &anyhow!("forced fallback failure"),
+            false,
+        );
+
+        assert_eq!(manager.snapshot.phase, RuntimePhase::Error);
+        assert_eq!(
+            manager.snapshot.mihomo.state,
+            RuntimeComponentState::Stopped
+        );
+        assert_eq!(
+            manager.snapshot.zapret.state,
+            RuntimeComponentState::Stopped
+        );
+        assert_eq!(
+            manager.snapshot.windivert.state,
+            RuntimeComponentState::Stopped
+        );
+        assert!(manager
+            .snapshot
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("prevent unprotected DIRECT routing"));
     }
 
     #[test]

@@ -79,9 +79,7 @@ impl AgentController {
                                 %error,
                                 "watchdog failed to apply VPN-only fallback after late zapret death"
                             );
-                            guard.manager.set_error_for_watchdog(format!(
-                                "Late zapret death fallback failed; Smart DIRECT rules may still be active: {error}"
-                            ));
+                            guard.manager.fail_closed_after_late_zapret_fallback(&error);
                         }
                     }
                 }
