@@ -930,15 +930,16 @@ fn apply_selected_proxies(
     }
 
     let mut effective_selections = selected_proxies.clone();
-    // Provider-group selections (e.g. PROXY / Выбор сервера) must also apply to the managed
-    // MATCH group (__BADVPN_VPN_ONLY__) when VPN Only rewrote the final group.
+    // Provider-group selections (e.g. PROXY / Выбор сервера) must also apply to the exact
+    // managed MATCH group that replaced that provider group. Matching only by leaf proxy name
+    // is ambiguous when several provider groups contain the same nodes.
     for managed in &policy.managed_proxy_groups {
         if effective_selections.contains_key(&managed.name) {
             continue;
         }
-        if let Some((_, proxy)) = selected_proxies
-            .iter()
-            .find(|(_, proxy)| managed.proxies.iter().any(|member| member == *proxy))
+        if let Some(proxy) = selected_proxies
+            .get(&managed.source_group)
+            .filter(|proxy| managed.proxies.iter().any(|member| member == *proxy))
         {
             effective_selections.insert(managed.name.clone(), proxy.clone());
         }
@@ -2188,6 +2189,68 @@ rules:
             .unwrap();
         let proxies = group
             .get("proxies")
+            .and_then(serde_yaml::Value::as_sequence)
+            .unwrap();
+
+        assert_eq!(proxies[0].as_str(), Some("Turkey"));
+    }
+
+    #[test]
+    fn vpn_only_managed_group_uses_selection_from_exact_rewritten_source_group() {
+        let body = r#"
+proxies:
+  - name: Germany
+    type: direct
+  - name: Turkey
+    type: direct
+proxy-groups:
+  - name: A Secondary
+    type: select
+    proxies:
+      - Germany
+      - Turkey
+  - name: Primary
+    type: select
+    proxies:
+      - DIRECT
+      - Germany
+      - Turkey
+rules:
+  - MATCH,Primary
+"#;
+        let mut options = MihomoConfigOptions {
+            route_mode: RouteMode::VpnOnly,
+            ..MihomoConfigOptions::default()
+        };
+        options
+            .selected_proxies
+            .insert("A Secondary".to_string(), "Germany".to_string());
+        options
+            .selected_proxies
+            .insert("Primary".to_string(), "Turkey".to_string());
+
+        let generated =
+            generate_mihomo_config_from_subscription_with_options(body, "secret", &options)
+                .unwrap();
+        let managed = generated
+            .policy
+            .managed_proxy_groups
+            .iter()
+            .find(|group| group.name == generated.policy.main_proxy_group)
+            .expect("managed VPN-only group");
+        assert_eq!(managed.source_group, "Primary");
+
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(&generated.yaml).unwrap();
+        let proxies = yaml
+            .get("proxy-groups")
+            .and_then(serde_yaml::Value::as_sequence)
+            .unwrap()
+            .iter()
+            .find(|group| {
+                group.get("name").and_then(serde_yaml::Value::as_str)
+                    == Some(generated.policy.main_proxy_group.as_str())
+            })
+            .and_then(|group| group.get("proxies"))
             .and_then(serde_yaml::Value::as_sequence)
             .unwrap();
 

@@ -1152,76 +1152,80 @@ impl RuntimeManager {
             .json::<serde_json::Value>()
             .await
             .context("failed to decode active Mihomo proxy groups")?;
-        validate_active_proxy_selection(&catalog, group, proxy)?;
-
-        let mut url = reqwest::Url::parse(&format!("{base}/proxies/"))?;
-        url.path_segments_mut()
-            .map_err(|_| anyhow!("Mihomo controller URL cannot contain path segments"))?
-            .pop_if_empty()
-            .push(group);
-        let mut select_request = client.put(url).json(&serde_json::json!({ "name": proxy }));
-        if !secret.is_empty() {
-            select_request = select_request.bearer_auth(&secret);
+        let targets = proxy_selection_targets(&catalog, self.active_policy.as_ref(), group, proxy)?;
+        let mut applied = Vec::new();
+        for target in &targets {
+            if let Err(error) =
+                put_active_proxy_selection(&client, &base, &secret, &target.group, proxy).await
+            {
+                let rollback_errors =
+                    rollback_proxy_selections(&client, &base, &secret, &applied).await;
+                return Err(with_proxy_rollback_detail(error, &rollback_errors));
+            }
+            applied.push(target.clone());
         }
-        let response = select_request
-            .send()
-            .await
-            .context("failed to send Mihomo proxy selection")?;
-        let status = response.status();
-        if !status.is_success() {
-            let detail = response.text().await.unwrap_or_default();
-            let detail = detail.trim().chars().take(512).collect::<String>();
-            return Err(if detail.is_empty() {
-                anyhow!("Mihomo rejected proxy selection with HTTP {status}")
-            } else {
-                anyhow!("Mihomo rejected proxy selection with HTTP {status}: {detail}")
-            });
-        }
-        self.remember_proxy_selection(group, proxy);
-        self.snapshot
-            .diagnostics
-            .push(format!("Selected a new proxy in Mihomo group '{group}'."));
 
         let verify_group = self
             .active_policy
             .as_ref()
             .map(|policy| policy.main_proxy_group.as_str())
+            .filter(|main| targets.iter().any(|target| target.group == *main))
             .unwrap_or(group);
-        match self
+        if let Err(error) = self
             .mihomo
             .verify_proxy_egress(verify_group, controller_port, &secret)
             .await
         {
-            Ok(()) => {
-                if self.snapshot.phase == RuntimePhase::Error {
-                    let desired = self.snapshot.desired_mode;
-                    let effective = self.snapshot.effective_mode;
-                    self.snapshot.phase = runtime_phase_after_connect(desired, effective);
-                    self.snapshot.last_error = None;
-                    self.snapshot.mihomo = RuntimeComponentSnapshot::new(
-                        RuntimeComponentState::Running,
-                        Some(format!("controller 127.0.0.1:{controller_port}")),
-                    );
-                    self.snapshot.diagnostics.push(
-                        "Selected proxy passed egress verification; connection recovered."
-                            .to_string(),
-                    );
-                    if let Err(error) = self.config_store.commit_last_working() {
-                        tracing::warn!(%error, "failed to commit last working config after proxy recovery");
-                    }
-                }
-            }
-            Err(error) => {
-                self.record_invalid_proxy_selection(group, proxy);
-                if let Some(policy) = self.active_policy.clone() {
-                    self.record_invalid_proxy_selections_for_policy(&policy);
-                }
-                self.set_error(format!(
-                    "Selected proxy '{proxy}' in group '{group}' still cannot reach the internet: {error}. Choose another server."
-                ));
+            let rollback_errors =
+                rollback_proxy_selections(&client, &base, &secret, &applied).await;
+            return self.reject_proxy_selection(&targets, group, proxy, error, &rollback_errors);
+        }
+
+        self.remember_proxy_selection(group, proxy);
+        self.snapshot
+            .diagnostics
+            .push(format!("Selected a new proxy in Mihomo group '{group}'."));
+        if self.snapshot.phase == RuntimePhase::Error {
+            let desired = self.snapshot.desired_mode;
+            let effective = self.snapshot.effective_mode;
+            self.snapshot.phase = runtime_phase_after_connect(desired, effective);
+            self.snapshot.last_error = None;
+            self.snapshot.mihomo = RuntimeComponentSnapshot::new(
+                RuntimeComponentState::Running,
+                Some(format!("controller 127.0.0.1:{controller_port}")),
+            );
+            self.snapshot.diagnostics.push(
+                "Selected proxy passed egress verification; connection recovered.".to_string(),
+            );
+            if let Err(error) = self.config_store.commit_last_working() {
+                tracing::warn!(%error, "failed to commit last working config after proxy recovery");
             }
         }
         Ok(self.snapshot.clone())
+    }
+
+    fn reject_proxy_selection(
+        &mut self,
+        targets: &[ActiveProxySelectionTarget],
+        group: &str,
+        proxy: &str,
+        error: anyhow::Error,
+        rollback_errors: &[String],
+    ) -> Result<AgentRuntimeSnapshot> {
+        for target in targets {
+            self.record_invalid_proxy_selection(&target.group, proxy);
+        }
+        let rollback_status = if rollback_errors.is_empty() {
+            "The previous live selection was restored."
+        } else {
+            "Not every previous live selection could be restored."
+        };
+        let message = format!(
+            "Selected proxy '{proxy}' in group '{group}' cannot reach the internet: {error}. {rollback_status} Choose another server."
+        );
+        let selection_error = with_proxy_rollback_detail(anyhow!(message), rollback_errors);
+        self.set_error(selection_error.to_string());
+        Err(selection_error)
     }
 
     fn remember_proxy_selection(&mut self, group: &str, proxy: &str) {
@@ -1240,6 +1244,7 @@ impl RuntimeManager {
                     .iter()
                     .filter(|managed| {
                         managed.name != group
+                            && managed.source_group == group
                             && managed.proxies.iter().any(|member| member == proxy)
                     })
                     .map(|managed| managed.name.clone())
@@ -1328,6 +1333,126 @@ impl RuntimeManager {
         for (group, proxy) in to_invalidate {
             self.record_invalid_proxy_selection(&group, &proxy);
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveProxySelectionTarget {
+    group: String,
+    previous_proxy: String,
+}
+
+fn proxy_selection_targets(
+    catalog: &serde_json::Value,
+    policy: Option<&CompiledPolicy>,
+    group: &str,
+    proxy: &str,
+) -> Result<Vec<ActiveProxySelectionTarget>> {
+    let mut groups = vec![group.to_string()];
+    if let Some(policy) = policy {
+        for managed in &policy.managed_proxy_groups {
+            if managed.source_group != group || managed.name == group {
+                continue;
+            }
+            if !managed.proxies.iter().any(|member| member == proxy) {
+                return Err(anyhow!(
+                    "Proxy '{proxy}' from group '{group}' cannot be applied to managed VPN selector '{}'; choose a concrete VPN server",
+                    managed.name
+                ));
+            }
+            groups.push(managed.name.clone());
+        }
+    }
+
+    groups
+        .into_iter()
+        .map(|target_group| {
+            validate_active_proxy_selection(catalog, &target_group, proxy)?;
+            let previous_proxy = active_proxy_selection(catalog, &target_group)?;
+            Ok(ActiveProxySelectionTarget {
+                group: target_group,
+                previous_proxy,
+            })
+        })
+        .collect()
+}
+
+fn active_proxy_selection(catalog: &serde_json::Value, group: &str) -> Result<String> {
+    catalog
+        .get("proxies")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|proxies| proxies.get(group))
+        .and_then(|state| state.get("now"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|selection| !selection.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            anyhow!(
+                "Active Mihomo group '{group}' did not report its current selection; refusing a change that cannot be rolled back"
+            )
+        })
+}
+
+async fn put_active_proxy_selection(
+    client: &reqwest::Client,
+    base: &str,
+    secret: &str,
+    group: &str,
+    proxy: &str,
+) -> Result<()> {
+    let mut url = reqwest::Url::parse(&format!("{base}/proxies/"))?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow!("Mihomo controller URL cannot contain path segments"))?
+        .pop_if_empty()
+        .push(group);
+    let mut request = client.put(url).json(&serde_json::json!({ "name": proxy }));
+    if !secret.is_empty() {
+        request = request.bearer_auth(secret);
+    }
+    let response = request
+        .send()
+        .await
+        .with_context(|| format!("failed to select proxy in active Mihomo group '{group}'"))?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let detail = response.text().await.unwrap_or_default();
+    let detail = detail.trim().chars().take(512).collect::<String>();
+    Err(if detail.is_empty() {
+        anyhow!("Mihomo rejected proxy selection for group '{group}' with HTTP {status}")
+    } else {
+        anyhow!("Mihomo rejected proxy selection for group '{group}' with HTTP {status}: {detail}")
+    })
+}
+
+async fn rollback_proxy_selections(
+    client: &reqwest::Client,
+    base: &str,
+    secret: &str,
+    applied: &[ActiveProxySelectionTarget],
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for target in applied.iter().rev() {
+        if let Err(error) =
+            put_active_proxy_selection(client, base, secret, &target.group, &target.previous_proxy)
+                .await
+        {
+            tracing::error!(group = %target.group, %error, "failed to roll back Mihomo proxy selection");
+            errors.push(format!("{}: {error}", target.group));
+        }
+    }
+    errors
+}
+
+fn with_proxy_rollback_detail(error: anyhow::Error, rollback_errors: &[String]) -> anyhow::Error {
+    if rollback_errors.is_empty() {
+        error
+    } else {
+        anyhow!(
+            "{error} Live proxy rollback also failed for {}",
+            rollback_errors.join("; ")
+        )
     }
 }
 
@@ -3959,6 +4084,75 @@ mod tests {
     }
 
     #[test]
+    fn source_proxy_selection_targets_exact_live_managed_group() {
+        let catalog = serde_json::json!({
+            "proxies": {
+                "A Secondary": {
+                    "type": "Selector",
+                    "all": ["Germany", "Turkey"],
+                    "now": "Germany"
+                },
+                "Primary": {
+                    "type": "Selector",
+                    "all": ["Germany", "Turkey"],
+                    "now": "Germany"
+                },
+                "__BADVPN_VPN_ONLY__": {
+                    "type": "Selector",
+                    "all": ["Germany", "Turkey"],
+                    "now": "Germany"
+                }
+            }
+        });
+        let policy = CompiledPolicy {
+            mode: AppRouteMode::VpnOnly,
+            mihomo_rules: vec!["MATCH,__BADVPN_VPN_ONLY__".to_string()],
+            zapret_hostlist: Vec::new(),
+            zapret_hostlist_exclude: Vec::new(),
+            zapret_ipset: Vec::new(),
+            zapret_ipset_exclude: Vec::new(),
+            dns_nameserver_policy: Vec::new(),
+            diagnostics_expectations: Vec::new(),
+            diagnostics_messages: Vec::new(),
+            suppressed_rules: Vec::new(),
+            main_proxy_group: "__BADVPN_VPN_ONLY__".to_string(),
+            policy_rules: Vec::new(),
+            should_create_canonical_proxy_group: false,
+            managed_proxy_groups: vec![ManagedProxyGroup {
+                name: "__BADVPN_VPN_ONLY__".to_string(),
+                source_group: "Primary".to_string(),
+                proxies: vec!["Germany".to_string(), "Turkey".to_string()],
+            }],
+        };
+
+        let secondary =
+            proxy_selection_targets(&catalog, Some(&policy), "A Secondary", "Turkey").unwrap();
+        assert_eq!(
+            secondary,
+            vec![ActiveProxySelectionTarget {
+                group: "A Secondary".to_string(),
+                previous_proxy: "Germany".to_string(),
+            }]
+        );
+
+        let primary =
+            proxy_selection_targets(&catalog, Some(&policy), "Primary", "Turkey").unwrap();
+        assert_eq!(
+            primary,
+            vec![
+                ActiveProxySelectionTarget {
+                    group: "Primary".to_string(),
+                    previous_proxy: "Germany".to_string(),
+                },
+                ActiveProxySelectionTarget {
+                    group: "__BADVPN_VPN_ONLY__".to_string(),
+                    previous_proxy: "Germany".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn proxy_delay_url_encodes_unicode_group_as_one_path_segment() {
         let url = mihomo_proxy_delay_url(
             9090,
@@ -4286,6 +4480,7 @@ start "zapret: general (ALT9)" /min "%BIN%winws.exe" --wf-tcp=80,443,%GameFilter
             should_create_canonical_proxy_group: false,
             managed_proxy_groups: vec![ManagedProxyGroup {
                 name: "__BADVPN_VPN_ONLY__".to_string(),
+                source_group: "PROXY".to_string(),
                 proxies: vec!["Backup node".to_string(), "Germany".to_string()],
             }],
         });
@@ -4327,6 +4522,41 @@ start "zapret: general (ALT9)" /min "%BIN%winws.exe" --wf-tcp=80,443,%GameFilter
         let mut selected = request.selected_proxies.clone();
         manager.strip_invalid_proxy_selections(&mut selected);
         assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn failed_proxy_egress_returns_error_and_does_not_persist_dead_selection() {
+        let mut manager = RuntimeManager::new();
+        let mut request = test_request();
+        request
+            .selected_proxies
+            .insert("PROXY".to_string(), "Dead node".to_string());
+        request
+            .selected_proxies
+            .insert("__BADVPN_VPN_ONLY__".to_string(), "Dead node".to_string());
+        manager.last_request = Some(request);
+        let targets = vec![
+            ActiveProxySelectionTarget {
+                group: "PROXY".to_string(),
+                previous_proxy: "Working node".to_string(),
+            },
+            ActiveProxySelectionTarget {
+                group: "__BADVPN_VPN_ONLY__".to_string(),
+                previous_proxy: "Working node".to_string(),
+            },
+        ];
+
+        let error = manager
+            .reject_proxy_selection(&targets, "PROXY", "Dead node", anyhow!("probe failed"), &[])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("cannot reach the internet"));
+        assert!(error.contains("previous live selection was restored"));
+        let selected = &manager.last_request.as_ref().unwrap().selected_proxies;
+        assert!(!selected.contains_key("PROXY"));
+        assert!(!selected.contains_key("__BADVPN_VPN_ONLY__"));
+        assert_eq!(manager.snapshot.phase, RuntimePhase::Error);
     }
 
     #[test]
