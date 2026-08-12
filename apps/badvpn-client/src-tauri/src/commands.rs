@@ -5832,8 +5832,21 @@ fn stage_runtime_assets_powershell() -> Result<String, String> {
         r#"$sourceComponents = '{source_components}'
 $targetComponents = '{target_components}'
 if (Test-Path -LiteralPath $sourceComponents) {{
+  $mihomoCandidates = @(
+    (Join-Path $sourceComponents 'mihomo.exe'),
+    (Join-Path $sourceComponents 'mihomo\mihomo.exe')
+  )
+  $hasMihomo = $false
+  foreach ($candidate in $mihomoCandidates) {{
+    if (Test-Path -LiteralPath $candidate) {{ $hasMihomo = $true; break }}
+  }}
+  if (-not $hasMihomo) {{
+    throw "Refusing ProgramData staging because source components are incomplete (mihomo.exe missing)."
+  }}
   New-Item -ItemType Directory -Path $targetComponents -Force | Out-Null
-  robocopy $sourceComponents $targetComponents /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
+  # /E copies recursively without deleting destination files that are absent from source.
+  # Never use /MIR here: an incomplete AppData tree must not wipe ProgramData assets.
+  robocopy $sourceComponents $targetComponents /E /XO /NFL /NDL /NJH /NJS /NP | Out-Null
   if ($LASTEXITCODE -gt 7) {{ throw "component staging failed with robocopy exit code $LASTEXITCODE" }}
   $global:LASTEXITCODE = 0
 }}
@@ -5841,7 +5854,7 @@ $sourceLists = '{source_lists}'
 $targetLists = '{target_lists}'
 if (Test-Path -LiteralPath $sourceLists) {{
   New-Item -ItemType Directory -Path $targetLists -Force | Out-Null
-  robocopy $sourceLists $targetLists /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
+  robocopy $sourceLists $targetLists /E /XO /NFL /NDL /NJH /NJS /NP | Out-Null
   if ($LASTEXITCODE -gt 7) {{ throw "Flowseal list staging failed with robocopy exit code $LASTEXITCODE" }}
   $global:LASTEXITCODE = 0
 }}

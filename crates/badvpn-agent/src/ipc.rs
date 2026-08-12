@@ -50,6 +50,7 @@ async fn serve_agent_tcp_ipc(shutdown: Arc<AtomicBool>) -> anyhow::Result<()> {
         .set_nonblocking(true)
         .context("failed to switch BadVpn agent IPC listener to non-blocking mode")?;
     let mut controller = AgentController::default();
+    controller.start_background_watchdog();
     tracing::info!(addr = AGENT_LOCAL_ADDR, "BadVpn agent IPC server started");
 
     while !shutdown.load(Ordering::SeqCst) {
@@ -149,6 +150,7 @@ async fn serve_agent_named_pipe_ipc(shutdown: Arc<AtomicBool>) -> anyhow::Result
 
     const BUFFER_SIZE: u32 = 64 * 1024;
     let mut controller = AgentController::default();
+    controller.start_background_watchdog();
     tracing::info!(
         pipe = PIPE_NAME,
         "BadVpn agent named pipe IPC server started"

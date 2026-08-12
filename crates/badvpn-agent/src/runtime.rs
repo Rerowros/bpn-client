@@ -1015,13 +1015,25 @@ impl RuntimeManager {
         };
     }
 
-    fn late_zapret_death_requires_fallback(&self) -> bool {
+    pub(crate) fn refresh_process_state_for_watchdog(&mut self) {
+        self.refresh_process_state();
+    }
+
+    pub(crate) fn handle_late_mihomo_death_for_watchdog(&mut self) {
+        self.handle_late_mihomo_death();
+    }
+
+    pub(crate) fn set_error_for_watchdog(&mut self, message: String) {
+        self.set_error(message);
+    }
+
+    pub(crate) fn late_zapret_death_requires_fallback(&self) -> bool {
         self.snapshot.effective_mode == RuntimeMode::Smart
             && self.snapshot.mihomo.state == RuntimeComponentState::Running
             && self.snapshot.zapret.state != RuntimeComponentState::Running
     }
 
-    async fn fallback_to_vpn_only_after_late_zapret_death(&mut self) -> Result<()> {
+    pub(crate) async fn fallback_to_vpn_only_after_late_zapret_death(&mut self) -> Result<()> {
         let request = self
             .last_request
             .clone()
@@ -1454,7 +1466,6 @@ impl Default for RuntimeConfigStore {
 #[derive(Debug, Clone)]
 struct ComponentStore {
     root: PathBuf,
-    appdata_fallback: Option<PathBuf>,
 }
 
 impl ComponentStore {
@@ -1524,24 +1535,16 @@ impl ComponentStore {
         let candidate = parts
             .iter()
             .fold(self.root.clone(), |path, part| path.join(part));
-        if candidate.exists() {
-            return Some(candidate);
-        }
-        let fallback = self.appdata_fallback.as_ref()?;
-        let candidate = parts
-            .iter()
-            .fold(fallback.clone(), |path, part| path.join(part));
         candidate.exists().then_some(candidate)
     }
 }
 
 impl Default for ComponentStore {
     fn default() -> Self {
-        let root = runtime_root_dir().join("components");
-        let appdata_fallback = appdata_root_dir().map(|path| path.join("components"));
         Self {
-            root,
-            appdata_fallback,
+            // Service-owned ProgramData (or BADVPN_AGENT_DATA_DIR). Do not fall back to
+            // %APPDATA%: under LocalSystem that resolves to the wrong profile.
+            root: runtime_root_dir().join("components"),
         }
     }
 }
@@ -4038,10 +4041,7 @@ start "zapret: general (ALT9)" /min "%BIN%winws.exe" --wf-tcp=80,443,%GameFilter
 "#,
         )
         .unwrap();
-        let store = ComponentStore {
-            root: components,
-            appdata_fallback: None,
-        };
+        let store = ComponentStore { root: components };
         let settings = RuntimeZapretSettings {
             strategy: "alt9".to_string(),
             game_filter: "tcp_udp".to_string(),
@@ -4199,7 +4199,6 @@ start "zapret: general (ALT9)" /min "%BIN%winws.exe" --wf-tcp=80,443,%GameFilter
         let components = root.join("components");
         let store = ComponentStore {
             root: components.clone(),
-            appdata_fallback: None,
         };
         let mut routing = RoutingPolicySettings::default();
         routing.force_zapret_cidrs = vec!["203.0.113.0/24".to_string()];
@@ -4295,7 +4294,6 @@ start "zapret: general (ALT9)" /min "%BIN%winws.exe" --wf-tcp=80,443,%GameFilter
         let components = root.join("components");
         let store = ComponentStore {
             root: components.clone(),
-            appdata_fallback: None,
         };
         let policy = compile_policy(PolicyCompileInput {
             mode: AppRouteMode::VpnOnly,

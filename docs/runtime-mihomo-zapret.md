@@ -55,8 +55,11 @@ Preflight should cover mixed/controller ports, DNS port `1053` TCP/UDP, managed 
 - Service runtime assets/configs/logs: `%PROGRAMDATA%\BadVpn`.
 - The Tauri installer bundles the current `badvpn-agent.exe` under application resources so Install / Repair can stage it into `%PROGRAMDATA%\BadVpn\agent`.
 - Agent service install/repair stages the current BPN Client runtime assets into ProgramData.
+- ProgramData staging copies with robocopy `/E` (never `/MIR`) and refuses to stage when the AppData source is missing `mihomo.exe`, so incomplete downloads cannot wipe existing service assets.
 - Mihomo and zapret/winws are not bundled into the installer. On first connect or explicit runtime update, the GUI downloads them into user-scoped components, then stages verified assets into ProgramData for `badvpn-agent`.
 - Runtime update/repair should eventually download, verify, stage, swap, smoke-check, and rollback entirely inside `badvpn-agent`.
+- `badvpn-agent` resolves components only under ProgramData / `BADVPN_AGENT_DATA_DIR` (plus explicit `BADVPN_MIHOMO_BIN` / `BADVPN_WINWS_BIN` overrides). It does not fall back to `%APPDATA%`.
+- A background agent watchdog polls late winws death and applies VPN Only fallback even when the GUI is closed.
 
 ## Logs And Secrets
 
@@ -87,7 +90,5 @@ Checks include:
 
 - Move final component update download/verify/swap ownership from GUI-assisted staging into `badvpn-agent`.
 - Finish reboot recovery and reattach-to-existing-owned-process logic.
-- Move late winws death detection from status polling into an agent-owned background watchdog. Status polling already triggers VPN-only fallback, but recovery must not depend on the GUI being open.
 - Expand `RunDiagnostics` beyond the current component snapshot into WinDivert/BFE, route, DNS, controller traffic, and HTTPS checks.
-- Replace robocopy `/MIR` staging with verify-then-swap so incomplete AppData sources cannot wipe ProgramData assets.
 - Include `proxy-providers` endpoint hosts in runtime facts / zapret excludes.

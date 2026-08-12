@@ -52,6 +52,55 @@ impl Default for AgentController {
 }
 
 impl AgentController {
+    pub fn start_background_watchdog(&self) {
+        let inner = Arc::clone(&self.inner);
+        let connecting = Arc::clone(&self.connecting);
+        let progress = Arc::clone(&self.progress);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                ticker.tick().await;
+                if connecting.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let mut guard = inner.lock().await;
+                guard.manager.refresh_process_state_for_watchdog();
+                guard.manager.handle_late_mihomo_death_for_watchdog();
+                if guard.manager.late_zapret_death_requires_fallback() {
+                    match guard
+                        .manager
+                        .fallback_to_vpn_only_after_late_zapret_death()
+                        .await
+                    {
+                        Ok(()) => {
+                            tracing::warn!(
+                                "watchdog applied VPN-only fallback after late zapret death"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                %error,
+                                "watchdog failed to apply VPN-only fallback after late zapret death"
+                            );
+                            guard.manager.set_error_for_watchdog(format!(
+                                "Late zapret death fallback failed; Smart DIRECT rules may still be active: {error}"
+                            ));
+                        }
+                    }
+                }
+                let snapshot = guard.manager.snapshot();
+                guard.runtime = AgentRuntimeState::from_agent_state(snapshot_to_agent_state(
+                    &snapshot,
+                    guard.runtime.subscription.clone(),
+                    guard.manager.remembered_selected_proxy(),
+                ));
+                if let Ok(mut slot) = progress.write() {
+                    *slot = guard.runtime.snapshot();
+                }
+            }
+        });
+    }
+
     pub async fn handle(&mut self, command: AgentCommand) -> BadVpnResult<AgentState> {
         tracing::debug!(command = ?command_kind(&command), "agent command received");
         match command {
