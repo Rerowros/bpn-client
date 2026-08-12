@@ -11,7 +11,8 @@ import type { PolicyPathFilter } from "../policyView";
 import type { LocalOverrideRoute, LocalOverrideTargetKind } from "../localOverrides";
 import type { PolicyRuleView, PolicySummaryResponse } from "../services/agentClient";
 import { compareText, formatRouteMode } from "../lib/format";
-import { EmptyList } from "../ui/primitives";
+import { formatPolicyPathLabel, ROUTE_PATH_LABELS } from "../lib/routeLabels";
+import { EmptyList, TruncatedText } from "../ui/primitives";
 
 export function PolicyPage({
   policySummary,
@@ -96,11 +97,11 @@ export function PolicyPage({
             <div className="policySummaryCards">
               <div className="policySummaryCard">
                 <span className="policySummaryLabel">Mode</span>
-                <strong className="policySummaryValue">{policy.mode}</strong>
+                <strong className="policySummaryValue">{formatRouteMode(policy.mode)}</strong>
               </div>
               <div className="policySummaryCard">
                 <span className="policySummaryLabel">Main proxy group</span>
-                <strong className="policySummaryValue">{policy.main_proxy_group || "—"}</strong>
+                <TruncatedText text={policy.main_proxy_group || "—"} className="policySummaryValue" lines={2} />
               </div>
               <div className="policySummaryCard">
                 <span className="policySummaryLabel">Rules</span>
@@ -124,7 +125,7 @@ export function PolicyPage({
               </div>
               <div className="policySummaryCard span2">
                 <span className="policySummaryLabel">Final rule</span>
-                <strong className="policySummaryValue mono">{policy.final_rule || "—"}</strong>
+                <TruncatedText text={policy.final_rule || "—"} className="policySummaryValue mono" lines={2} />
               </div>
             </div>
 
@@ -177,7 +178,7 @@ export function PolicyPage({
                   .filter(([path, count]) => path !== "all" && count > 0)
                   .map(([path, count]) => (
                     <span key={path} className={path}>
-                      {formatRouteMode(path)} {count}
+                      {path === "reject" ? ROUTE_PATH_LABELS.reject : ROUTE_PATH_LABELS[path as keyof typeof ROUTE_PATH_LABELS]} {count}
                     </span>
                   ))}
                 {sourceCounts.map(([source, count]) => (
@@ -217,8 +218,8 @@ export function PolicyPage({
                             <td className="mono">{rule.target_kind}</td>
                             <td className="mono wrap">{rule.target_value}</td>
                             <td>
-                              <span className={`policyPathBadge ${policyPathTone(rule.path)}`}>
-                                {rule.path}
+                              <span className={`policyPathBadge ${policyPathTone(rule.path)}`} title={rule.path}>
+                                {formatPolicyPathLabel(rule.path)}
                               </span>
                             </td>
                             <td>{rule.source}</td>
@@ -325,7 +326,11 @@ export function PolicyPage({
                       {policy.diagnostics_expectations.map((exp, index) => (
                         <tr key={index}>
                           <td className="mono">{exp.target}</td>
-                          <td>{exp.expected_path}</td>
+                          <td>
+                            <span className={`policyPathBadge ${policyPathTone(exp.expected_path)}`} title={exp.expected_path}>
+                              {formatPolicyPathLabel(exp.expected_path)}
+                            </span>
+                          </td>
                           <td className="mono">{exp.expected_mihomo_action}</td>
                           <td>{exp.expected_zapret ? "Yes" : "—"}</td>
                           <td>{exp.source}</td>

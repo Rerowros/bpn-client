@@ -53,6 +53,7 @@ import {
 } from "./policyView";
 import type { PolicyPathFilter } from "./policyView";
 import { AppNotification, NotificationCenter, NotificationTone } from "./ui/NotificationCenter";
+import { SettingsDisclosure, SettingsRow } from "./ui/primitives";
 import {
   AgentState,
   AppSettings,
@@ -386,6 +387,7 @@ export function App() {
   const [progressNow, setProgressNow] = useState(() => Date.now());
   const [showConnectionDetails, setShowConnectionDetails] = useState(false);
   const [connectionFailureStage, setConnectionFailureStage] = useState<string | null>(null);
+  const [connectReadinessPrompt, setConnectReadinessPrompt] = useState(false);
   const [trafficSamples, setTrafficSamples] = useState<TrafficSample[]>([]);
 
   function pushNotification({
@@ -682,35 +684,30 @@ export function App() {
 
   async function handlePrimaryConnectionAction() {
     const action = isConnected ? "disconnect" : "connect";
-    if (action === "connect" && agentService && !agentService.installed) {
-      const message = "badvpn-agent is not installed. Install or repair the service before connecting.";
-      setShowConnectionDetails(true);
-      setConnectionFailureStage("Agent");
-      setState((current) => ({
-        ...current,
-        phase: "ready",
-        connection: {
-          ...current.connection,
-          status: "idle",
-        },
-        diagnostics: {
-          ...current.diagnostics,
-          message,
-        },
-        last_error: message,
-      }));
-      pushNotification({
-        tone: "warning",
-        title: "Agent setup required",
-        message,
-        actionLabel: "Install",
-        action: () => {
-          void handleInstallAgentService();
-        },
-        autoDismiss: false,
-      });
-      return;
+    if (action === "connect") {
+      const readinessIssue = getConnectReadinessIssue(agentService, runtimeReadiness);
+      if (readinessIssue) {
+        setConnectReadinessPrompt(true);
+        setView("overview");
+        setShowConnectionDetails(true);
+        setConnectionFailureStage(readinessIssue.stage);
+        setState((current) => ({
+          ...current,
+          phase: "ready",
+          connection: {
+            ...current.connection,
+            status: "idle",
+          },
+          diagnostics: {
+            ...current.diagnostics,
+            message: readinessIssue.message,
+          },
+          last_error: readinessIssue.message,
+        }));
+        return;
+      }
     }
+    setConnectReadinessPrompt(false);
     const attempt = { action, startedAt: Date.now() } satisfies ConnectionAttempt;
     setConnectionAttempt(attempt);
     setProgressNow(Date.now());
@@ -1052,6 +1049,18 @@ export function App() {
       pushNotification({ tone: "success", title: "Agent service updated", message: status.message });
       await refreshRuntimeReadiness(false);
       await runAction(() => getStatus(), false);
+      if (connectReadinessPrompt && status.ipc_ready) {
+        setConnectReadinessPrompt(false);
+        setConnectionFailureStage(null);
+        setState((current) => ({
+          ...current,
+          last_error: null,
+          diagnostics: {
+            ...current.diagnostics,
+            message: "Agent ready. Press Connect to start VPN.",
+          },
+        }));
+      }
     } catch (error) {
       notifyFromError("Agent service failed", error);
     } finally {
@@ -1924,25 +1933,36 @@ export function App() {
 
             <div className="homeAlertStack">
               <ConnectionProgressView progress={connectionProgress} />
-              {!isConnected && hasSubscription && (!agentReady || (runtimeReadiness && !runtimeReadiness.components_ready)) ? (
-                <div className="connectionNotice warning">
+              {connectReadinessPrompt || (!isConnected && hasSubscription && (!agentReady || (runtimeReadiness && !runtimeReadiness.components_ready))) ? (
+                <div className="connectionNotice warning readinessNotice">
                   <AlertTriangle size={16} aria-hidden="true" />
                   <span>
-                    {!agentReady
-                      ? agentService?.installed
-                        ? agentService.message
-                        : "badvpn-agent must be installed once before the GUI can start Mihomo and zapret."
-                      : runtimeReadiness?.message}
+                    {connectReadinessPrompt && state.last_error
+                      ? state.last_error
+                      : !agentReady
+                        ? agentService?.installed
+                          ? agentService.message || "badvpn-agent is installed but not reachable."
+                          : "badvpn-agent must be installed once before the GUI can start Mihomo and zapret."
+                        : runtimeReadiness?.message || "Runtime components are not prepared yet."}
                   </span>
-                  {!agentReady ? (
-                    <button type="button" onClick={() => void handleInstallAgentService()} disabled={agentServiceBusy}>
-                      Repair
-                    </button>
-                  ) : (
-                    <button type="button" onClick={() => void handleRuntimeUpdate()} disabled={updateBusy}>
-                      Prepare
-                    </button>
-                  )}
+                  <div className="buttonRow compactActions">
+                    {!agentReady ? (
+                      <button className="subtleButton" type="button" onClick={() => void handleInstallAgentService()} disabled={agentServiceBusy}>
+                        <Shield size={15} aria-hidden="true" />
+                        Install / repair agent
+                      </button>
+                    ) : runtimeReadiness && !runtimeReadiness.components_ready ? (
+                      <button className="subtleButton" type="button" onClick={() => void handleRuntimeUpdate()} disabled={updateBusy}>
+                        <Download size={15} aria-hidden="true" />
+                        Prepare runtime
+                      </button>
+                    ) : null}
+                    {agentReady && runtimeReadiness?.components_ready ? (
+                      <button className="primarySmall" type="button" onClick={() => void handlePrimaryConnectionAction()} disabled={busy}>
+                        Start VPN
+                      </button>
+                    ) : null}
+                  </div>
                 </div>
               ) : null}
               {smartFallbackActive ? (
@@ -1987,10 +2007,10 @@ export function App() {
                 <span>Режим</span>
                 <div className="slothSegmented">
                   <button className={settings.core.route_mode === "smart" ? "active" : ""} type="button" onClick={() => updateSettings({ ...settings, core: { ...settings.core, route_mode: "smart" } })}>
-                    Rule
+                    Smart
                   </button>
                   <button className={settings.core.route_mode === "vpn_only" ? "active" : ""} type="button" onClick={() => updateSettings({ ...settings, core: { ...settings.core, route_mode: "vpn_only" } })}>
-                    Global
+                    VPN Only
                   </button>
                 </div>
               </div>
@@ -2236,7 +2256,7 @@ export function App() {
           </div>
         </header>
 
-        {renderWorkspace()}
+        <div className="appBody">{renderWorkspace()}</div>
 
         <footer className="statusBar">
           <span>{hasSubscription ? state.subscription.profile_title ?? "Subscription ready" : "Waiting for subscription"}</span>
@@ -2635,56 +2655,148 @@ function renderSettingsPage({
           ) : null}
 
           {settingsSection === "basic" ? (
-            <section className="settingsPanels">
-              <Panel title="Connection">
-                <SegmentedControl
+            <section className="settingsList">
+              <SettingsDisclosure title="Connection" defaultOpen>
+                <SettingsRow
                   label="Mode"
-                  value={settings.core.route_mode}
-                  options={[
-                    ["smart", "Smart"],
-                    ["vpn_only", "VPN Only"],
-                  ]}
-                  onChange={(value) =>
-                    updateSettings({
-                      ...settings,
-                      core: { ...settings.core, route_mode: value as AppSettings["core"]["route_mode"] },
-                      zapret: { ...settings.zapret, enabled: value === "smart" },
-                    })
+                  value={formatRouteMode(settings.core.route_mode)}
+                  hint={
+                    settings.core.route_mode === "smart"
+                      ? "Smart: video, Discord, and games use DIRECT + zapret; protected routes stay on VPN."
+                      : "VPN Only skips zapret and keeps external traffic on VPN paths."
                   }
-                  disabled={settingsBusy}
+                  control={
+                    <div className="segmented compactSegmented settingsInlineSegmented">
+                      <button
+                        className={settings.core.route_mode === "smart" ? "active" : ""}
+                        type="button"
+                        disabled={settingsBusy}
+                        onClick={() =>
+                          updateSettings({
+                            ...settings,
+                            core: { ...settings.core, route_mode: "smart" },
+                            zapret: { ...settings.zapret, enabled: true },
+                          })
+                        }
+                      >
+                        Smart
+                      </button>
+                      <button
+                        className={settings.core.route_mode === "vpn_only" ? "active" : ""}
+                        type="button"
+                        disabled={settingsBusy}
+                        onClick={() =>
+                          updateSettings({
+                            ...settings,
+                            core: { ...settings.core, route_mode: "vpn_only" },
+                            zapret: { ...settings.zapret, enabled: false },
+                          })
+                        }
+                      >
+                        VPN Only
+                      </button>
+                    </div>
+                  }
                 />
-                <p className="diagnosticText">
-                  {settings.core.route_mode === "smart"
-                    ? "Smart is the default: video, Discord, and games use DIRECT + zapret while protected provider routes stay on VPN."
-                    : "VPN Only skips zapret and keeps external traffic on VPN paths."}
-                </p>
-                <StatusRow label="Selected" value={state.connection.selected_proxy ?? "Provider default"} good={hasSubscription} />
-                <button className="subtleButton" type="button" onClick={openServers} disabled={!hasSubscription}>
-                  <Server size={15} aria-hidden="true" />
-                  Servers
-                </button>
-              </Panel>
-              <Panel title="Smart presets">
-                <ToggleRow label="YouTube + Discord via zapret" checked={settings.routing_policy.smart_presets.youtube_discord_zapret} disabled={settingsBusy || settings.core.route_mode !== "smart"} onChange={(checked) => updateSmartPresets({ youtube_discord_zapret: checked })} />
-                <ToggleRow label="Games via zapret" checked={settings.routing_policy.smart_presets.games_zapret} disabled={settingsBusy || settings.core.route_mode !== "smart"} onChange={(checked) => updateSmartPresets({ games_zapret: checked })} />
-                <ToggleRow label="AI via VPN" checked={settings.routing_policy.smart_presets.ai_vpn} disabled={settingsBusy || settings.core.route_mode !== "smart"} onChange={(checked) => updateSmartPresets({ ai_vpn: checked })} />
-                <ToggleRow label="Social via VPN" checked={settings.routing_policy.smart_presets.social_vpn} disabled={settingsBusy || settings.core.route_mode !== "smart"} onChange={(checked) => updateSmartPresets({ social_vpn: checked })} />
-                <ToggleRow label="Telegram from provider" checked={settings.routing_policy.smart_presets.telegram_vpn_from_provider} disabled={settingsBusy || settings.core.route_mode !== "smart"} onChange={(checked) => updateSmartPresets({ telegram_vpn_from_provider: checked })} />
-              </Panel>
-              <Panel title="Quick actions">
-                <StatusRow label="Agent" value={agentService?.ipc_ready ? "Ready" : "Needs setup"} good={agentService?.ipc_ready ?? false} />
-                <StatusRow label="Runtime" value={formatRuntimeComponentStatus(componentUpdates, runtimeReadiness)} good={runtimeReadiness?.components_ready} />
-                <div className="buttonRow">
-                  <button className="subtleButton" type="button" onClick={refreshSubscription} disabled={busy || !hasSubscription}>
-                    <RefreshCw size={15} aria-hidden="true" />
-                    Refresh profile
-                  </button>
-                  <button className="subtleButton" type="button" onClick={runDiagnostics} disabled={diagnosticBusy}>
-                    <Activity size={15} aria-hidden="true" />
-                    Diagnostics
-                  </button>
-                </div>
-              </Panel>
+                <SettingsRow
+                  label="Selected server"
+                  value={state.connection.selected_proxy ?? "Provider default"}
+                  control={
+                    <button className="subtleButton" type="button" onClick={openServers} disabled={!hasSubscription}>
+                      <Server size={15} aria-hidden="true" />
+                      Servers
+                    </button>
+                  }
+                />
+              </SettingsDisclosure>
+
+              <SettingsDisclosure title="Smart presets" defaultOpen>
+                <SettingsRow
+                  label="YouTube + Discord"
+                  value="zapret"
+                  control={
+                    <input
+                      type="checkbox"
+                      checked={settings.routing_policy.smart_presets.youtube_discord_zapret}
+                      disabled={settingsBusy || settings.core.route_mode !== "smart"}
+                      onChange={(event) => updateSmartPresets({ youtube_discord_zapret: event.currentTarget.checked })}
+                      aria-label="YouTube + Discord via zapret"
+                    />
+                  }
+                />
+                <SettingsRow
+                  label="Games"
+                  value="zapret"
+                  control={
+                    <input
+                      type="checkbox"
+                      checked={settings.routing_policy.smart_presets.games_zapret}
+                      disabled={settingsBusy || settings.core.route_mode !== "smart"}
+                      onChange={(event) => updateSmartPresets({ games_zapret: event.currentTarget.checked })}
+                      aria-label="Games via zapret"
+                    />
+                  }
+                />
+                <SettingsRow
+                  label="AI"
+                  value="VPN"
+                  control={
+                    <input
+                      type="checkbox"
+                      checked={settings.routing_policy.smart_presets.ai_vpn}
+                      disabled={settingsBusy || settings.core.route_mode !== "smart"}
+                      onChange={(event) => updateSmartPresets({ ai_vpn: event.currentTarget.checked })}
+                      aria-label="AI via VPN"
+                    />
+                  }
+                />
+                <SettingsRow
+                  label="Social"
+                  value="VPN"
+                  control={
+                    <input
+                      type="checkbox"
+                      checked={settings.routing_policy.smart_presets.social_vpn}
+                      disabled={settingsBusy || settings.core.route_mode !== "smart"}
+                      onChange={(event) => updateSmartPresets({ social_vpn: event.currentTarget.checked })}
+                      aria-label="Social via VPN"
+                    />
+                  }
+                />
+                <SettingsRow
+                  label="Telegram"
+                  value="From provider"
+                  control={
+                    <input
+                      type="checkbox"
+                      checked={settings.routing_policy.smart_presets.telegram_vpn_from_provider}
+                      disabled={settingsBusy || settings.core.route_mode !== "smart"}
+                      onChange={(event) => updateSmartPresets({ telegram_vpn_from_provider: event.currentTarget.checked })}
+                      aria-label="Telegram from provider"
+                    />
+                  }
+                />
+              </SettingsDisclosure>
+
+              <SettingsDisclosure title="Quick actions">
+                <SettingsRow label="Agent" value={agentService?.ipc_ready ? "Ready" : "Needs setup"} control={null} />
+                <SettingsRow label="Runtime" value={formatRuntimeComponentStatus(componentUpdates, runtimeReadiness)} control={null} />
+                <SettingsRow
+                  label="Maintenance"
+                  control={
+                    <div className="buttonRow compactActions">
+                      <button className="subtleButton" type="button" onClick={refreshSubscription} disabled={busy || !hasSubscription}>
+                        <RefreshCw size={15} aria-hidden="true" />
+                        Refresh profile
+                      </button>
+                      <button className="subtleButton" type="button" onClick={runDiagnostics} disabled={diagnosticBusy}>
+                        <Activity size={15} aria-hidden="true" />
+                        Diagnostics
+                      </button>
+                    </div>
+                  }
+                />
+              </SettingsDisclosure>
             </section>
           ) : null}
 
@@ -4817,4 +4929,35 @@ function getQuota(state: AgentState) {
     daysLeft: String(days),
     expires: new Date(expire_at * 1000).toLocaleDateString(),
   };
+}
+
+function getConnectReadinessIssue(
+  agentService: AgentServiceStatus | null,
+  runtimeReadiness: RuntimeReadinessResponse | null,
+): { stage: string; message: string } | null {
+  if (!agentService?.installed) {
+    return {
+      stage: "Agent",
+      message: "badvpn-agent is not installed. Install or repair the privileged service once, then connect.",
+    };
+  }
+  if (!agentService.running) {
+    return {
+      stage: "Agent",
+      message: agentService.message || "badvpn-agent is installed but not running. Repair the service before connecting.",
+    };
+  }
+  if (!agentService.ipc_ready) {
+    return {
+      stage: "Agent",
+      message: agentService.message || "badvpn-agent is not reachable from the GUI. Repair the service before connecting.",
+    };
+  }
+  if (runtimeReadiness && !runtimeReadiness.components_ready) {
+    return {
+      stage: "Runtime",
+      message: runtimeReadiness.message || "Runtime components are missing. Prepare Mihomo and zapret assets before connecting.",
+    };
+  }
+  return null;
 }

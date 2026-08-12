@@ -157,6 +157,20 @@
   padding: 10px 12px 12px;
 }
 
+.serverNodeList {
+  border-top: 1px solid rgba(228, 233, 240, 0.08);
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 8px 10px 10px;
+}
+
+.serverNodeList .nodeRow {
+  grid-template-columns: minmax(0, 1fr) auto;
+  min-height: 52px;
+  width: 100%;
+}
+
 .serverGroupPanel > .emptyList {
   border-top: 1px solid rgba(228, 233, 240, 0.08);
   min-height: 120px;

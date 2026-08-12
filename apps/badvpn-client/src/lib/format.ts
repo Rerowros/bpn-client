@@ -1,4 +1,5 @@
 import type { ConnectionPath } from "../services/agentClient";
+import { formatConnectionPathLabel } from "./routeLabels";
 
 export function formatRouteMode(mode: string) {
   if (mode === "smart") {
@@ -14,13 +15,7 @@ export function formatRouteMode(mode: string) {
 }
 
 export function formatPathLabel(path: ConnectionPath) {
-  if (path === "vpn") {
-    return "VPN";
-  }
-  if (path === "direct") {
-    return "DIRECT";
-  }
-  return formatRouteMode(path);
+  return formatConnectionPathLabel(path);
 }
 
 export function formatBytes(bytes: number) {

@@ -1,13 +1,14 @@
 import type { PolicyRuleView, SuppressedRuleView } from "./services/agentClient";
+import { ROUTE_PATH_LABELS } from "./lib/routeLabels";
 
 export type PolicyPathFilter = "all" | "vpn" | "zapret" | "direct" | "reject";
 
 export const policyPathOptions: Array<[PolicyPathFilter, string]> = [
   ["all", "All"],
-  ["vpn", "VPN"],
-  ["zapret", "zapret"],
-  ["direct", "DIRECT"],
-  ["reject", "Reject"],
+  ["vpn", ROUTE_PATH_LABELS.vpn],
+  ["zapret", ROUTE_PATH_LABELS.zapret],
+  ["direct", ROUTE_PATH_LABELS.direct],
+  ["reject", ROUTE_PATH_LABELS.reject],
 ];
 
 export function policyPathTone(path: string): string {

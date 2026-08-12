@@ -322,6 +322,14 @@ button {
   overflow: hidden;
 }
 
+.appBody {
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+  scrollbar-color: rgba(109, 168, 255, 0.34) transparent;
+  scrollbar-width: thin;
+}
+
 .statusBar {
   align-items: center;
   background: var(--desktop-bg-elevated);

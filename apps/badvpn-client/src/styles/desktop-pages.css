@@ -218,8 +218,7 @@
 .detailItem span,
 .detailItem strong {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  overflow-wrap: anywhere;
 }
 
 .workspace.dashboardWorkspace {
@@ -322,8 +321,22 @@
 
 .connectionNotice span {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.connectionNotice.readinessNotice {
+  align-items: start;
+  grid-template-columns: auto minmax(0, 1fr);
+}
+
+.connectionNotice.readinessNotice .buttonRow {
+  grid-column: 1 / -1;
+  justify-content: flex-start;
+}
+
+.compactActions {
+  gap: 6px;
 }
 
 .connectionNotice.warning {
@@ -388,11 +401,47 @@
 .groupCountBadge {
   border-radius: 999px;
   display: inline-flex;
+  flex: 0 0 auto;
   max-width: 100%;
   min-width: 0;
+  white-space: nowrap;
+}
+
+.pathBadgeWrap {
+  display: grid;
+  gap: 2px;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.pathBadgeSubtitle {
+  color: var(--desktop-muted);
+  font-size: 10px;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.truncatedText,
+.clampedText,
+.settingsRowValue,
+.policySummaryValue {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.truncatedText {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.clampedText {
+  -webkit-box-orient: vertical;
+  display: -webkit-box;
+  -webkit-line-clamp: var(--clamp-lines, 2);
+  overflow: hidden;
+  white-space: normal;
 }
 
 .slothStatusPill,
@@ -618,6 +667,84 @@
   padding: 14px;
 }
 
+.settingsList {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.settingsDisclosure {
+  background: var(--desktop-panel-soft);
+  border: 1px solid var(--desktop-line);
+  border-radius: var(--desktop-radius);
+  min-width: 0;
+}
+
+.settingsDisclosure summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 760;
+  list-style: none;
+  padding: 10px 12px;
+}
+
+.settingsDisclosure summary::-webkit-details-marker {
+  display: none;
+}
+
+.settingsDisclosureBody {
+  border-top: 1px solid var(--desktop-line);
+  display: grid;
+}
+
+.settingsRow {
+  align-items: center;
+  border-bottom: 1px solid var(--desktop-line);
+  display: grid;
+  gap: 10px;
+  grid-template-columns: minmax(120px, 0.95fr) minmax(0, 1.1fr) auto;
+  min-height: 44px;
+  min-width: 0;
+  padding: 8px 12px;
+}
+
+.settingsRow:last-child {
+  border-bottom: 0;
+}
+
+.settingsRowLabel {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.settingsRowLabel span {
+  color: var(--desktop-text);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.settingsRowLabel small {
+  color: var(--desktop-muted);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.settingsRowControl {
+  align-items: center;
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+.settingsInlineSegmented {
+  display: inline-grid;
+  grid-template-columns: repeat(2, minmax(72px, auto));
+}
+
 .settingsBanner,
 .inlineNotice,
 .overridePreview,
@@ -671,9 +798,6 @@
   color: var(--desktop-text);
   font-size: 15px;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .policyToolbar,
@@ -766,7 +890,12 @@
 .connectionMain strong,
 .connectionProcessLine,
 .chainLine,
-.connectionTraceLine,
+.connectionTraceLine {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .connectionTail span {
   display: block;
   min-width: 0;
@@ -884,10 +1013,13 @@
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .connectionRow {
+  .settingsRow {
     grid-template-columns: minmax(0, 1fr);
   }
-}
+
+  .settingsRowControl {
+    justify-content: flex-start;
+  }
 
 @media (max-width: 640px) {
   .workspace.pageWorkspace,
@@ -1083,5 +1215,37 @@
   .slothGroupList,
   .slothNodeList {
     max-height: 150px;
+  }
+}
+
+@media (max-height: 720px) {
+  .inspector.dashboardInspector {
+    display: none;
+  }
+
+  .workspace.dashboardWorkspace {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .slothNoticeGrid .slothAnnouncement {
+    display: none;
+  }
+
+  .slothCenterControl {
+    padding: 10px;
+  }
+
+  .slothCenterControl .connectButton {
+    height: 96px;
+    width: 96px;
+  }
+
+  .slothControlRow {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .settingsRow {
+    min-height: 40px;
+    padding-block: 6px;
   }
 }
