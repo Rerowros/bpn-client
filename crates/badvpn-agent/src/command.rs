@@ -507,9 +507,19 @@ fn installed_agent_attestation_message() -> Option<String> {
     let sha256 = file_sha256(&path).unwrap_or_else(|| "sha256-unavailable".to_string());
     Some(format!(
         "path={} bytes={} sha256={sha256}",
-        path.display(),
+        redact_local_path(&path),
         metadata.len()
     ))
+}
+
+fn redact_local_path(path: &Path) -> String {
+    let display = path.to_string_lossy();
+    if let Ok(program_data) = std::env::var("PROGRAMDATA") {
+        if !program_data.trim().is_empty() {
+            return display.replace(&program_data, "%PROGRAMDATA%");
+        }
+    }
+    display.into_owned()
 }
 
 fn file_sha256(path: &Path) -> Option<String> {

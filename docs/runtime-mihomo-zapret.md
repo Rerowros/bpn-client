@@ -92,4 +92,4 @@ Checks include:
 ## Open Runtime Gaps
 
 - Move final component update download/verify/swap ownership from GUI-assisted staging into `badvpn-agent`.
-- Further deepen WinDivert driver health beyond `sc query` service state (device node / WinDivert.sys load checks).
+- Optional deeper WinDivert.sys device-node load checks beyond `sc query` service state.

@@ -29,7 +29,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { CSSProperties, FormEvent, useEffect, useMemo, useState } from "react";
+import { CSSProperties, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import {
   buildLocalOverridePatch,
@@ -384,6 +384,7 @@ export function App() {
   const [settingsRestartRequired, setSettingsRestartRequired] = useState(false);
   const [lastConnectionsError, setLastConnectionsError] = useState<string | null>(null);
   const [connectionAttempt, setConnectionAttempt] = useState<ConnectionAttempt | null>(null);
+  const statusEpochRef = useRef(0);
   const [progressNow, setProgressNow] = useState(() => Date.now());
   const [showConnectionDetails, setShowConnectionDetails] = useState(false);
   const [connectionFailureStage, setConnectionFailureStage] = useState<string | null>(null);
@@ -659,13 +660,21 @@ export function App() {
     if (showBusy) {
       setBusy(true);
     }
+    const epoch = statusEpochRef.current;
     try {
       const nextState = await action();
+      // Drop stale background status polls that started before a connect/disconnect.
+      if (!showBusy && epoch !== statusEpochRef.current) {
+        return;
+      }
       setState(nextState);
       if (showBusy) {
         notifyAgentError("Action failed", nextState);
       }
     } catch (error) {
+      if (!showBusy && epoch !== statusEpochRef.current) {
+        return;
+      }
       const message = error instanceof Error ? error.message : String(error);
       setState((current) => ({
         ...current,
@@ -710,6 +719,7 @@ export function App() {
     setConnectReadinessPrompt(false);
     const attempt = { action, startedAt: Date.now() } satisfies ConnectionAttempt;
     setConnectionAttempt(attempt);
+    statusEpochRef.current += 1;
     setProgressNow(Date.now());
     setShowConnectionDetails(false);
     setConnectionFailureStage(null);

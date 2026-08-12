@@ -7200,14 +7200,16 @@ fn ensure_mihomo_config_routing(
 ) -> Result<(), String> {
     let content = fs::read_to_string(config_path)
         .map_err(|error| format!("Failed to read Mihomo config for route migration: {error}"))?;
-    let secret = serde_yaml::from_str::<YamlValue>(&content)
+    let secret = match serde_yaml::from_str::<YamlValue>(&content)
         .ok()
         .and_then(|yaml| {
             yaml.get("secret")
                 .and_then(YamlValue::as_str)
                 .map(ToOwned::to_owned)
-        })
-        .unwrap_or_else(|| format!("badvpn-{}", current_unix_timestamp()));
+        }) {
+        Some(existing) => existing,
+        None => badvpn_common::generate_controller_secret()?,
+    };
     let rendered = overlay_mihomo_config_yaml(
         &content,
         &secret,
@@ -10917,14 +10919,16 @@ fn patch_mihomo_config_with_settings(settings: &AppSettings) -> Result<(), Strin
     }
     let content = fs::read_to_string(&config_path)
         .map_err(|error| format!("Failed to read Mihomo config for settings apply: {error}"))?;
-    let secret = serde_yaml::from_str::<YamlValue>(&content)
+    let secret = match serde_yaml::from_str::<YamlValue>(&content)
         .ok()
         .and_then(|yaml| {
             yaml.get("secret")
                 .and_then(YamlValue::as_str)
                 .map(ToOwned::to_owned)
-        })
-        .unwrap_or_else(|| format!("badvpn-{}", current_unix_timestamp()));
+        }) {
+        Some(existing) => existing,
+        None => badvpn_common::generate_controller_secret()?,
+    };
     let rendered = overlay_mihomo_config_yaml(
         &content,
         &secret,

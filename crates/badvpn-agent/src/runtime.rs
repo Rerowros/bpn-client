@@ -3119,26 +3119,67 @@ fn ensure_vpn_only_fallback_policy(policy: &CompiledPolicy) -> Result<()> {
         .validate_invariants()
         .map_err(|error| anyhow!("invalid VPN-only fallback policy: {error}"))?;
 
-    for forbidden_rule in [
-        "MATCH,DIRECT",
-        "GEOSITE,youtube,DIRECT",
-        "DOMAIN-SUFFIX,googlevideo.com,DIRECT",
-        "DOMAIN-SUFFIX,youtu.be,DIRECT",
-        "GEOSITE,discord,DIRECT",
-    ] {
-        if policy
-            .mihomo_rules
-            .iter()
-            .any(|rule| rule == forbidden_rule)
-        {
+    for rule in &policy.mihomo_rules {
+        if mihomo_rule_has_direct_action(rule) && !is_safety_direct_mihomo_rule(rule) {
             return Err(anyhow!(
-                "VPN-only fallback policy contains Smart direct rule {forbidden_rule}."
+                "VPN-only fallback policy contains non-safety DIRECT rule {rule}."
             ));
         }
     }
 
     debug_assert_vpn_only_policy(policy);
     Ok(())
+}
+
+fn mihomo_rule_has_direct_action(rule: &str) -> bool {
+    mihomo_rule_action(rule).is_some_and(|action| action.eq_ignore_ascii_case("DIRECT"))
+}
+
+fn mihomo_rule_action(rule: &str) -> Option<&str> {
+    let parts = rule
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() < 3 {
+        return None;
+    }
+    let last = *parts.last()?;
+    if last.eq_ignore_ascii_case("no-resolve") {
+        if parts.len() < 4 {
+            return None;
+        }
+        Some(parts[parts.len() - 2])
+    } else {
+        Some(last)
+    }
+}
+
+fn is_safety_direct_mihomo_rule(rule: &str) -> bool {
+    let normalized = rule.trim().to_ascii_lowercase();
+    if normalized.starts_with("geoip,private") || normalized.starts_with("geosite,private") {
+        return true;
+    }
+    if normalized.contains("localhost")
+        || normalized.contains(",local,")
+        || normalized.contains(".local,")
+    {
+        return true;
+    }
+    const SAFETY_CIDRS: &[&str] = &[
+        "0.0.0.0/8",
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "224.0.0.0/4",
+        "::1/128",
+        "fc00::/7",
+        "fe80::/10",
+    ];
+    SAFETY_CIDRS.iter().any(|cidr| normalized.contains(cidr))
 }
 
 fn debug_assert_vpn_only_policy(policy: &CompiledPolicy) {
@@ -4134,6 +4175,40 @@ mod architecture_fix_tests {
         assert_eq!(safe_mode_message().as_deref(), Some("Safe Mode test"));
         let _ = fs::remove_dir_all(root);
         std::env::remove_var("BADVPN_AGENT_DATA_DIR");
+    }
+
+    #[test]
+    fn vpn_only_guard_rejects_non_safety_direct_rules() {
+        let mut policy = badvpn_common::compile_policy(badvpn_common::PolicyCompileInput {
+            mode: AppRouteMode::VpnOnly,
+            provider_rules: vec![
+                "DOMAIN-SUFFIX,example.com,PROXY".to_string(),
+                "MATCH,PROXY".to_string(),
+            ],
+            proxy_groups: vec![badvpn_common::ProxyGroupInfo {
+                name: "PROXY".to_string(),
+                group_type: Some("select".to_string()),
+                proxies: vec!["n1".to_string()],
+            }],
+            proxy_count: 1,
+            routing: badvpn_common::RoutingPolicySettings::default(),
+            runtime_facts: badvpn_common::RuntimeFacts::default(),
+        })
+        .unwrap();
+        ensure_vpn_only_fallback_policy(&policy).unwrap();
+
+        policy
+            .mihomo_rules
+            .insert(0, "DOMAIN-SUFFIX,youtube.com,DIRECT".to_string());
+        let err = ensure_vpn_only_fallback_policy(&policy).unwrap_err();
+        assert!(err.to_string().contains("youtube.com"));
+
+        assert!(is_safety_direct_mihomo_rule(
+            "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve"
+        ));
+        assert!(!is_safety_direct_mihomo_rule(
+            "DOMAIN-SUFFIX,discord.com,DIRECT"
+        ));
     }
 
     #[test]
