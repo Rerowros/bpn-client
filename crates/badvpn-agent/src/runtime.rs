@@ -161,6 +161,15 @@ impl RuntimeManager {
         self.last_request.clone()
     }
 
+    pub(crate) fn persist_background_connect_failure(&mut self, message: String) {
+        self.abort_started_connect(message);
+        self.last_metrics = badvpn_common::TrafficMetrics::default();
+        // `abort_started_connect` refreshes both owned children after cleanup;
+        // refresh once more before publishing the final snapshot so callers never
+        // retain a stale transitional or connected component state.
+        self.refresh_process_state();
+    }
+
     pub async fn connect(&mut self, request: ConnectRequest) -> Result<AgentRuntimeSnapshot> {
         self.connect_with_cancel(request, None).await
     }
@@ -5060,6 +5069,40 @@ mod tests {
         assert!(!first_connect_store.run_path().exists());
         assert!(!first_connect_store.policy_summary_path().exists());
         let _ = fs::remove_dir_all(first_connect_root);
+    }
+
+    #[test]
+    fn background_connect_failure_replaces_transitional_or_connected_snapshot_with_error() {
+        for phase in [RuntimePhase::Preparing, RuntimePhase::DegradedVpnOnly] {
+            let mut manager = RuntimeManager::new();
+            manager.snapshot.phase = phase;
+            manager.snapshot.mihomo =
+                RuntimeComponentSnapshot::new(RuntimeComponentState::Running, None);
+            manager.snapshot.zapret =
+                RuntimeComponentSnapshot::new(RuntimeComponentState::Running, None);
+            manager.snapshot.active_config_id = Some("stale-config".to_string());
+
+            manager.persist_background_connect_failure(format!("failure from {phase:?}"));
+
+            assert_eq!(manager.snapshot.phase, RuntimePhase::Error);
+            assert_eq!(
+                manager.snapshot.mihomo.state,
+                RuntimeComponentState::Stopped
+            );
+            assert_eq!(
+                manager.snapshot.zapret.state,
+                RuntimeComponentState::Stopped
+            );
+            assert!(manager.snapshot.active_config_id.is_none());
+            assert!(manager.snapshot.last_error.is_some());
+            let state = manager.to_agent_state(SubscriptionState::default());
+            assert_eq!(state.phase, badvpn_common::AppPhase::Error);
+            assert_eq!(
+                state.connection.status,
+                badvpn_common::ConnectionStatus::Error
+            );
+            assert!(!state.connection.connected);
+        }
     }
 
     #[test]

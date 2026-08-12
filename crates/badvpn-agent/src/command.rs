@@ -268,16 +268,17 @@ impl AgentController {
                     );
                 }
                 Err(error) => {
-                    if cancel.load(Ordering::SeqCst) {
-                        guard.runtime.clear_error();
-                        guard.runtime.set_phase(AppPhase::Ready);
-                        guard.runtime.connection.status = badvpn_common::ConnectionStatus::Idle;
-                        guard.runtime.connection.connected = false;
-                        guard.runtime.diagnostics.message =
-                            Some(format!("Connect cancelled: {error}"));
+                    let message = if cancel.load(Ordering::SeqCst) {
+                        format!("Connect cancelled: {error}")
                     } else {
-                        guard.runtime.set_error(error.to_string());
-                    }
+                        error.to_string()
+                    };
+                    guard.manager.persist_background_connect_failure(message);
+                    guard.runtime = AgentRuntimeState::from_agent_state(
+                        guard
+                            .manager
+                            .to_agent_state(guard.runtime.subscription.clone()),
+                    );
                 }
             }
             if let Ok(mut slot) = progress.write() {
@@ -635,6 +636,34 @@ mod tests {
         if let Some(task) = controller.connect_task.take() {
             task.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn failed_background_connect_persists_manager_error_across_status_refresh() {
+        let mut controller = AgentController::default();
+        {
+            let mut guard = controller.inner.lock().await;
+            guard.manager.persist_background_connect_failure(
+                "forced background connect failure".to_string(),
+            );
+            guard.runtime = AgentRuntimeState::from_agent_state(
+                guard
+                    .manager
+                    .to_agent_state(guard.runtime.subscription.clone()),
+            );
+        }
+
+        let state = controller.runtime_status().await.unwrap();
+        assert_eq!(state.phase, AppPhase::Error);
+        assert_eq!(
+            state.connection.status,
+            badvpn_common::ConnectionStatus::Error
+        );
+        assert!(!state.connection.connected);
+        assert_eq!(
+            state.last_error.as_deref(),
+            Some("forced background connect failure")
+        );
     }
 
     #[tokio::test]

@@ -5884,7 +5884,9 @@ $serviceAgent = '{service_agent}'
 $serviceAgentDir = Split-Path -Parent $serviceAgent
 New-Item -ItemType Directory -Path $serviceAgentDir -Force | Out-Null
 $invokingUserSid = '{invoking_user_sid}'
-Set-Content -LiteralPath (Join-Path $serviceAgentDir 'allowed-user.sid') -Value $invokingUserSid -Encoding ascii -NoNewline
+$allowedUserSidPath = Join-Path $serviceAgentDir 'allowed-user.sid'
+$allowedUserSidExisted = Test-Path -LiteralPath $allowedUserSidPath -PathType Leaf
+$previousAllowedUserSid = if ($allowedUserSidExisted) {{ Get-Content -LiteralPath $allowedUserSidPath -Raw }} else {{ $null }}
 $service = Get-Service -Name '{service_name}' -ErrorAction SilentlyContinue
 $wasRunning = [bool]($service -and $service.Status -eq 'Running')
 $serviceAgentBackup = $null
@@ -5903,6 +5905,7 @@ try {{
     $serviceAgentBackup = "$serviceAgent.backup-$([Guid]::NewGuid().ToString('N'))"
     Copy-Item -LiteralPath $serviceAgent -Destination $serviceAgentBackup -Force
   }}
+  Set-Content -LiteralPath $allowedUserSidPath -Value $invokingUserSid -Encoding ascii -NoNewline
   Copy-Item -LiteralPath $sourceAgent -Destination $serviceAgent -Force
   & $serviceAgent install-service | Out-Null
   if ($LASTEXITCODE -ne 0) {{ throw "badvpn-agent install-service failed with exit code $LASTEXITCODE" }}
@@ -5930,6 +5933,11 @@ try {{
   if ($serviceAgentBackup -and (Test-Path -LiteralPath $serviceAgentBackup)) {{
     Copy-Item -LiteralPath $serviceAgentBackup -Destination $serviceAgent -Force
     Remove-Item -LiteralPath $serviceAgentBackup -Force -ErrorAction SilentlyContinue
+  }}
+  if ($allowedUserSidExisted) {{
+    Set-Content -LiteralPath $allowedUserSidPath -Value $previousAllowedUserSid -Encoding ascii -NoNewline
+  }} elseif (Test-Path -LiteralPath $allowedUserSidPath) {{
+    Remove-Item -LiteralPath $allowedUserSidPath -Force
   }}
   $restartFailure = $null
   if ($wasRunning) {{
@@ -10537,6 +10545,13 @@ mod redaction_tests {
         );
         assert!(script.contains("$invokingUserSid = 'S-1-5-21-1-2-3-1001'"));
         assert!(!script.contains("Win32_ComputerSystem"));
+        assert!(script.contains("$allowedUserSidExisted = Test-Path"));
+        assert!(script.contains("$previousAllowedUserSid = if ($allowedUserSidExisted)"));
+        assert!(script.contains(
+            "Set-Content -LiteralPath $allowedUserSidPath -Value $previousAllowedUserSid"
+        ));
+        assert!(script.contains("elseif (Test-Path -LiteralPath $allowedUserSidPath)"));
+        assert!(script.contains("Remove-Item -LiteralPath $allowedUserSidPath -Force"));
         assert!(
             script.contains("$wasRunning = [bool]($service -and $service.Status -eq 'Running')")
         );
@@ -10550,6 +10565,26 @@ mod redaction_tests {
             .find("Move-Item -LiteralPath $runtimeAssetsBackup -Destination $runtimeAssetsTarget")
             .unwrap();
         let restart = script.find("Start-Service -Name 'badvpn-agent'").unwrap();
+        let write_new_sid = script
+            .find("Set-Content -LiteralPath $allowedUserSidPath -Value $invokingUserSid")
+            .unwrap();
+        let install = script.find("& $serviceAgent install-service").unwrap();
+        let restore_sid = script
+            .find("Set-Content -LiteralPath $allowedUserSidPath -Value $previousAllowedUserSid")
+            .unwrap();
+        let delete_new_sid = script
+            .find("Remove-Item -LiteralPath $allowedUserSidPath -Force")
+            .unwrap();
+        assert!(
+            write_new_sid < install,
+            "service must start with the new SID ACL"
+        );
+        assert!(
+            install < restore_sid,
+            "SID restore belongs to failure handling"
+        );
+        assert!(restore_sid < restart);
+        assert!(delete_new_sid < restart);
         assert!(catch < restore_assets);
         assert!(restore_assets < restart);
 
