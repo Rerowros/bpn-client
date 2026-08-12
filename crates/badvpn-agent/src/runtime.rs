@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::Read,
     net::{TcpListener, UdpSocket},
@@ -35,7 +35,7 @@ pub struct RuntimeManager {
     zapret: ZapretManager,
     pub active_policy: Option<CompiledPolicy>,
     /// Group -> proxy pairs that failed egress verification and must not be re-applied on reconnect.
-    invalid_proxy_selections: BTreeMap<String, String>,
+    invalid_proxy_selections: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl RuntimeManager {
@@ -1158,9 +1158,13 @@ impl RuntimeManager {
             if let Err(error) =
                 put_active_proxy_selection(&client, &base, &secret, &target.group, proxy).await
             {
+                // A transport failure can happen after Mihomo applied the PUT but before the
+                // response reached us, so include the current target in rollback as well.
+                let mut rollback_targets = applied.clone();
+                rollback_targets.push(target.clone());
                 let rollback_errors =
-                    rollback_proxy_selections(&client, &base, &secret, &applied).await;
-                return Err(with_proxy_rollback_detail(error, &rollback_errors));
+                    rollback_proxy_selections(&client, &base, &secret, &rollback_targets).await;
+                return self.finish_failed_proxy_selection(error, &rollback_errors);
             }
             applied.push(target.clone());
         }
@@ -1223,8 +1227,27 @@ impl RuntimeManager {
         let message = format!(
             "Selected proxy '{proxy}' in group '{group}' cannot reach the internet: {error}. {rollback_status} Choose another server."
         );
-        let selection_error = with_proxy_rollback_detail(anyhow!(message), rollback_errors);
-        self.set_error(selection_error.to_string());
+        self.finish_failed_proxy_selection(anyhow!(message), rollback_errors)
+    }
+
+    fn finish_failed_proxy_selection(
+        &mut self,
+        error: anyhow::Error,
+        rollback_errors: &[String],
+    ) -> Result<AgentRuntimeSnapshot> {
+        let selection_error = with_proxy_rollback_detail(error, rollback_errors);
+        if rollback_errors.is_empty()
+            && matches!(
+                self.snapshot.phase,
+                RuntimePhase::Running | RuntimePhase::DegradedVpnOnly
+            )
+        {
+            self.snapshot.diagnostics.push(format!(
+                "Proxy selection failed, but the previous live route remains active: {selection_error}"
+            ));
+        } else {
+            self.set_error(selection_error.to_string());
+        }
         Err(selection_error)
     }
 
@@ -1263,7 +1286,7 @@ impl RuntimeManager {
             }
         }
         for managed_name in mirrored_groups {
-            self.invalid_proxy_selections.remove(&managed_name);
+            self.clear_invalid_proxy_selection(&managed_name, proxy);
         }
     }
 
@@ -1274,13 +1297,15 @@ impl RuntimeManager {
         selected_proxies.retain(|group, proxy| {
             self.invalid_proxy_selections
                 .get(group)
-                .is_none_or(|invalid| invalid != proxy)
+                .is_none_or(|invalid| !invalid.contains(proxy))
         });
     }
 
     fn record_invalid_proxy_selection(&mut self, group: &str, proxy: &str) {
         self.invalid_proxy_selections
-            .insert(group.to_string(), proxy.to_string());
+            .entry(group.to_string())
+            .or_default()
+            .insert(proxy.to_string());
         if let Some(request) = self.last_request.as_mut() {
             if request
                 .selected_proxies
@@ -1293,11 +1318,14 @@ impl RuntimeManager {
     }
 
     fn clear_invalid_proxy_selection(&mut self, group: &str, proxy: &str) {
-        if self
+        let remove_group = self
             .invalid_proxy_selections
-            .get(group)
-            .is_some_and(|invalid| invalid == proxy)
-        {
+            .get_mut(group)
+            .is_some_and(|invalid| {
+                invalid.remove(proxy);
+                invalid.is_empty()
+            });
+        if remove_group {
             self.invalid_proxy_selections.remove(group);
         }
     }
@@ -1311,21 +1339,12 @@ impl RuntimeManager {
             for (group, proxy) in &request.selected_proxies {
                 let affects_main = group == &policy.main_proxy_group
                     || policy.managed_proxy_groups.iter().any(|managed| {
-                        (&managed.name == group || managed.name == policy.main_proxy_group)
+                        managed.name == policy.main_proxy_group
+                            && (&managed.name == group || &managed.source_group == group)
                             && managed.proxies.iter().any(|member| member == proxy)
                     });
                 if affects_main {
                     to_invalidate.push((group.clone(), proxy.clone()));
-                }
-            }
-            if to_invalidate.is_empty() {
-                if let Some(proxy) = request.selected_proxies.get(&policy.main_proxy_group) {
-                    to_invalidate.push((policy.main_proxy_group.clone(), proxy.clone()));
-                }
-                for managed in &policy.managed_proxy_groups {
-                    if let Some(proxy) = request.selected_proxies.get(&managed.name) {
-                        to_invalidate.push((managed.name.clone(), proxy.clone()));
-                    }
                 }
             }
             to_invalidate
@@ -4514,10 +4533,14 @@ start "zapret: general (ALT9)" /min "%BIN%winws.exe" --wf-tcp=80,443,%GameFilter
         manager.last_request = Some(request.clone());
         manager
             .invalid_proxy_selections
-            .insert("__BADVPN_VPN_ONLY__".to_string(), "Dead node".to_string());
+            .entry("__BADVPN_VPN_ONLY__".to_string())
+            .or_default()
+            .insert("Dead node".to_string());
         manager
             .invalid_proxy_selections
-            .insert("PROXY".to_string(), "Dead node".to_string());
+            .entry("PROXY".to_string())
+            .or_default()
+            .insert("Dead node".to_string());
 
         let mut selected = request.selected_proxies.clone();
         manager.strip_invalid_proxy_selections(&mut selected);
@@ -4525,8 +4548,87 @@ start "zapret: general (ALT9)" /min "%BIN%winws.exe" --wf-tcp=80,443,%GameFilter
     }
 
     #[test]
-    fn failed_proxy_egress_returns_error_and_does_not_persist_dead_selection() {
+    fn invalid_proxy_selections_retain_multiple_rejected_nodes_per_group() {
         let mut manager = RuntimeManager::new();
+        manager.record_invalid_proxy_selection("PROXY", "Dead one");
+        manager.record_invalid_proxy_selection("PROXY", "Dead two");
+
+        let rejected = manager.invalid_proxy_selections.get("PROXY").unwrap();
+        assert_eq!(rejected.len(), 2);
+        assert!(rejected.contains("Dead one"));
+        assert!(rejected.contains("Dead two"));
+
+        let mut first = BTreeMap::from([("PROXY".to_string(), "Dead one".to_string())]);
+        manager.strip_invalid_proxy_selections(&mut first);
+        assert!(first.is_empty());
+
+        manager.clear_invalid_proxy_selection("PROXY", "Dead two");
+        let rejected = manager.invalid_proxy_selections.get("PROXY").unwrap();
+        assert_eq!(rejected, &BTreeSet::from(["Dead one".to_string()]));
+    }
+
+    #[test]
+    fn policy_egress_invalidation_ignores_unrelated_group_with_shared_leaf() {
+        let mut manager = RuntimeManager::new();
+        let mut request = test_request();
+        request
+            .selected_proxies
+            .insert("A Secondary".to_string(), "Germany".to_string());
+        request
+            .selected_proxies
+            .insert("Primary".to_string(), "Germany".to_string());
+        request
+            .selected_proxies
+            .insert("__BADVPN_VPN_ONLY__".to_string(), "Germany".to_string());
+        manager.last_request = Some(request);
+        let policy = CompiledPolicy {
+            mode: AppRouteMode::VpnOnly,
+            mihomo_rules: vec!["MATCH,__BADVPN_VPN_ONLY__".to_string()],
+            zapret_hostlist: Vec::new(),
+            zapret_hostlist_exclude: Vec::new(),
+            zapret_ipset: Vec::new(),
+            zapret_ipset_exclude: Vec::new(),
+            dns_nameserver_policy: Vec::new(),
+            diagnostics_expectations: Vec::new(),
+            diagnostics_messages: Vec::new(),
+            suppressed_rules: Vec::new(),
+            main_proxy_group: "__BADVPN_VPN_ONLY__".to_string(),
+            policy_rules: Vec::new(),
+            should_create_canonical_proxy_group: false,
+            managed_proxy_groups: vec![ManagedProxyGroup {
+                name: "__BADVPN_VPN_ONLY__".to_string(),
+                source_group: "Primary".to_string(),
+                proxies: vec!["Germany".to_string(), "Turkey".to_string()],
+            }],
+        };
+
+        manager.record_invalid_proxy_selections_for_policy(&policy);
+
+        let selected = &manager.last_request.as_ref().unwrap().selected_proxies;
+        assert_eq!(selected.get("A Secondary"), Some(&"Germany".to_string()));
+        assert!(!selected.contains_key("Primary"));
+        assert!(!selected.contains_key("__BADVPN_VPN_ONLY__"));
+        assert!(!manager.invalid_proxy_selections.contains_key("A Secondary"));
+        assert!(manager
+            .invalid_proxy_selections
+            .get("Primary")
+            .is_some_and(|nodes| nodes.contains("Germany")));
+        assert!(manager
+            .invalid_proxy_selections
+            .get("__BADVPN_VPN_ONLY__")
+            .is_some_and(|nodes| nodes.contains("Germany")));
+    }
+
+    #[test]
+    fn failed_proxy_egress_with_successful_rollback_preserves_healthy_runtime() {
+        let mut manager = RuntimeManager::new();
+        manager.snapshot.phase = RuntimePhase::Running;
+        manager.snapshot.last_error = None;
+        manager.snapshot.mihomo = RuntimeComponentSnapshot::new(
+            RuntimeComponentState::Running,
+            Some("controller 127.0.0.1:9090".to_string()),
+        );
+        let previous_mihomo = manager.snapshot.mihomo.clone();
         let mut request = test_request();
         request
             .selected_proxies
@@ -4556,7 +4658,71 @@ start "zapret: general (ALT9)" /min "%BIN%winws.exe" --wf-tcp=80,443,%GameFilter
         let selected = &manager.last_request.as_ref().unwrap().selected_proxies;
         assert!(!selected.contains_key("PROXY"));
         assert!(!selected.contains_key("__BADVPN_VPN_ONLY__"));
+        assert_eq!(manager.snapshot.phase, RuntimePhase::Running);
+        assert_eq!(manager.snapshot.last_error, None);
+        assert_eq!(manager.snapshot.mihomo, previous_mihomo);
+        assert!(manager
+            .snapshot
+            .diagnostics
+            .iter()
+            .any(|message| { message.contains("previous live route remains active") }));
+    }
+
+    #[test]
+    fn failed_proxy_egress_with_failed_rollback_enters_error_state() {
+        let mut manager = RuntimeManager::new();
+        manager.snapshot.phase = RuntimePhase::DegradedVpnOnly;
+        let targets = vec![ActiveProxySelectionTarget {
+            group: "PROXY".to_string(),
+            previous_proxy: "Working node".to_string(),
+        }];
+
+        let error = manager
+            .reject_proxy_selection(
+                &targets,
+                "PROXY",
+                "Dead node",
+                anyhow!("probe failed"),
+                &["PROXY: rollback request failed".to_string()],
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("rollback also failed"));
         assert_eq!(manager.snapshot.phase, RuntimePhase::Error);
+        assert!(manager
+            .snapshot
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("rollback also failed")));
+    }
+
+    #[test]
+    fn failed_proxy_recovery_keeps_error_state_after_successful_rollback() {
+        let mut manager = RuntimeManager::new();
+        manager.snapshot.phase = RuntimePhase::Error;
+        manager.snapshot.last_error = Some("original dead route".to_string());
+        let targets = vec![ActiveProxySelectionTarget {
+            group: "PROXY".to_string(),
+            previous_proxy: "Dead node".to_string(),
+        }];
+
+        manager
+            .reject_proxy_selection(
+                &targets,
+                "PROXY",
+                "Another dead node",
+                anyhow!("probe failed again"),
+                &[],
+            )
+            .unwrap_err();
+
+        assert_eq!(manager.snapshot.phase, RuntimePhase::Error);
+        assert!(manager
+            .snapshot
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("probe failed again")));
     }
 
     #[test]
@@ -4616,7 +4782,7 @@ start "zapret: general (ALT9)" /min "%BIN%winws.exe" --wf-tcp=80,443,%GameFilter
         assert!(manager
             .invalid_proxy_selections
             .get("PROXY")
-            .is_some_and(|proxy| proxy == "Dead node"));
+            .is_some_and(|proxies| proxies.contains("Dead node")));
         assert!(manager
             .last_request
             .as_ref()
