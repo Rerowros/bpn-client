@@ -124,6 +124,7 @@ name = "badvpn-common"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "getrandom 0.4.2",
  "serde",
  "serde_json",
  "serde_yaml",

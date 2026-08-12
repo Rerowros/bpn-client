@@ -7091,7 +7091,7 @@ fn format_subscription_fetch_error(action: &str, url: &str, error: reqwest::Erro
 }
 
 fn write_mihomo_config(subscription_body: &str) -> Result<(), String> {
-    let secret = format!("badvpn-{}", current_unix_timestamp());
+    let secret = badvpn_common::generate_controller_secret()?;
     let settings = load_app_settings();
     write_zapret_lists()?;
     let options = mihomo_options_for_runtime_route(&settings, settings.effective_route_mode());

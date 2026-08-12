@@ -8,6 +8,25 @@ use crate::{
     ProxyGroupInfo, ProxyNode, RouteMode, RoutingPolicySettings, RuntimeFacts, SubscriptionFormat,
 };
 
+/// Cryptographically random Mihomo controller secret (never timestamp-derived).
+pub fn generate_controller_secret() -> Result<String, String> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| format!("failed to read OS random bytes for Mihomo secret: {error}"))?;
+    Ok(format!("badvpn-{}", bytes_to_hex(&bytes)))
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let byte = *byte;
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GeneratedMihomoConfig {
     pub yaml: String,
@@ -2205,5 +2224,18 @@ rules:
         assert!(policy
             .zapret_hostlist_exclude
             .contains(&"edge.example.com".to_string()));
+    }
+
+    #[test]
+    fn controller_secret_is_cryptographic_shape() {
+        let first = generate_controller_secret().unwrap();
+        let second = generate_controller_secret().unwrap();
+        assert!(first.starts_with("badvpn-"));
+        assert_eq!(first.len(), "badvpn-".len() + 64);
+        assert_ne!(first, second);
+        assert!(!first["badvpn-".len()..]
+            .chars()
+            .all(|ch| ch.is_ascii_digit()));
+        assert_eq!(bytes_to_hex(&[0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
     }
 }

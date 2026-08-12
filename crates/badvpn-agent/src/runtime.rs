@@ -489,11 +489,13 @@ impl RuntimeManager {
         }
         self.mihomo.stop()?;
         self.zapret.stop()?;
+        self.active_policy = None;
         self.snapshot.phase = RuntimePhase::Idle;
         self.snapshot.effective_mode = self.snapshot.desired_mode;
         self.snapshot.mihomo = RuntimeComponentSnapshot::default();
         self.snapshot.zapret = RuntimeComponentSnapshot::default();
         self.snapshot.windivert = RuntimeComponentSnapshot::default();
+        self.snapshot.active_config_id = None;
         self.snapshot
             .diagnostics
             .push("Stopped BadVpn-owned Mihomo and winws processes.".to_string());
@@ -701,7 +703,12 @@ impl RuntimeManager {
         request: &ConnectRequest,
         mode: RuntimeMode,
     ) -> Result<RuntimeConfig> {
-        self.build_runtime_config_with_secret(request, mode, generate_controller_secret()?)
+        self.build_runtime_config_with_secret(
+            request,
+            mode,
+            badvpn_common::generate_controller_secret()
+                .map_err(|error| anyhow!(error))?,
+        )
     }
 
     fn build_runtime_config_with_secret(
@@ -860,6 +867,8 @@ impl RuntimeManager {
         self.snapshot
             .diagnostics
             .push(format!("Runtime error: {message}"));
+        self.active_policy = None;
+        self.snapshot.active_config_id = None;
         self.refresh_process_state();
     }
 
@@ -1460,7 +1469,9 @@ impl MihomoManager {
                 Ok(None) => true,
                 Err(error) => {
                     self.last_exit_detail = Some(format!("Mihomo state check failed: {error}"));
-                    false
+                    // Keep reporting running until stop/kill clears the child; a transient
+                    // try_wait error must not orphan the handle while claiming stopped.
+                    true
                 }
             }
         } else {
@@ -1798,7 +1809,9 @@ impl ZapretManager {
                 Ok(None) => true,
                 Err(error) => {
                     self.last_exit_detail = Some(format!("winws state check failed: {error}"));
-                    false
+                    // Keep reporting running until stop/kill clears the child; a transient
+                    // try_wait error must not orphan the handle while claiming stopped.
+                    true
                 }
             }
         } else {
@@ -3071,24 +3084,6 @@ fn udp_port_is_busy(port: u16) -> bool {
     UdpSocket::bind((LOCALHOST, port)).is_err()
 }
 
-fn generate_controller_secret() -> Result<String> {
-    let mut bytes = [0_u8; 32];
-    getrandom::fill(&mut bytes)
-        .map_err(|error| anyhow!("failed to read OS random bytes for Mihomo secret: {error}"))?;
-    Ok(format!("badvpn-{}", to_hex(&bytes)))
-}
-
-fn to_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let byte = *byte;
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
-}
-
 #[derive(Debug, Clone)]
 struct RunningProcess {
     name: String,
@@ -3591,8 +3586,8 @@ mod architecture_fix_tests {
 
     #[test]
     fn controller_secret_is_random_shape() {
-        let first = generate_controller_secret().unwrap();
-        let second = generate_controller_secret().unwrap();
+        let first = badvpn_common::generate_controller_secret().unwrap();
+        let second = badvpn_common::generate_controller_secret().unwrap();
 
         assert!(first.starts_with("badvpn-"));
         assert_eq!(first.len(), "badvpn-".len() + 64);
@@ -3600,11 +3595,6 @@ mod architecture_fix_tests {
         assert!(!first["badvpn-".len()..]
             .chars()
             .all(|ch| ch.is_ascii_digit()));
-    }
-
-    #[test]
-    fn hex_encoding_is_lowercase_and_stable() {
-        assert_eq!(to_hex(&[0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
     }
 
     #[test]
