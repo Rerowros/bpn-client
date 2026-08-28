@@ -14,7 +14,7 @@ rust-version = "1.89"
 
 [workspace.dependencies]
 anyhow = "1"
-base64 = "0.22"
+base64 = "0.23"
 flate2 = { version = "1", features = ["rust_backend"] }
 getrandom = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["charset", "http2", "json", "rustls-tls"] }
